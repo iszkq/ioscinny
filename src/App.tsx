@@ -237,9 +237,9 @@ export function App() {
 
             {error && <p className="error-text">{error}</p>}
 
-            <button className="primary-button" type="submit" disabled={bootState === 'connecting'}>
-              {bootState === 'connecting' ? <RefreshCw className="spin" size={18} /> : <Lock size={18} />}
-              {bootState === 'connecting' ? '连接中' : '登录'}
+            <button className="primary-button" type="submit">
+              <Lock size={18} />
+              登录
             </button>
           </form>
         </section>

@@ -1,6 +1,5 @@
 import inject from '@rollup/plugin-inject';
 import { wasm } from '@rollup/plugin-wasm';
-import { NodeGlobalsPolyfillPlugin } from '@esbuild-plugins/node-globals-polyfill';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite';
 import topLevelAwait from 'vite-plugin-top-level-await';
@@ -24,12 +23,6 @@ export default defineConfig({
       define: {
         global: 'globalThis',
       },
-      plugins: [
-        NodeGlobalsPolyfillPlugin({
-          process: false,
-          buffer: true,
-        }),
-      ],
     },
   },
   build: {

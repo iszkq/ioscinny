@@ -4,7 +4,6 @@ const config: CapacitorConfig = {
   appId: 'com.starfire.ioscinny',
   appName: 'Starfire iOS',
   webDir: 'dist',
-  bundledWebRuntime: false,
   ios: {
     contentInset: 'automatic',
   },
