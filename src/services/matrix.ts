@@ -711,6 +711,11 @@ const getRoomMuted = (client: MatrixClient, roomId: string): boolean => {
   }
 };
 
+const getFileInfo = (file: File): Record<string, unknown> => ({
+  mimetype: file.type || 'application/octet-stream',
+  size: file.size,
+});
+
 const roomToSummary = (
   client: MatrixClient,
   room: Room,
@@ -957,7 +962,8 @@ export function getRoomMembers(client: MatrixClient, roomId: string): RoomMember
 export async function sendTextMessage(
   client: MatrixClient,
   roomId: string,
-  body: string
+  body: string,
+  mentions: string[] = []
 ): Promise<void> {
   const trimmed = body.trim();
   if (!trimmed) return;
@@ -965,7 +971,28 @@ export async function sendTextMessage(
   await client.sendMessage(roomId, {
     msgtype: MsgType.Text,
     body: trimmed,
-  });
+    ...(mentions.length > 0
+      ? {
+          'm.mentions': {
+            user_ids: mentions,
+          },
+        }
+      : {}),
+  } as never);
+}
+
+export async function sendEmoteMessage(
+  client: MatrixClient,
+  roomId: string,
+  body: string
+): Promise<void> {
+  const trimmed = body.trim();
+  if (!trimmed) return;
+
+  await client.sendMessage(roomId, {
+    msgtype: MsgType.Emote,
+    body: trimmed,
+  } as never);
 }
 
 export async function sendReplyMessage(
@@ -1064,6 +1091,18 @@ export async function getOwnProfile(client: MatrixClient): Promise<OwnProfile> {
   };
 }
 
+export async function updateOwnAvatar(client: MatrixClient, file: File): Promise<void> {
+  const upload = await client.uploadContent(file, {
+    name: file.name,
+    type: file.type || 'application/octet-stream',
+    includeFilename: true,
+  });
+
+  await (client as unknown as { setAvatarUrl: (mxcUrl: string) => Promise<unknown> }).setAvatarUrl(
+    upload.content_uri
+  );
+}
+
 export async function updateOwnDisplayName(
   client: MatrixClient,
   displayName: string
@@ -1071,6 +1110,28 @@ export async function updateOwnDisplayName(
   const trimmed = displayName.trim();
   if (!trimmed) throw new Error('显示名不能为空。');
   await client.setDisplayName(trimmed);
+}
+
+export async function updateRoomAvatar(
+  client: MatrixClient,
+  roomId: string,
+  file: File
+): Promise<void> {
+  const upload = await client.uploadContent(file, {
+    name: file.name,
+    type: file.type || 'application/octet-stream',
+    includeFilename: true,
+  });
+
+  await client.sendStateEvent(
+    roomId,
+    'm.room.avatar' as never,
+    {
+      url: upload.content_uri,
+      info: getFileInfo(file),
+    } as never,
+    ''
+  );
 }
 
 export function getRoomTypingMembers(client: MatrixClient, roomId: string): string[] {
@@ -1107,10 +1168,7 @@ export async function uploadFileMessage(
     body: file.name,
     filename: file.name,
     url: upload.content_uri,
-    info: {
-      mimetype: file.type || 'application/octet-stream',
-      size: file.size,
-    },
+    info: getFileInfo(file),
   } as never);
 }
 

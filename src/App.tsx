@@ -80,11 +80,14 @@ import {
   RoomSummary,
   searchPublicRooms,
   searchLocalMessages,
+  sendEmoteMessage,
   sendReplyMessage,
   sendReaction,
   sendTextMessage,
   setRoomMuted,
+  updateOwnAvatar,
   updateOwnDisplayName,
+  updateRoomAvatar,
   updateRoomProfile,
   updateTypingStatus,
   uploadFileMessage,
@@ -125,6 +128,7 @@ const defaultHomeserver = 'https://mtx01.cc';
 const favoriteRoomsKey = 'ioscinny.favoriteRooms';
 const favoriteMessagesKey = 'ioscinny.favoriteMessages';
 const appPreferencesKey = 'ioscinny.preferences';
+const roomDraftsKey = 'ioscinny.roomDrafts';
 
 const emptySnapshot: MatrixSnapshot = {
   version: 0,
@@ -222,6 +226,20 @@ const saveFavoriteMessages = (value: Record<string, string[]>) => {
   window.localStorage.setItem(favoriteMessagesKey, JSON.stringify(value));
 };
 
+const loadRoomDrafts = (): Record<string, string> => {
+  try {
+    const value = window.localStorage.getItem(roomDraftsKey);
+    const parsed = value ? JSON.parse(value) : {};
+    return parsed && typeof parsed === 'object' ? (parsed as Record<string, string>) : {};
+  } catch {
+    return {};
+  }
+};
+
+const saveRoomDrafts = (value: Record<string, string>) => {
+  window.localStorage.setItem(roomDraftsKey, JSON.stringify(value));
+};
+
 const loadPreferences = (): AppPreferences => {
   try {
     const value = window.localStorage.getItem(appPreferencesKey);
@@ -254,6 +272,11 @@ const normalizeUserId = (value: string, fallbackServer?: string): string => {
 
 const serverFromUserId = (userId?: string): string | undefined => userId?.split(':')[1];
 
+const extractMentionUserIds = (body: string, members: RoomMemberSummary[]): string[] =>
+  members
+    .filter((member) => body.includes(member.id) || body.includes(`@${member.name}`))
+    .map((member) => member.id);
+
 export function App() {
   const runtimeStopRef = useRef<(() => void) | undefined>();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -283,6 +306,7 @@ export function App() {
   const [favoriteMessageIds, setFavoriteMessageIds] = useState<Record<string, string[]>>(
     () => loadFavoriteMessages()
   );
+  const [roomDrafts, setRoomDrafts] = useState<Record<string, string>>(() => loadRoomDrafts());
   const [preferences, setPreferences] = useState<AppPreferences>(() => loadPreferences());
   const [ownProfile, setOwnProfile] = useState<OwnProfile>();
   const [profileForm, setProfileForm] = useState({ displayName: '' });
@@ -290,6 +314,8 @@ export function App() {
   const [typingMembers, setTypingMembers] = useState<string[]>([]);
   const [roomMediaItems, setRoomMediaItems] = useState<RoomMediaItem[]>([]);
   const [previewMedia, setPreviewMedia] = useState<RoomMediaItem>();
+  const [pendingScrollEventId, setPendingScrollEventId] = useState<string>();
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string>();
   const [roomProfileForm, setRoomProfileForm] = useState({ name: '', topic: '' });
   const [publicRooms, setPublicRooms] = useState<PublicRoomSummary[]>([]);
   const [publicSearch, setPublicSearch] = useState({ server: '', query: '' });
@@ -337,6 +363,8 @@ export function App() {
     setRoomMembers([]);
     setTypingMembers([]);
     setRoomMediaItems([]);
+    setPendingScrollEventId(undefined);
+    setHighlightedMessageId(undefined);
   }, []);
 
   const refreshSnapshot = useCallback(
@@ -523,6 +551,7 @@ export function App() {
       topic: selectedRoom.topic ?? '',
     });
     setComposerMode({ type: 'normal' });
+    setMessageDraft(roomDrafts[selectedRoom.id] ?? '');
   }, [selectedRoom?.id]);
 
   useEffect(() => {
@@ -535,11 +564,27 @@ export function App() {
   }, [client, selectedRoomId, snapshot.version]);
 
   useEffect(() => {
+    if (pendingScrollEventId) return;
     timelineRef.current?.scrollTo({
       top: timelineRef.current.scrollHeight,
       behavior: 'smooth',
     });
-  }, [selectedRoomId, selectedRoomMessages.length]);
+  }, [pendingScrollEventId, selectedRoomId, selectedRoomMessages.length]);
+
+  useEffect(() => {
+    if (!pendingScrollEventId) return;
+
+    const target = timelineRef.current?.querySelector<HTMLElement>(
+      `[data-message-id="${CSS.escape(pendingScrollEventId)}"]`
+    );
+    if (!target) return;
+
+    target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    setHighlightedMessageId(pendingScrollEventId);
+    const timeout = window.setTimeout(() => setHighlightedMessageId(undefined), 1800);
+    setPendingScrollEventId(undefined);
+    return () => window.clearTimeout(timeout);
+  }, [pendingScrollEventId, selectedRoomMessages.length]);
 
   useEffect(() => {
     saveStringArray(favoriteRoomsKey, favoriteRoomIds);
@@ -548,6 +593,10 @@ export function App() {
   useEffect(() => {
     saveFavoriteMessages(favoriteMessageIds);
   }, [favoriteMessageIds]);
+
+  useEffect(() => {
+    saveRoomDrafts(roomDrafts);
+  }, [roomDrafts]);
 
   useEffect(() => {
     savePreferences(preferences);
@@ -593,7 +642,44 @@ export function App() {
     setMobilePane('chat');
     setMessageQuery('');
     setComposerMode({ type: 'normal' });
-    setMessageDraft('');
+  };
+
+  const executeSlashCommand = async (body: string): Promise<boolean> => {
+    if (!client || !selectedRoom || composerMode.type !== 'normal' || !body.startsWith('/')) {
+      return false;
+    }
+
+    const [command, ...args] = body.trim().split(/\s+/);
+    const rest = args.join(' ').trim();
+
+    switch (command.toLowerCase()) {
+      case '/me':
+        await sendEmoteMessage(client, selectedRoom.id, rest);
+        return true;
+      case '/join': {
+        const roomId = await joinRoom(client, rest);
+        setSelectedRoomId(roomId);
+        setActiveView('rooms');
+        setMobilePane('chat');
+        return true;
+      }
+      case '/invite':
+        await inviteUser(client, selectedRoom.id, normalizeUserId(rest, currentUserServer));
+        setNotice('邀请已发送');
+        return true;
+      case '/topic':
+        await updateRoomProfile(client, selectedRoom.id, {
+          name: selectedRoom.name,
+          topic: rest,
+        });
+        setRoomProfileForm((current) => ({ ...current, topic: rest }));
+        return true;
+      case '/shrug':
+        await sendTextMessage(client, selectedRoom.id, `${rest ? `${rest} ` : ''}¯\\_(ツ)_/¯`);
+        return true;
+      default:
+        return false;
+    }
   };
 
   const handleSendMessage = async (evt?: FormEvent<HTMLFormElement>) => {
@@ -610,7 +696,9 @@ export function App() {
       }
       await updateTypingStatus(client, selectedRoom.id, false).catch(() => undefined);
 
-      if (composerMode.type === 'edit') {
+      if (await executeSlashCommand(body)) {
+        // Command handled.
+      } else if (composerMode.type === 'edit') {
         await editTextMessage(client, selectedRoom.id, composerMode.message.id, body);
       } else if (composerMode.type === 'reply') {
         const replyTo: ChatReply = {
@@ -620,14 +708,20 @@ export function App() {
         };
         await sendReplyMessage(client, selectedRoom.id, replyTo, body);
       } else {
-        await sendTextMessage(client, selectedRoom.id, body);
+        await sendTextMessage(client, selectedRoom.id, body, extractMentionUserIds(body, roomMembers));
       }
 
       setComposerMode({ type: 'normal' });
+      setRoomDrafts((current) => {
+        const next = { ...current };
+        delete next[selectedRoom.id];
+        return next;
+      });
       await Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
       refreshSnapshot();
     } catch (err) {
       setMessageDraft(body);
+      setRoomDrafts((current) => ({ ...current, [selectedRoom.id]: body }));
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);
@@ -643,6 +737,17 @@ export function App() {
 
   const handleDraftChange = (value: string) => {
     setMessageDraft(value);
+    if (selectedRoom && composerMode.type === 'normal') {
+      setRoomDrafts((current) => {
+        const next = { ...current };
+        if (value) {
+          next[selectedRoom.id] = value;
+        } else {
+          delete next[selectedRoom.id];
+        }
+        return next;
+      });
+    }
     if (!client || !selectedRoom || selectedRoom.membership !== 'join') return;
 
     void updateTypingStatus(client, selectedRoom.id, Boolean(value.trim())).catch(() => undefined);
@@ -745,6 +850,20 @@ export function App() {
     );
   };
 
+  const handleMentionMember = (member: RoomMemberSummary) => {
+    const mention = `${member.id} `;
+    const nextDraft =
+      messageDraft.endsWith(' ') || messageDraft.length === 0
+        ? `${messageDraft}${mention}`
+        : `${messageDraft} ${mention}`;
+    setMessageDraft(nextDraft);
+    if (selectedRoom && composerMode.type === 'normal') {
+      setRoomDrafts((drafts) => ({ ...drafts, [selectedRoom.id]: nextDraft }));
+    }
+    setSheet(undefined);
+    setMobilePane('chat');
+  };
+
   const toggleFavoriteRoom = (roomId: string) => {
     setFavoriteRoomIds((current) =>
       current.includes(roomId) ? current.filter((id) => id !== roomId) : [...current, roomId]
@@ -789,6 +908,20 @@ export function App() {
       setOwnProfile(profile);
       setProfileForm({ displayName: profile.displayName ?? profile.userId });
     }, '个人资料已更新');
+  };
+
+  const handleProfileAvatarSelected = async (file: File) => {
+    if (!client) return;
+    await runAction(async () => {
+      await updateOwnAvatar(client, file);
+      const profile = await getOwnProfile(client);
+      setOwnProfile(profile);
+    }, '头像已更新');
+  };
+
+  const handleRoomAvatarSelected = async (file: File) => {
+    if (!client || !selectedRoom) return;
+    await runAction(() => updateRoomAvatar(client, selectedRoom.id, file), '房间头像已更新');
   };
 
   const favoriteMessageCount = Object.values(favoriteMessageIds).reduce(
@@ -927,6 +1060,7 @@ export function App() {
                 rooms={visibleRooms}
                 selectedRoomId={selectedRoomId}
                 favoriteRoomIds={favoriteRoomIds}
+                roomDrafts={roomDrafts}
                 onSelectRoom={handleSelectRoom}
                 onAccept={(roomId) =>
                   client && runAction(() => acceptInvite(client, roomId), '已加入房间')
@@ -938,13 +1072,19 @@ export function App() {
               {activeView === 'favorites' && (
                 <FavoriteMessageDigest
                   items={favoriteMessageItems}
-                  onOpen={(roomId) => handleSelectRoom(roomId)}
+                  onOpen={(roomId, eventId) => {
+                    handleSelectRoom(roomId);
+                    setPendingScrollEventId(eventId);
+                  }}
                 />
               )}
               {localSearchResults.length > 0 && (
                 <LocalSearchDigest
                   results={localSearchResults}
-                  onOpen={(roomId) => handleSelectRoom(roomId)}
+                  onOpen={(roomId, eventId) => {
+                    handleSelectRoom(roomId);
+                    setPendingScrollEventId(eventId);
+                  }}
                 />
               )}
             </div>
@@ -982,6 +1122,7 @@ export function App() {
             preferences={preferences}
             onProfileChange={setProfileForm}
             onProfileSubmit={handleProfileSubmit}
+            onAvatarSelected={handleProfileAvatarSelected}
             onPreferencesChange={setPreferences}
             onClearLocal={() => {
               window.localStorage.removeItem(favoriteRoomsKey);
@@ -1063,6 +1204,7 @@ export function App() {
                     key={message.id}
                     message={message}
                     favorite={favoriteMessageIds[message.roomId]?.includes(message.id) ?? false}
+                    highlighted={message.id === highlightedMessageId}
                     onFavorite={() => toggleFavoriteMessage(message)}
                     onReply={() => {
                       setComposerMode({ type: 'reply', message });
@@ -1084,6 +1226,11 @@ export function App() {
               {typingMembers.length > 0 && (
                 <div className="typing-line">
                   {typingMembers.slice(0, 3).join('、')} 正在输入
+                </div>
+              )}
+              {composerMode.type === 'normal' && messageDraft.startsWith('/') && (
+                <div className="command-hint">
+                  支持 /me /join /invite /topic /shrug
                 </div>
               )}
               {composerMode.type !== 'normal' && (
@@ -1171,7 +1318,9 @@ export function App() {
           onInvite={handleInviteSubmit}
           onProfileChange={setRoomProfileForm}
           onProfileSubmit={handleRoomProfileSubmit}
+          onAvatarSelected={handleRoomAvatarSelected}
           onPreviewMedia={setPreviewMedia}
+          onMentionMember={handleMentionMember}
           onToggleMute={() =>
             client &&
             runAction(
@@ -1219,6 +1368,7 @@ function RoomList({
   rooms,
   selectedRoomId,
   favoriteRoomIds,
+  roomDrafts,
   onSelectRoom,
   onAccept,
   onReject,
@@ -1226,6 +1376,7 @@ function RoomList({
   rooms: RoomSummary[];
   selectedRoomId?: string;
   favoriteRoomIds: string[];
+  roomDrafts: Record<string, string>;
   onSelectRoom: (roomId: string) => void;
   onAccept: (roomId: string) => void;
   onReject: (roomId: string) => void;
@@ -1259,7 +1410,7 @@ function RoomList({
               {room.encrypted && <Lock size={12} />}
               {room.muted && <Bell size={12} />}
               {favoriteRoomIds.includes(room.id) && <Star size={12} />}
-              <span>{room.lastMessage}</span>
+              <span>{roomDrafts[room.id] ? `草稿：${roomDrafts[room.id]}` : room.lastMessage}</span>
             </span>
           </span>
           {room.membership === 'invite' ? (
@@ -1297,7 +1448,7 @@ function FavoriteMessageDigest({
   onOpen,
 }: {
   items: Array<{ room: RoomSummary; message: ChatMessage }>;
-  onOpen: (roomId: string) => void;
+  onOpen: (roomId: string, eventId: string) => void;
 }) {
   return (
     <section className="favorite-digest">
@@ -1309,7 +1460,7 @@ function FavoriteMessageDigest({
         <p className="digest-empty">收藏单条消息后会出现在这里。</p>
       ) : (
         items.slice(0, 24).map(({ room, message }) => (
-          <button key={message.id} className="favorite-message" onClick={() => onOpen(room.id)}>
+          <button key={message.id} className="favorite-message" onClick={() => onOpen(room.id, message.id)}>
             <span>
               <strong>{room.name}</strong>
               <small>{message.senderName ?? message.sender} · {formatTime(message.timestamp)}</small>
@@ -1327,7 +1478,7 @@ function LocalSearchDigest({
   onOpen,
 }: {
   results: Array<{ room: RoomSummary; message: ChatMessage }>;
-  onOpen: (roomId: string) => void;
+  onOpen: (roomId: string, eventId: string) => void;
 }) {
   return (
     <section className="search-digest">
@@ -1336,7 +1487,7 @@ function LocalSearchDigest({
         <strong>{results.length}</strong>
       </div>
       {results.slice(0, 30).map(({ room, message }) => (
-        <button key={message.id} className="search-result" onClick={() => onOpen(room.id)}>
+        <button key={message.id} className="search-result" onClick={() => onOpen(room.id, message.id)}>
           <Avatar name={room.name} src={room.avatarUrl} small />
           <span>
             <strong>{room.name}</strong>
@@ -1352,6 +1503,7 @@ function LocalSearchDigest({
 function MessageBubble({
   message,
   favorite,
+  highlighted,
   onFavorite,
   onReply,
   onEdit,
@@ -1361,6 +1513,7 @@ function MessageBubble({
 }: {
   message: ChatMessage;
   favorite: boolean;
+  highlighted: boolean;
   onFavorite: () => void;
   onReply: () => void;
   onEdit: () => void;
@@ -1377,7 +1530,10 @@ function MessageBubble({
   }
 
   return (
-    <article className={message.mine ? 'message mine' : 'message'}>
+    <article
+      className={`${message.mine ? 'message mine' : 'message'}${highlighted ? ' highlighted' : ''}`}
+      data-message-id={message.id}
+    >
       {!message.mine && <Avatar name={message.senderName ?? message.sender ?? '?'} src={message.senderAvatarUrl} small />}
       <div className="bubble-wrap">
         <div className="message-meta">
@@ -1586,7 +1742,9 @@ function RoomInfoSheet({
   onInvite,
   onProfileChange,
   onProfileSubmit,
+  onAvatarSelected,
   onPreviewMedia,
+  onMentionMember,
   onToggleMute,
   onFavorite,
   onLeave,
@@ -1600,7 +1758,9 @@ function RoomInfoSheet({
   onInvite: (evt: FormEvent<HTMLFormElement>) => void;
   onProfileChange: (value: { name: string; topic: string }) => void;
   onProfileSubmit: (evt: FormEvent<HTMLFormElement>) => void;
+  onAvatarSelected: (file: File) => void;
   onPreviewMedia: (media: RoomMediaItem) => void;
+  onMentionMember: (member: RoomMemberSummary) => void;
   onToggleMute: () => void;
   onFavorite: () => void;
   onLeave: () => void;
@@ -1610,7 +1770,19 @@ function RoomInfoSheet({
       <section className="sheet room-sheet">
         <header className="sheet-header">
           <div className="room-info-title">
-            <Avatar name={room.name} src={room.avatarUrl} />
+            <label className="avatar-upload">
+              <Avatar name={room.name} src={room.avatarUrl} />
+              <input
+                type="file"
+                accept="image/*"
+                hidden
+                onChange={(evt) => {
+                  const file = evt.target.files?.[0];
+                  evt.target.value = '';
+                  if (file) onAvatarSelected(file);
+                }}
+              />
+            </label>
             <div>
               <p className="eyebrow">{room.direct ? 'Direct' : room.space ? 'Space' : 'Room'}</p>
               <h2>{room.name}</h2>
@@ -1700,7 +1872,9 @@ function RoomInfoSheet({
                 <strong>{member.name}</strong>
                 <small>{member.id}</small>
               </span>
-              {member.powerLevel ? <em>{member.powerLevel}</em> : null}
+              <button className="member-action" onClick={() => onMentionMember(member)}>
+                提及
+              </button>
             </div>
           ))}
         </div>
@@ -1843,6 +2017,7 @@ function SettingsPanel({
   onLogout,
   onProfileChange,
   onProfileSubmit,
+  onAvatarSelected,
   onPreferencesChange,
   onClearLocal,
 }: {
@@ -1856,13 +2031,26 @@ function SettingsPanel({
   onLogout: () => void;
   onProfileChange: (value: { displayName: string }) => void;
   onProfileSubmit: (evt: FormEvent<HTMLFormElement>) => void;
+  onAvatarSelected: (file: File) => void;
   onPreferencesChange: (value: AppPreferences) => void;
   onClearLocal: () => void;
 }) {
   return (
     <div className="settings-list">
       <form className="profile-card" onSubmit={onProfileSubmit}>
-        <Avatar name={ownProfile?.displayName ?? session?.userId ?? 'Me'} src={ownProfile?.avatarUrl} />
+        <label className="avatar-upload">
+          <Avatar name={ownProfile?.displayName ?? session?.userId ?? 'Me'} src={ownProfile?.avatarUrl} />
+          <input
+            type="file"
+            accept="image/*"
+            hidden
+            onChange={(evt) => {
+              const file = evt.target.files?.[0];
+              evt.target.value = '';
+              if (file) onAvatarSelected(file);
+            }}
+          />
+        </label>
         <label>
           显示名
           <input
