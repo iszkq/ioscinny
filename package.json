@@ -1,0 +1,43 @@
+{
+  "name": "ioscinny",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "vite --host 0.0.0.0",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 0.0.0.0",
+    "cap:add:ios": "cap add ios",
+    "cap:sync:ios": "cap sync ios",
+    "ios:ipa:unsigned": "npm run build && npm run cap:add:ios && npm run cap:sync:ios"
+  },
+  "dependencies": {
+    "@capacitor/app": "^7.0.0",
+    "@capacitor/browser": "^7.0.0",
+    "@capacitor/core": "^7.0.0",
+    "@capacitor/device": "^7.0.0",
+    "@capacitor/filesystem": "^7.0.0",
+    "@capacitor/haptics": "^7.0.0",
+    "@capacitor/keyboard": "^7.0.0",
+    "@capacitor/preferences": "^7.0.0",
+    "@fontsource/inter": "^5.0.18",
+    "buffer": "^6.0.3",
+    "lucide-react": "^0.468.0",
+    "matrix-js-sdk": "38.2.0",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "^7.0.0",
+    "@esbuild-plugins/node-globals-polyfill": "^0.2.3",
+    "@rollup/plugin-inject": "^5.0.5",
+    "@rollup/plugin-wasm": "^6.2.2",
+    "@types/node": "^20.14.15",
+    "@types/react": "^18.2.79",
+    "@types/react-dom": "^18.2.25",
+    "@vitejs/plugin-react": "^4.3.1",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.19",
+    "vite-plugin-top-level-await": "^1.4.4"
+  }
+}

@@ -1,0 +1,74 @@
+name: Build iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_name:
+        description: 'IPA artifact name'
+        required: true
+        default: 'starfire-ios'
+
+jobs:
+  build-ios-unsigned-ipa:
+    name: Build unsigned IPA
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build web app
+        run: npm run build
+
+      - name: Generate Capacitor iOS project
+        run: npx cap add ios
+
+      - name: Sync web assets to iOS
+        run: npx cap sync ios
+
+      - name: Build iOS app without Apple signing
+        run: |
+          xcodebuild \
+            -workspace ios/App/App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          APP_PATH="$(find build/Build/Products/Release-iphoneos -maxdepth 1 -name '*.app' -type d | head -n 1)"
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app bundle was produced."
+            exit 1
+          fi
+
+          rm -rf Payload artifacts
+          mkdir -p Payload artifacts
+          cp -R "$APP_PATH" Payload/
+          IPA_PATH="artifacts/${{ inputs.artifact_name }}-unsigned.ipa"
+          /usr/bin/zip -qry "$IPA_PATH" Payload
+          echo "Created $IPA_PATH"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}-unsigned-ipa
+          path: artifacts/*.ipa
+          retention-days: 14
