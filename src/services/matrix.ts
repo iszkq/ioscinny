@@ -149,6 +149,9 @@ type MatrixWellKnown = {
 };
 
 type MatrixClientOptions = Parameters<typeof createClient>[0];
+type AccountDataEventLike = {
+  getContent: () => unknown;
+};
 
 const ROOM_NAME_FALLBACK = '未命名房间';
 const DEFAULT_MESSAGE_LIMIT = 140;
@@ -165,6 +168,31 @@ const createNativeMatrixClient = (options: MatrixClientOptions): MatrixClient =>
     ...options,
     fetchFn: matrixFetch,
   } as MatrixClientOptions & { fetchFn: typeof fetch });
+
+const getAccountDataContent = (
+  client: MatrixClient,
+  eventType: string
+): Record<string, unknown> | undefined => {
+  const event = (
+    client as unknown as {
+      getAccountData: (type: string) => AccountDataEventLike | undefined;
+    }
+  ).getAccountData(eventType);
+  const content = event?.getContent();
+  return content && typeof content === 'object' ? (content as Record<string, unknown>) : undefined;
+};
+
+const setAccountDataContent = async (
+  client: MatrixClient,
+  eventType: string,
+  content: Record<string, unknown>
+): Promise<void> => {
+  await (
+    client as unknown as {
+      setAccountData: (type: string, content: Record<string, unknown>) => Promise<unknown>;
+    }
+  ).setAccountData(eventType, content);
+};
 
 const readJsonSafely = async <T>(response: Response): Promise<T | undefined> => {
   try {
@@ -710,8 +738,7 @@ const getLastMessagePreview = (client: MatrixClient, room: Room): { text: string
 };
 
 const getDirectRoomIds = (client: MatrixClient): Set<string> => {
-  const event = client.getAccountData('m.direct');
-  const content = event?.getContent() as Record<string, unknown> | undefined;
+  const content = getAccountDataContent(client, 'm.direct');
   const roomIds = new Set<string>();
 
   Object.values(content ?? {}).forEach((value) => {
@@ -755,7 +782,7 @@ const getRoomMuted = (client: MatrixClient, roomId: string): boolean => {
     }).getRoomPushRule?.('global', roomId);
     if (directRule) return isMutedAction(directRule.actions);
 
-    const pushRules = client.getAccountData('m.push_rules')?.getContent() as
+    const pushRules = getAccountDataContent(client, 'm.push_rules') as
       | { global?: { override?: Array<{ rule_id?: string; actions?: unknown }> } }
       | undefined;
     const overrideRule = pushRules?.global?.override?.find((rule) => rule.rule_id === roomId);
@@ -826,16 +853,21 @@ const storeDirectRoom = async (
   roomId: string,
   userId: string
 ): Promise<void> => {
-  const event = client.getAccountData('m.direct');
-  const content = event?.getContent() as Record<string, string[]> | undefined;
-  const nextContent: Record<string, string[]> = structuredClone(content ?? {});
+  const content = getAccountDataContent(client, 'm.direct');
+  const nextContent: Record<string, string[]> = {};
+
+  Object.entries(content ?? {}).forEach(([key, value]) => {
+    if (Array.isArray(value)) {
+      nextContent[key] = value.filter((id): id is string => typeof id === 'string');
+    }
+  });
 
   Object.keys(nextContent).forEach((key) => {
     nextContent[key] = nextContent[key].filter((id) => id !== roomId);
   });
 
   nextContent[userId] = Array.from(new Set([...(nextContent[userId] ?? []), roomId]));
-  await client.setAccountData('m.direct', nextContent);
+  await setAccountDataContent(client, 'm.direct', nextContent);
 };
 
 export async function loginWithPassword(input: LoginInput): Promise<StoredMatrixSession> {
@@ -1042,8 +1074,7 @@ export function getRoomMembers(client: MatrixClient, roomId: string): RoomMember
 }
 
 export function getDirectRoomIdForUser(client: MatrixClient, userId: string): string | undefined {
-  const event = client.getAccountData('m.direct');
-  const content = event?.getContent() as Record<string, unknown> | undefined;
+  const content = getAccountDataContent(client, 'm.direct');
   const roomIds = content?.[userId];
 
   if (!Array.isArray(roomIds)) return undefined;
@@ -1257,8 +1288,10 @@ export function getRoomTypingMembers(client: MatrixClient, roomId: string): stri
   const room = client.getRoom(roomId);
   if (!room) return [];
 
-  return room
-    .getTypingMembers()
+  const typingMembers =
+    (room as unknown as { getTypingMembers?: () => RoomMember[] }).getTypingMembers?.() ?? [];
+
+  return typingMembers
     .filter((member) => member.userId !== client.getUserId())
     .map((member) => member.rawDisplayName || member.userId);
 }
