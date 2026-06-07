@@ -464,6 +464,39 @@ const getEventReactions = (
   }
 };
 
+const getOwnReactionEventId = (
+  client: MatrixClient,
+  room: Room,
+  eventId: string,
+  key: string
+): string | undefined => {
+  try {
+    const relations = (
+      room.getUnfilteredTimelineSet() as unknown as {
+        relations?: {
+          getChildEventsForEvent?: (
+            targetEventId: string,
+            relationType: string,
+            eventType: string
+          ) => { getRelations: () => MatrixEvent[] } | undefined;
+        };
+      }
+    ).relations?.getChildEventsForEvent?.(eventId, 'm.annotation', 'm.reaction');
+
+    const reaction = relations?.getRelations().find((event) => {
+      if (event.getSender() !== client.getUserId()) return false;
+      const content = getEventContent(event);
+      const relation = content['m.relates_to'];
+      if (!relation || typeof relation !== 'object') return false;
+      return (relation as Record<string, unknown>).key === key;
+    });
+
+    return reaction?.getId();
+  } catch {
+    return undefined;
+  }
+};
+
 const getLatestEditContent = (
   room: Room,
   eventId: string,
@@ -1264,6 +1297,16 @@ export async function sendReaction(
   eventId: string,
   key: string
 ): Promise<void> {
+  const room = client.getRoom(roomId);
+  const ownReactionEventId = room ? getOwnReactionEventId(client, room, eventId, key) : undefined;
+
+  if (ownReactionEventId) {
+    await (client as unknown as {
+      redactEvent: (targetRoomId: string, targetEventId: string) => Promise<unknown>;
+    }).redactEvent(roomId, ownReactionEventId);
+    return;
+  }
+
   await client.sendEvent(
     roomId,
     'm.reaction' as never,

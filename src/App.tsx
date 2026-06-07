@@ -114,6 +114,7 @@ import {
 type BootState = 'booting' | 'signedOut' | 'connecting' | 'signedIn' | 'error';
 type PrimaryView = 'home' | 'direct' | 'rooms' | 'spaces' | 'invites' | 'favorites' | 'explore' | 'settings';
 type RoomListView = Exclude<PrimaryView, 'explore' | 'settings'>;
+type RoomFilter = 'all' | 'unread' | 'mentions' | 'drafts';
 type MobilePane = 'list' | 'chat';
 type Sheet = 'new' | 'roomInfo' | { type: 'messageInfo'; message: ChatMessage } | undefined;
 type ComposerMode =
@@ -142,6 +143,12 @@ const favoriteMessagesKey = 'ioscinny.favoriteMessages';
 const appPreferencesKey = 'ioscinny.preferences';
 const roomDraftsKey = 'ioscinny.roomDrafts';
 const quickReactionOptions = ['👍', '❤️', '😂', '🎉', '👀', '✅'];
+const roomFilterLabels: Record<RoomFilter, string> = {
+  all: '全部',
+  unread: '未读',
+  mentions: '提及',
+  drafts: '草稿',
+};
 
 const emptySnapshot: MatrixSnapshot = {
   version: 0,
@@ -321,6 +328,11 @@ const extractMentionUserIds = (body: string, members: RoomMemberSummary[]): stri
     .filter((member) => body.includes(member.id) || body.includes(`@${member.name}`))
     .map((member) => member.id);
 
+const getTrailingMentionQuery = (value: string): string | undefined => {
+  const match = value.match(/(?:^|\s)@([^\s@:]{0,32})$/);
+  return match ? match[1].toLowerCase() : undefined;
+};
+
 const buildMatrixPermalink = (room: Pick<RoomSummary, 'id' | 'canonicalAlias'>, eventId?: string): string => {
   const roomPart = encodeURIComponent(room.canonicalAlias ?? room.id);
   const eventPart = eventId ? `/${encodeURIComponent(eventId)}` : '';
@@ -353,6 +365,7 @@ export function App() {
   const [mobilePane, setMobilePane] = useState<MobilePane>('list');
   const [sheet, setSheet] = useState<Sheet>();
   const [roomQuery, setRoomQuery] = useState('');
+  const [roomFilter, setRoomFilter] = useState<RoomFilter>('all');
   const [messageQuery, setMessageQuery] = useState('');
   const [messageDraft, setMessageDraft] = useState('');
   const [composerMode, setComposerMode] = useState<ComposerMode>({ type: 'normal' });
@@ -516,12 +529,32 @@ export function App() {
   const visibleRooms = useMemo(() => {
     if (activeView === 'explore' || activeView === 'settings') return [];
     const source = roomBuckets[activeView as RoomListView] ?? roomBuckets.home;
+    const filteredByMode = source.filter((room) => {
+      if (roomFilter === 'unread') return room.unread > 0;
+      if (roomFilter === 'mentions') return room.highlight > 0;
+      if (roomFilter === 'drafts') return Boolean(roomDrafts[room.id]);
+      return true;
+    });
     const query = roomQuery.trim().toLowerCase();
-    if (!query) return source;
-    return source.filter((room) =>
+    if (!query) return filteredByMode;
+    return filteredByMode.filter((room) =>
       `${room.name} ${room.topic ?? ''} ${room.canonicalAlias ?? ''}`.toLowerCase().includes(query)
     );
-  }, [activeView, roomBuckets, roomQuery]);
+  }, [activeView, roomBuckets, roomDrafts, roomFilter, roomQuery]);
+
+  const roomFilterCounts = useMemo<Record<RoomFilter, number>>(() => {
+    if (activeView === 'explore' || activeView === 'settings') {
+      return { all: 0, unread: 0, mentions: 0, drafts: 0 };
+    }
+
+    const source = roomBuckets[activeView as RoomListView] ?? roomBuckets.home;
+    return {
+      all: source.length,
+      unread: source.filter((room) => room.unread > 0).length,
+      mentions: source.filter((room) => room.highlight > 0).length,
+      drafts: source.filter((room) => Boolean(roomDrafts[room.id])).length,
+    };
+  }, [activeView, roomBuckets, roomDrafts]);
 
   const selectedRoom = useMemo(
     () => snapshot.rooms.find((room) => room.id === selectedRoomId),
@@ -551,6 +584,21 @@ export function App() {
         : undefined,
     [messageInfoMessage, snapshot.rooms]
   );
+
+  const mentionSuggestions = useMemo(() => {
+    if (composerMode.type !== 'normal') return [];
+    const query = getTrailingMentionQuery(messageDraft);
+    if (query === undefined) return [];
+
+    return roomMembers
+      .filter((member) => member.id !== session?.userId)
+      .filter((member) =>
+        query
+          ? `${member.name} ${member.id}`.toLowerCase().includes(query)
+          : true
+      )
+      .slice(0, 6);
+  }, [composerMode.type, messageDraft, roomMembers, session?.userId]);
 
   const favoriteMessageItems = useMemo(() => {
     if (!client) return [];
@@ -595,6 +643,10 @@ export function App() {
     if (selectedRoomId && visibleRooms.some((room) => room.id === selectedRoomId)) return;
     setSelectedRoomId(visibleRooms[0]?.id);
   }, [activeView, selectedRoomId, visibleRooms]);
+
+  useEffect(() => {
+    setRoomFilter('all');
+  }, [activeView]);
 
   useEffect(() => {
     if (!client || !selectedRoomId) {
@@ -969,6 +1021,14 @@ export function App() {
     setMobilePane('chat');
   };
 
+  const handlePickMentionSuggestion = (member: RoomMemberSummary) => {
+    const nextDraft = messageDraft.match(/(?:^|\s)@[^\s@:]{0,32}$/)
+      ? messageDraft.replace(/(^|\s)@[^\s@:]{0,32}$/, `$1${member.id} `)
+      : `${messageDraft}${messageDraft.endsWith(' ') || !messageDraft ? '' : ' '}${member.id} `;
+
+    handleDraftChange(nextDraft);
+  };
+
   const handleCopyMember = async (member: RoomMemberSummary) => {
     await navigator.clipboard?.writeText(member.id);
     setNotice('成员 ID 已复制');
@@ -1208,6 +1268,11 @@ export function App() {
                 onChange={(evt) => setRoomQuery(evt.target.value)}
               />
             </label>
+            <RoomFilterBar
+              value={roomFilter}
+              counts={roomFilterCounts}
+              onChange={setRoomFilter}
+            />
             <div className="room-list-stack">
               <RoomList
                 rooms={visibleRooms}
@@ -1387,7 +1452,7 @@ export function App() {
                         onTogglePin={() => handleTogglePinMessage(message)}
                         onReact={(key) =>
                           client &&
-                          runAction(() => sendReaction(client, message.roomId, message.id, key), '已添加回应')
+                          runAction(() => sendReaction(client, message.roomId, message.id, key), '已更新回应')
                         }
                       />
                     </Fragment>
@@ -1423,6 +1488,12 @@ export function App() {
                     <X size={16} />
                   </button>
                 </div>
+              )}
+              {mentionSuggestions.length > 0 && (
+                <MentionSuggestions
+                  members={mentionSuggestions}
+                  onPick={handlePickMentionSuggestion}
+                />
               )}
               <input ref={fileInputRef} type="file" hidden onChange={handleFileSelected} />
               <button
@@ -1549,7 +1620,7 @@ export function App() {
           onCopyLink={() => handleCopyMessageLink(messageInfoMessage)}
           onReact={(key) =>
             client &&
-            runAction(() => sendReaction(client, messageInfoMessage.roomId, messageInfoMessage.id, key), '已添加回应')
+            runAction(() => sendReaction(client, messageInfoMessage.roomId, messageInfoMessage.id, key), '已更新回应')
           }
           onRedact={() => handleRedactMessage(messageInfoMessage)}
         />
@@ -1575,6 +1646,31 @@ function Avatar({ name, src, small = false }: { name: string; src?: string; smal
   return (
     <div className={small ? 'avatar small' : 'avatar'}>
       {src ? <img src={src} alt="" /> : <span>{initials(name)}</span>}
+    </div>
+  );
+}
+
+function RoomFilterBar({
+  value,
+  counts,
+  onChange,
+}: {
+  value: RoomFilter;
+  counts: Record<RoomFilter, number>;
+  onChange: (value: RoomFilter) => void;
+}) {
+  return (
+    <div className="filter-tabs">
+      {(['all', 'unread', 'mentions', 'drafts'] as RoomFilter[]).map((filter) => (
+        <button
+          key={filter}
+          className={value === filter ? 'active' : ''}
+          onClick={() => onChange(filter)}
+        >
+          <span>{roomFilterLabels[filter]}</span>
+          <strong>{counts[filter]}</strong>
+        </button>
+      ))}
     </div>
   );
 }
@@ -1747,6 +1843,28 @@ function TimelineDateSeparator({ timestamp }: { timestamp: number }) {
   return (
     <div className="date-separator">
       <span>{formatDateSeparator(timestamp)}</span>
+    </div>
+  );
+}
+
+function MentionSuggestions({
+  members,
+  onPick,
+}: {
+  members: RoomMemberSummary[];
+  onPick: (member: RoomMemberSummary) => void;
+}) {
+  return (
+    <div className="mention-suggestions">
+      {members.map((member) => (
+        <button key={member.id} type="button" onClick={() => onPick(member)}>
+          <Avatar name={member.name} src={member.avatarUrl} small />
+          <span>
+            <strong>{member.name}</strong>
+            <small>{member.id}</small>
+          </span>
+        </button>
+      ))}
     </div>
   );
 }

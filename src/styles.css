@@ -386,6 +386,7 @@ h2 {
 }
 
 .theme-dark .command-hint,
+.theme-dark .mention-suggestions,
 .theme-dark .member-action,
 .theme-dark .pinned-count {
   color: #c8f3fb;
@@ -396,10 +397,21 @@ h2 {
 .theme-dark .reaction-picker button,
 .theme-dark .reaction-list button,
 .theme-dark .message-info-actions button,
+.theme-dark .filter-tabs,
 .theme-dark .quick-reactions {
   color: #d6e1ec;
   border-color: #334155;
   background: #202b3a;
+}
+
+.theme-dark .filter-tabs button.active {
+  color: #c8f3fb;
+  background: #123744;
+}
+
+.theme-dark .mention-suggestions button {
+  color: #d9e5ee;
+  background: rgba(15, 23, 42, 0.38);
 }
 
 .theme-dark .pinned-summary,
@@ -618,6 +630,50 @@ h2 {
   border: 0;
   background: transparent;
   box-shadow: none;
+}
+
+.filter-tabs {
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid #dbe3ea;
+  border-radius: 8px;
+  background: #eef3f7;
+}
+
+.filter-tabs button {
+  min-width: 0;
+  min-height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  border: 0;
+  border-radius: 7px;
+  color: #64748b;
+  background: transparent;
+  font-size: 12px;
+  font-weight: 850;
+}
+
+.filter-tabs button.active {
+  color: #0f6b82;
+  background: #ffffff;
+  box-shadow: 0 1px 5px rgba(15, 23, 42, 0.08);
+}
+
+.filter-tabs strong {
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  color: inherit;
+  background: rgba(15, 23, 42, 0.08);
+  font-size: 11px;
 }
 
 .room-list,
@@ -1228,7 +1284,8 @@ h2 {
 
 .typing-line,
 .composer-context,
-.command-hint {
+.command-hint,
+.mention-suggestions {
   grid-column: 1 / -1;
 }
 
@@ -1246,6 +1303,50 @@ h2 {
   background: #eef6f8;
   font-size: 12px;
   font-weight: 750;
+}
+
+.mention-suggestions {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  padding: 6px;
+  border-radius: 8px;
+  background: #eef6f8;
+}
+
+.mention-suggestions button {
+  min-width: 150px;
+  max-width: 220px;
+  min-height: 42px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 8px;
+  color: #164e63;
+  text-align: left;
+  background: rgba(255, 255, 255, 0.72);
+}
+
+.mention-suggestions span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.mention-suggestions strong,
+.mention-suggestions small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mention-suggestions small {
+  color: #667085;
+  font-size: 11px;
 }
 
 .composer-context {
