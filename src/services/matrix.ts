@@ -6,11 +6,14 @@ import {
   MatrixClient,
   MatrixEvent,
   MsgType,
+  NotificationCountType,
   Room,
   RoomEvent,
   RoomMember,
   SyncState,
 } from 'matrix-js-sdk';
+import { deriveRecoveryKeyFromPassphrase } from 'matrix-js-sdk/lib/crypto-api/key-passphrase.js';
+import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/recovery-key.js';
 
 import { matrixFetch, matrixRequestError } from './nativeFetch';
 import type { StoredMatrixSession } from './sessionStore';
@@ -29,6 +32,7 @@ export type RoomSummary = {
   canonicalAlias?: string;
   topic?: string;
   avatarUrl?: string;
+  parentSpaceIds: string[];
   encrypted: boolean;
   muted: boolean;
   direct: boolean;
@@ -41,15 +45,33 @@ export type RoomSummary = {
   lastTs: number;
 };
 
+export type EncryptedMediaFile = {
+  url: string;
+  key: JsonWebKey & {
+    alg?: string;
+    key_ops?: string[];
+    k?: string;
+  };
+  iv: string;
+  hashes?: Record<string, string>;
+  v?: string;
+};
+
 export type ChatAttachment = {
   kind: 'image' | 'video' | 'audio' | 'file';
   url?: string;
   authUrl?: string;
+  previewEncryptedFile?: EncryptedMediaFile;
+  previewMimeType?: string;
   downloadUrl?: string;
   authDownloadUrl?: string;
+  encryptedFile?: EncryptedMediaFile;
   name?: string;
   mimeType?: string;
   size?: number;
+  durationMs?: number;
+  width?: number;
+  height?: number;
 };
 
 export type ChatReaction = {
@@ -58,16 +80,36 @@ export type ChatReaction = {
   reactedByMe: boolean;
 };
 
+export type MessageReadReceipt = {
+  userId: string;
+  name: string;
+  avatarUrl?: string;
+  timestamp?: number;
+};
+
 export type ChatReply = {
   eventId: string;
   senderName?: string;
   body: string;
 };
 
+export type FavoriteSourceMetadata = {
+  roomId: string;
+  roomName: string;
+  roomAvatarUrl?: string;
+  eventId: string;
+  senderId?: string;
+  senderName: string;
+  senderAvatarUrl?: string;
+  sourceTimestamp: number;
+  favoritedAt: number;
+};
+
 export type ChatMessage = {
   id: string;
   roomId: string;
   eventType: string;
+  forwardContent?: Record<string, unknown>;
   kind: 'message' | 'system';
   sender?: string;
   senderName?: string;
@@ -83,6 +125,8 @@ export type ChatMessage = {
   replyTo?: ChatReply;
   attachment?: ChatAttachment;
   reactions: ChatReaction[];
+  readReceipts: MessageReadReceipt[];
+  favoriteSource?: FavoriteSourceMetadata;
 };
 
 export type RoomMemberSummary = {
@@ -99,15 +143,53 @@ export type OwnProfile = {
   avatarUrl?: string;
 };
 
+export type ExploreSourceKind = 'server' | 'web' | 'nav';
+export type ExploreWebOpenMode = 'auto' | 'external';
+export type ExploreWebEmbedStatus = 'unknown' | 'embeddable' | 'blocked';
+
+export type ExploreNavCard = {
+  id: string;
+  title: string;
+  url: string;
+  description?: string;
+  iconUrl?: string;
+  tags?: string[];
+};
+
+export type ExploreNavSection = {
+  id: string;
+  title: string;
+  cards: ExploreNavCard[];
+};
+
+export type ExploreSource = {
+  id: string;
+  kind: ExploreSourceKind;
+  title: string;
+  value: string;
+  createdAt: number;
+  updatedAt: number;
+  webOpenMode?: ExploreWebOpenMode;
+  webEmbedStatus?: ExploreWebEmbedStatus;
+  navSections?: ExploreNavSection[];
+};
+
 export type RoomMediaItem = {
   messageId: string;
   roomId: string;
   kind: ChatAttachment['kind'];
   url?: string;
   authUrl?: string;
+  previewEncryptedFile?: EncryptedMediaFile;
+  previewMimeType?: string;
   downloadUrl?: string;
   authDownloadUrl?: string;
+  encryptedFile?: EncryptedMediaFile;
   name: string;
+  mimeType?: string;
+  durationMs?: number;
+  width?: number;
+  height?: number;
   senderName?: string;
   timestamp: number;
 };
@@ -119,6 +201,45 @@ export type PinnedMessageSummary = {
   senderName?: string;
   timestamp?: number;
   available: boolean;
+};
+
+export type CustomEmojiUsage = 'emoticon' | 'sticker';
+
+export type CustomEmojiItem = {
+  id: string;
+  packId: string;
+  shortcode: string;
+  body: string;
+  packName: string;
+  usage: CustomEmojiUsage[];
+  mxcUrl: string;
+  url?: string;
+  authUrl?: string;
+  info?: Record<string, unknown>;
+};
+
+export type CustomEmojiDebugSummary = {
+  defaultPackImageCount: number;
+  defaultPackSyncedImageCount: number;
+  defaultPackLocalImageCount: number;
+  defaultPackSyncedSourcePackIds: string[];
+  cinnyRootKeys: string[];
+  cinnyOrder: string[];
+  cinnyPackIds: string[];
+  cinnyPacks: Array<{
+    packId: string;
+    packName: string;
+    imageCount: number;
+    sampleShortcodes: string[];
+  }>;
+  roomPackCount: number;
+  dedupedPackSummaries: Array<{
+    packId: string;
+    packName: string;
+    total: number;
+    emoticonCount: number;
+    stickerCount: number;
+  }>;
 };
 
 export type LocalMessageSearchResult = {
@@ -179,9 +300,71 @@ type MatrixClientOptions = Parameters<typeof createClient>[0];
 type AccountDataEventLike = {
   getContent: () => unknown;
 };
+type SecretStorageKeyInfo = Record<string, unknown> & {
+  passphrase?: {
+    salt?: string;
+    iterations?: number;
+    bits?: number;
+  };
+};
+type SecretStorageApi = {
+  getDefaultKeyId?: () => Promise<string | null>;
+  getKey?: (keyId?: string | null) => Promise<[string, SecretStorageKeyInfo] | null>;
+};
+type SecretStorageCacheSource = 'recovery-key' | 'security-phrase';
+
+const FULLY_READ_EVENT_TYPE = 'm.fully_read';
+const OPTIMISTIC_ROOM_READ_MARKERS_STORAGE_KEY = 'ioscinny.optimisticRoomReadMarkers';
+const NOTIFICATION_EVENT_TYPES = new Set([
+  'm.room.create',
+  'm.room.message',
+  'm.room.encrypted',
+  'm.poll.start',
+  'org.matrix.msc3381.poll.start',
+  'm.sticker',
+]);
+const optimisticRoomReadMarkers = new Map<string, string>();
+
+type FullyReadContent = {
+  event_id?: string;
+};
+
+type OptimisticRoomReadMarkersByUser = Record<string, Record<string, string>>;
+
+type RoomReadMarkerState = {
+  eventId?: string;
+  optimistic: boolean;
+};
+
+type LiveTimelineUnreadState = {
+  reliable: boolean;
+  total: number;
+};
+
+type ReceiptWithTimestamp = {
+  ts?: number;
+  data?: {
+    ts?: number;
+  };
+};
 
 const ROOM_NAME_FALLBACK = '未命名房间';
 const DEFAULT_MESSAGE_LIMIT = 140;
+const secretStorageKeys = new Map<string, Uint8Array>();
+
+const cryptoCallbacks = {
+  getSecretStorageKey: async ({ keys }: { keys: Record<string, unknown> }) => {
+    const keyId = Object.keys(keys).find((candidate) => secretStorageKeys.has(candidate));
+    if (!keyId) return null;
+    const privateKey = secretStorageKeys.get(keyId);
+    return privateKey ? ([keyId, privateKey] as [string, Uint8Array]) : null;
+  },
+  cacheSecretStorageKey: (keyId: string, _keyInfo: unknown, privateKey: Uint8Array) => {
+    if (privateKey instanceof Uint8Array) {
+      secretStorageKeys.set(keyId, privateKey);
+    }
+  },
+};
 
 const normalizeBaseUrl = (value: string): string => {
   const trimmed = value.trim();
@@ -192,6 +375,7 @@ const normalizeBaseUrl = (value: string): string => {
 
 const createNativeMatrixClient = (options: MatrixClientOptions): MatrixClient =>
   createClient({
+    cryptoCallbacks,
     ...options,
     fetchFn: matrixFetch,
   } as MatrixClientOptions & { fetchFn: typeof fetch });
@@ -209,6 +393,394 @@ const getAccountDataContent = (
   return content && typeof content === 'object' ? (content as Record<string, unknown>) : undefined;
 };
 
+const hasProtocol = (value: string): boolean => /^[a-z][a-z0-9+.-]*:\/\//i.test(value);
+
+const toTimestamp = (value: unknown, fallback: number): number =>
+  typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+
+const trimOptionalText = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') return undefined;
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+};
+
+const normalizeOptionalText = (value: unknown): string => trimOptionalText(value) ?? '';
+
+const isExploreSourceKind = (value: unknown): value is ExploreSourceKind =>
+  value === 'server' || value === 'web' || value === 'nav';
+
+const isExploreWebOpenMode = (value: unknown): value is ExploreWebOpenMode =>
+  value === 'auto' || value === 'external';
+
+const isExploreWebEmbedStatus = (value: unknown): value is ExploreWebEmbedStatus =>
+  value === 'unknown' || value === 'embeddable' || value === 'blocked';
+
+const normalizeExploreServerAddress = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error('Missing server address');
+
+  const candidate = hasProtocol(trimmed) ? trimmed : `https://${trimmed}`;
+  const url = new URL(candidate);
+  const host = url.host.trim().toLowerCase();
+  if (!host) throw new Error('Invalid server address');
+  return host;
+};
+
+const normalizeExploreWebUrl = (value: string): string => {
+  const trimmed = value.trim();
+  if (!trimmed) throw new Error('Missing URL');
+
+  const candidate = hasProtocol(trimmed) ? trimmed : `https://${trimmed}`;
+  const url = new URL(candidate);
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+    throw new Error('Unsupported URL protocol');
+  }
+  return url.toString();
+};
+
+const getDefaultExploreSourceTitle = (kind: ExploreSourceKind, value: string): string => {
+  if (kind === 'server') return value;
+  if (kind === 'nav') return '未命名导航站';
+
+  try {
+    return new URL(value).hostname || value;
+  } catch {
+    return value;
+  }
+};
+
+const normalizeExploreTags = (value: unknown): string[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+
+  const tags = value
+    .map((item) => trimOptionalText(item))
+    .filter((item): item is string => Boolean(item));
+
+  return tags.length > 0 ? Array.from(new Set(tags)) : undefined;
+};
+
+const normalizeExploreNavCard = (value: unknown): ExploreNavCard | undefined => {
+  if (!value || typeof value !== 'object') return undefined;
+
+  const card = value as Record<string, unknown>;
+  const id = trimOptionalText(card.id);
+  const title = trimOptionalText(card.title);
+  const rawUrl = trimOptionalText(card.url);
+  if (!id || !title || !rawUrl) return undefined;
+
+  let url: string;
+  try {
+    url = normalizeExploreWebUrl(rawUrl);
+  } catch {
+    return undefined;
+  }
+
+  let iconUrl: string | undefined;
+  const rawIconUrl = trimOptionalText(card.iconUrl);
+  if (rawIconUrl) {
+    try {
+      iconUrl = normalizeExploreWebUrl(rawIconUrl);
+    } catch {
+      iconUrl = undefined;
+    }
+  }
+
+  return {
+    id,
+    title,
+    url,
+    description: trimOptionalText(card.description),
+    iconUrl,
+    tags: normalizeExploreTags(card.tags),
+  };
+};
+
+const normalizeExploreNavSections = (value: unknown): ExploreNavSection[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+
+  const sections = value.reduce<ExploreNavSection[]>((acc, item) => {
+    if (!item || typeof item !== 'object') return acc;
+
+    const section = item as Record<string, unknown>;
+    const id = trimOptionalText(section.id);
+    const title = trimOptionalText(section.title);
+    if (!id || !title || !Array.isArray(section.cards)) return acc;
+
+    const cards = section.cards
+      .map((card) => normalizeExploreNavCard(card))
+      .filter((card): card is ExploreNavCard => Boolean(card));
+
+    acc.push({ id, title, cards });
+    return acc;
+  }, []);
+
+  return sections;
+};
+
+const normalizeExploreSourceValue = (kind: ExploreSourceKind, value: unknown): string => {
+  const normalizedValue = normalizeOptionalText(value);
+  if (kind === 'server') return normalizeExploreServerAddress(normalizedValue);
+  if (kind === 'web') return normalizeExploreWebUrl(normalizedValue);
+  return normalizedValue;
+};
+
+const readOptimisticRoomReadMarkers = (): OptimisticRoomReadMarkersByUser => {
+  if (typeof window === 'undefined') return {};
+
+  try {
+    const raw = window.localStorage.getItem(OPTIMISTIC_ROOM_READ_MARKERS_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? (parsed as OptimisticRoomReadMarkersByUser) : {};
+  } catch {
+    return {};
+  }
+};
+
+const writeOptimisticRoomReadMarkers = (markers: OptimisticRoomReadMarkersByUser) => {
+  if (typeof window === 'undefined') return;
+
+  try {
+    if (Object.keys(markers).length === 0) {
+      window.localStorage.removeItem(OPTIMISTIC_ROOM_READ_MARKERS_STORAGE_KEY);
+      return;
+    }
+    window.localStorage.setItem(OPTIMISTIC_ROOM_READ_MARKERS_STORAGE_KEY, JSON.stringify(markers));
+  } catch {
+    // Ignore localStorage failures.
+  }
+};
+
+const getPersistedOptimisticRoomReadMarker = (
+  roomId: string,
+  userId?: string | null
+): string | undefined => {
+  if (!userId) return undefined;
+  const eventId = readOptimisticRoomReadMarkers()[userId]?.[roomId];
+  return typeof eventId === 'string' ? eventId : undefined;
+};
+
+const setPersistedOptimisticRoomReadMarker = (
+  roomId: string,
+  eventId: string,
+  userId?: string | null
+) => {
+  if (!userId) return;
+
+  const markers = readOptimisticRoomReadMarkers();
+  markers[userId] = {
+    ...(markers[userId] ?? {}),
+    [roomId]: eventId,
+  };
+  writeOptimisticRoomReadMarkers(markers);
+};
+
+const clearPersistedOptimisticRoomReadMarker = (roomId: string, userId?: string | null) => {
+  if (!userId) return;
+
+  const markers = readOptimisticRoomReadMarkers();
+  const userMarkers = markers[userId];
+  if (!userMarkers || !(roomId in userMarkers)) return;
+
+  delete userMarkers[roomId];
+  if (Object.keys(userMarkers).length === 0) {
+    delete markers[userId];
+  } else {
+    markers[userId] = userMarkers;
+  }
+  writeOptimisticRoomReadMarkers(markers);
+};
+
+const getRoomFullyReadEventId = (room: Room): string | undefined => {
+  const fullyReadEvent = room.accountData.get(FULLY_READ_EVENT_TYPE);
+  const eventId = fullyReadEvent?.getContent<FullyReadContent>()?.event_id;
+  return typeof eventId === 'string' ? eventId : undefined;
+};
+
+const setOptimisticRoomReadMarker = (roomId: string, eventId: string, userId?: string | null) => {
+  optimisticRoomReadMarkers.set(roomId, eventId);
+  setPersistedOptimisticRoomReadMarker(roomId, eventId, userId);
+};
+
+const clearOptimisticRoomReadMarker = (roomId: string, eventId?: string, userId?: string | null) => {
+  if (eventId && optimisticRoomReadMarkers.get(roomId) !== eventId) return;
+  optimisticRoomReadMarkers.delete(roomId);
+  clearPersistedOptimisticRoomReadMarker(roomId, userId);
+};
+
+const getStoredRoomReadMarkerEventId = (room: Room, userId?: string | null): string | undefined => {
+  const fullyReadEventId = getRoomFullyReadEventId(room);
+  if (fullyReadEventId) return fullyReadEventId;
+  if (!userId) return undefined;
+  return room.getEventReadUpTo(userId) ?? undefined;
+};
+
+const getLiveTimelineEventIndex = (room: Room, eventId?: string): number => {
+  if (!eventId) return -1;
+  return room.getLiveTimeline().getEvents().findIndex((event) => event.getId() === eventId);
+};
+
+const getRoomReadMarkerState = (room: Room, userId?: string | null): RoomReadMarkerState => {
+  const storedReadMarkerEventId = getStoredRoomReadMarkerEventId(room, userId);
+  const optimisticReadMarkerEventId =
+    optimisticRoomReadMarkers.get(room.roomId) ??
+    getPersistedOptimisticRoomReadMarker(room.roomId, userId);
+
+  if (optimisticReadMarkerEventId) {
+    optimisticRoomReadMarkers.set(room.roomId, optimisticReadMarkerEventId);
+  }
+
+  if (!optimisticReadMarkerEventId) {
+    return {
+      eventId: storedReadMarkerEventId,
+      optimistic: false,
+    };
+  }
+
+  if (storedReadMarkerEventId === optimisticReadMarkerEventId) {
+    clearOptimisticRoomReadMarker(room.roomId, optimisticReadMarkerEventId, userId);
+    return {
+      eventId: storedReadMarkerEventId,
+      optimistic: false,
+    };
+  }
+
+  const optimisticIndex = getLiveTimelineEventIndex(room, optimisticReadMarkerEventId);
+  if (optimisticIndex === -1) {
+    clearOptimisticRoomReadMarker(room.roomId, optimisticReadMarkerEventId, userId);
+    return {
+      eventId: storedReadMarkerEventId,
+      optimistic: false,
+    };
+  }
+
+  const storedIndex = getLiveTimelineEventIndex(room, storedReadMarkerEventId);
+  if (storedIndex >= optimisticIndex) {
+    clearOptimisticRoomReadMarker(room.roomId, optimisticReadMarkerEventId, userId);
+    return {
+      eventId: storedReadMarkerEventId,
+      optimistic: false,
+    };
+  }
+
+  return {
+    eventId: optimisticReadMarkerEventId,
+    optimistic: true,
+  };
+};
+
+const isNotificationEvent = (event: MatrixEvent): boolean => {
+  const eventType = event.getType();
+  if (!NOTIFICATION_EVENT_TYPES.has(eventType)) return false;
+  if (event.isRedacted()) return false;
+  if (event.getRelation()?.rel_type === 'm.replace') return false;
+  return true;
+};
+
+const roomHaveNotification = (room: Room): boolean => {
+  const total = room.getUnreadNotificationCount(NotificationCountType.Total);
+  const highlight = room.getUnreadNotificationCount(NotificationCountType.Highlight);
+  return total > 0 || highlight > 0;
+};
+
+const getLiveTimelineUnreadState = (room: Room, userId?: string | null): LiveTimelineUnreadState => {
+  if (!userId) {
+    return {
+      reliable: false,
+      total: 0,
+    };
+  }
+
+  const liveEvents = room.getLiveTimeline().getEvents();
+  if (liveEvents.length === 0) {
+    return {
+      reliable: true,
+      total: 0,
+    };
+  }
+
+  const { eventId: readUpToId } = getRoomReadMarkerState(room, userId);
+  if (!readUpToId) {
+    return {
+      reliable: false,
+      total: 0,
+    };
+  }
+
+  const readUpToIndex = getLiveTimelineEventIndex(room, readUpToId);
+  if (readUpToIndex === -1) {
+    return {
+      reliable: false,
+      total: 0,
+    };
+  }
+
+  let total = 0;
+  for (let index = readUpToIndex + 1; index < liveEvents.length; index += 1) {
+    const event = liveEvents[index];
+    if (!event || event.getSender() === userId) continue;
+    if (isNotificationEvent(event)) total += 1;
+  }
+
+  return {
+    reliable: true,
+    total,
+  };
+};
+
+const roomHaveUnread = (client: MatrixClient, room: Room): boolean => {
+  const userId = client.getUserId();
+  if (!userId) return false;
+
+  const liveTimelineUnread = getLiveTimelineUnreadState(room, userId);
+  if (liveTimelineUnread.reliable) return liveTimelineUnread.total > 0;
+
+  const { eventId: readUpToId } = getRoomReadMarkerState(room, userId);
+  const liveEvents = room.getLiveTimeline().getEvents();
+  const readUpToIndex = getLiveTimelineEventIndex(room, readUpToId);
+
+  if (readUpToId && readUpToIndex === -1) {
+    return roomHaveNotification(room);
+  }
+
+  for (let index = liveEvents.length - 1; index >= 0; index -= 1) {
+    const event = liveEvents[index];
+    if (!event) return false;
+    if (event.getId() === readUpToId) return false;
+    if (event.getSender() === userId) continue;
+    if (isNotificationEvent(event)) return true;
+  }
+
+  return false;
+};
+
+const getUnreadInfo = (client: MatrixClient, room: Room): { total: number; highlight: number } => {
+  const total = room.getUnreadNotificationCount(NotificationCountType.Total);
+  const highlight = room.getUnreadNotificationCount(NotificationCountType.Highlight);
+  const userId = client.getUserId();
+  const readMarkerState = getRoomReadMarkerState(room, userId);
+  const liveTimelineUnread = getLiveTimelineUnreadState(room, userId);
+
+  if (liveTimelineUnread.reliable) {
+    return {
+      highlight: Math.min(highlight, liveTimelineUnread.total),
+      total: liveTimelineUnread.total,
+    };
+  }
+
+  if (readMarkerState.optimistic && !roomHaveUnread(client, room)) {
+    return {
+      highlight: 0,
+      total: 0,
+    };
+  }
+
+  return {
+    highlight,
+    total: highlight > total ? highlight : total,
+  };
+};
+
 const setAccountDataContent = async (
   client: MatrixClient,
   eventType: string,
@@ -219,6 +791,59 @@ const setAccountDataContent = async (
       setAccountData: (type: string, content: Record<string, unknown>) => Promise<unknown>;
     }
   ).setAccountData(eventType, content);
+};
+
+const getSecretStorageApi = (client: MatrixClient): SecretStorageApi | undefined =>
+  (client as unknown as { secretStorage?: SecretStorageApi }).secretStorage;
+
+const getDefaultSecretStorageKey = async (
+  client: MatrixClient
+): Promise<{ keyId: string; keyInfo: SecretStorageKeyInfo } | undefined> => {
+  const secretStorage = getSecretStorageApi(client);
+  const keyId =
+    (await secretStorage?.getDefaultKeyId?.().catch(() => null)) ??
+    (getAccountDataContent(client, 'm.secret_storage.default_key')?.key as string | undefined);
+
+  if (!keyId) return undefined;
+
+  const keyTuple = await secretStorage?.getKey?.(keyId).catch(() => null);
+  if (keyTuple?.[1]) {
+    return { keyId: keyTuple[0], keyInfo: keyTuple[1] };
+  }
+
+  const keyInfo = getAccountDataContent(client, `m.secret_storage.key.${keyId}`);
+  return keyInfo ? { keyId, keyInfo: keyInfo as SecretStorageKeyInfo } : undefined;
+};
+
+const cacheSecretStorageKeyFromInput = async (
+  client: MatrixClient,
+  input: string
+): Promise<{ cached: boolean; source?: SecretStorageCacheSource }> => {
+  const trimmed = input.trim();
+  if (!trimmed) return { cached: false };
+
+  const defaultKey = await getDefaultSecretStorageKey(client);
+  if (!defaultKey) return { cached: false };
+
+  try {
+    const privateKey = decodeRecoveryKey(trimmed);
+    secretStorageKeys.set(defaultKey.keyId, privateKey);
+    return { cached: true, source: 'recovery-key' };
+  } catch {
+    // Not a Matrix recovery key; it may still be the user's security phrase.
+  }
+
+  const passphrase = defaultKey.keyInfo.passphrase;
+  if (!passphrase?.salt || !passphrase.iterations) return { cached: false };
+
+  const privateKey = await deriveRecoveryKeyFromPassphrase(
+    trimmed,
+    passphrase.salt,
+    passphrase.iterations,
+    passphrase.bits
+  );
+  secretStorageKeys.set(defaultKey.keyId, privateKey);
+  return { cached: true, source: 'security-phrase' };
 };
 
 const readJsonSafely = async <T>(response: Response): Promise<T | undefined> => {
@@ -427,35 +1052,92 @@ const mxcToHttp = (
   );
 };
 
+const getEncryptedMediaFile = (value: unknown): EncryptedMediaFile | undefined => {
+  if (!value || typeof value !== 'object') return undefined;
+  const file = value as Record<string, unknown>;
+  const key = file.key;
+  const hashes = file.hashes;
+
+  if (
+    typeof file.url !== 'string' ||
+    !file.url.startsWith('mxc://') ||
+    !key ||
+    typeof key !== 'object' ||
+    typeof file.iv !== 'string'
+  ) {
+    return undefined;
+  }
+
+  return {
+    url: file.url,
+    key: key as EncryptedMediaFile['key'],
+    iv: file.iv,
+    hashes:
+      hashes && typeof hashes === 'object'
+        ? (hashes as Record<string, string>)
+        : undefined,
+    v: typeof file.v === 'string' ? file.v : undefined,
+  };
+};
+
 const getAttachment = (
   client: MatrixClient,
   content: Record<string, unknown>
 ): ChatAttachment | undefined => {
   const msgType = content.msgtype;
-  const info = typeof content.info === 'object' && content.info ? content.info : {};
+  const infoRecord = typeof content.info === 'object' && content.info
+    ? (content.info as Record<string, unknown>)
+    : {};
+  const encryptedFile = getEncryptedMediaFile(content.file);
+  const mediaMxc = encryptedFile?.url ?? content.url;
   const name =
     typeof content.filename === 'string'
       ? content.filename
       : typeof content.body === 'string'
         ? content.body
         : undefined;
-  const thumbnailUrl = mxcToHttp(client, content.url, 980, 760);
-  const authThumbnailUrl = mxcToHttp(client, content.url, 980, 760, true);
-  const downloadUrl = mxcToHttp(client, content.url);
-  const authDownloadUrl = mxcToHttp(client, content.url, undefined, undefined, true);
-  const mimeType = (info as Record<string, unknown>).mimetype;
-  const size = (info as Record<string, unknown>).size;
+  const thumbnailInfo = typeof infoRecord.thumbnail_info === 'object' && infoRecord.thumbnail_info
+    ? (infoRecord.thumbnail_info as Record<string, unknown>)
+    : {};
+  const thumbnailFile = getEncryptedMediaFile(infoRecord.thumbnail_file);
+  const previewMxc = thumbnailFile?.url ?? infoRecord.thumbnail_url;
+  const downloadUrl = mxcToHttp(client, mediaMxc);
+  const authDownloadUrl = mxcToHttp(client, mediaMxc, undefined, undefined, true);
+  const thumbnailUrl = previewMxc
+    ? mxcToHttp(client, previewMxc, 980, 760)
+    : encryptedFile
+      ? downloadUrl
+      : mxcToHttp(client, mediaMxc, 980, 760);
+  const authThumbnailUrl = previewMxc
+    ? mxcToHttp(client, previewMxc, 980, 760, true)
+    : encryptedFile
+      ? authDownloadUrl
+      : mxcToHttp(client, mediaMxc, 980, 760, true);
+  const mimeType = infoRecord.mimetype;
+  const previewMimeType = thumbnailInfo.mimetype;
+  const size = infoRecord.size;
+  const duration = infoRecord.duration;
+  const width = infoRecord.w;
+  const height = infoRecord.h;
+  const previewWidth = thumbnailInfo.w;
+  const previewHeight = thumbnailInfo.h;
 
   if (msgType === MsgType.Image || msgType === 'm.image') {
     return {
       kind: 'image',
       url: thumbnailUrl ?? downloadUrl,
       authUrl: authThumbnailUrl ?? authDownloadUrl,
+      previewEncryptedFile: thumbnailFile,
+      previewMimeType: typeof previewMimeType === 'string' ? previewMimeType : typeof mimeType === 'string' ? mimeType : undefined,
       downloadUrl,
       authDownloadUrl,
+      encryptedFile,
       name,
       mimeType: typeof mimeType === 'string' ? mimeType : undefined,
       size: typeof size === 'number' ? size : undefined,
+      durationMs: typeof duration === 'number' ? duration : undefined,
+      width: typeof width === 'number' ? width : typeof previewWidth === 'number' ? previewWidth : undefined,
+      height: typeof height === 'number' ? height : typeof previewHeight === 'number' ? previewHeight : undefined,
     };
   }
 
@@ -464,11 +1146,17 @@ const getAttachment = (
       kind: 'video',
       url: thumbnailUrl ?? downloadUrl,
       authUrl: authThumbnailUrl ?? authDownloadUrl,
+      previewEncryptedFile: thumbnailFile,
+      previewMimeType: typeof previewMimeType === 'string' ? previewMimeType : typeof mimeType === 'string' ? mimeType : undefined,
       downloadUrl,
       authDownloadUrl,
+      encryptedFile,
       name,
       mimeType: typeof mimeType === 'string' ? mimeType : undefined,
       size: typeof size === 'number' ? size : undefined,
+      durationMs: typeof duration === 'number' ? duration : undefined,
+      width: typeof width === 'number' ? width : typeof previewWidth === 'number' ? previewWidth : undefined,
+      height: typeof height === 'number' ? height : typeof previewHeight === 'number' ? previewHeight : undefined,
     };
   }
 
@@ -479,9 +1167,11 @@ const getAttachment = (
       authUrl: authDownloadUrl,
       downloadUrl,
       authDownloadUrl,
+      encryptedFile,
       name,
       mimeType: typeof mimeType === 'string' ? mimeType : undefined,
       size: typeof size === 'number' ? size : undefined,
+      durationMs: typeof duration === 'number' ? duration : undefined,
     };
   }
 
@@ -492,9 +1182,11 @@ const getAttachment = (
       authUrl: authDownloadUrl,
       downloadUrl,
       authDownloadUrl,
+      encryptedFile,
       name,
       mimeType: typeof mimeType === 'string' ? mimeType : undefined,
       size: typeof size === 'number' ? size : undefined,
+      durationMs: typeof duration === 'number' ? duration : undefined,
     };
   }
 
@@ -538,6 +1230,59 @@ const getEventReactions = (
       count: value.count,
       reactedByMe: value.reactedByMe,
     }));
+  } catch {
+    return [];
+  }
+};
+
+const getReceiptTimestamp = (room: Room, userId: string): number | undefined => {
+  const receipt = room.getReadReceiptForUserId(userId) as ReceiptWithTimestamp | null;
+  if (typeof receipt?.data?.ts === 'number') return receipt.data.ts;
+  if (typeof receipt?.ts === 'number') return receipt.ts;
+
+  const unthreadedReceipt = room.getLastUnthreadedReceiptFor(userId) as
+    | ReceiptWithTimestamp
+    | undefined;
+  if (typeof unthreadedReceipt?.data?.ts === 'number') return unthreadedReceipt.data.ts;
+  if (typeof unthreadedReceipt?.ts === 'number') return unthreadedReceipt.ts;
+
+  return undefined;
+};
+
+const getEventReadReceipts = (
+  client: MatrixClient,
+  room: Room,
+  eventId: string,
+  sender?: string
+): MessageReadReceipt[] => {
+  if (!eventId.startsWith('$')) return [];
+
+  try {
+    const event = room.findEventById(eventId);
+    if (!event) return [];
+
+    const currentUserId = client.getUserId();
+    return room
+      .getUsersReadUpTo(event)
+      .filter((userId, index, userIds) => userIds.indexOf(userId) === index)
+      .filter((userId) => userId !== currentUserId && userId !== sender)
+      .map((userId) => {
+        const member = room.getMember(userId);
+        return {
+          userId,
+          name: getMemberDisplayName(room, userId),
+          avatarUrl: getMemberAvatarUrl(client, member, 48),
+          timestamp: getReceiptTimestamp(room, userId),
+        };
+      })
+      .sort((left, right) => {
+        if (typeof left.timestamp === 'number' && typeof right.timestamp === 'number') {
+          return right.timestamp - left.timestamp;
+        }
+        if (typeof left.timestamp === 'number') return -1;
+        if (typeof right.timestamp === 'number') return 1;
+        return left.name.localeCompare(right.name, 'zh-Hans-CN');
+      });
   } catch {
     return [];
   }
@@ -608,6 +1353,39 @@ const getLatestEditContent = (
   } catch {
     return undefined;
   }
+};
+
+const getFavoriteSourceMetadata = (
+  client: MatrixClient,
+  content: Record<string, unknown>
+): FavoriteSourceMetadata | undefined => {
+  const metadata = content['in.cinny.favorite'];
+  if (!metadata || typeof metadata !== 'object') return undefined;
+
+  const record = metadata as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    typeof record.sourceRoomId !== 'string' ||
+    typeof record.sourceRoomName !== 'string' ||
+    typeof record.sourceEventId !== 'string' ||
+    typeof record.sourceSenderName !== 'string' ||
+    typeof record.sourceTimestamp !== 'number' ||
+    typeof record.favoritedAt !== 'number'
+  ) {
+    return undefined;
+  }
+
+  return {
+    roomId: record.sourceRoomId,
+    roomName: record.sourceRoomName,
+    roomAvatarUrl: mxcToHttp(client, record.sourceRoomAvatarMxc, 96, 96),
+    eventId: record.sourceEventId,
+    senderId: typeof record.sourceSenderId === 'string' ? record.sourceSenderId : undefined,
+    senderName: record.sourceSenderName,
+    senderAvatarUrl: mxcToHttp(client, record.sourceSenderAvatarMxc, 72, 72),
+    sourceTimestamp: record.sourceTimestamp,
+    favoritedAt: record.favoritedAt,
+  };
 };
 
 const describeMemberEvent = (event: MatrixEvent): string => {
@@ -688,6 +1466,8 @@ const eventToChatMessage = (
     pinned: pinnedEventIds.includes(id),
     replyTo: getReplyPreview(client, room, content),
     reactions: getEventReactions(client, room, id),
+    readReceipts: getEventReadReceipts(client, room, id, sender),
+    favoriteSource: getFavoriteSourceMetadata(client, content),
   };
 
   if (event.isRedacted?.()) {
@@ -721,8 +1501,13 @@ const eventToChatMessage = (
   }
 
   if (eventType === 'm.sticker') {
+    const stickerInfo =
+      displayContent.info && typeof displayContent.info === 'object'
+        ? (displayContent.info as Record<string, unknown>)
+        : {};
     return {
       ...baseMessage,
+      forwardContent: displayContent,
       kind: 'message',
       body: getPlainBody(displayContent) || '贴纸',
       attachment: {
@@ -732,6 +1517,9 @@ const eventToChatMessage = (
         downloadUrl: mxcToHttp(client, displayContent.url),
         authDownloadUrl: mxcToHttp(client, displayContent.url, undefined, undefined, true),
         name: getPlainBody(displayContent) || '贴纸',
+        mimeType: typeof stickerInfo.mimetype === 'string' ? stickerInfo.mimetype : undefined,
+        width: typeof stickerInfo.w === 'number' ? stickerInfo.w : undefined,
+        height: typeof stickerInfo.h === 'number' ? stickerInfo.h : undefined,
       },
     };
   }
@@ -751,6 +1539,7 @@ const eventToChatMessage = (
 
   return {
     ...baseMessage,
+    forwardContent: displayContent,
     kind: 'message',
     body: body || (attachment ? attachment.name ?? '附件' : '空消息'),
     attachment,
@@ -826,6 +1615,28 @@ const getRoomMemberCount = (room: Room): number => {
   }
 };
 
+const getSpaceParentMap = (rooms: Room[]): Map<string, string[]> => {
+  const parentMap = new Map<string, string[]>();
+
+  rooms
+    .filter((room) => room.isSpaceRoom())
+    .forEach((spaceRoom) => {
+      const childEvents =
+        (spaceRoom.currentState?.getStateEvents('m.space.child') as MatrixEvent[] | undefined) ?? [];
+      childEvents.forEach((event) => {
+        const childRoomId = event.getStateKey?.();
+        const content = event.getContent?.() as Record<string, unknown> | undefined;
+        if (!childRoomId || content?.via === undefined) return;
+        const current = parentMap.get(childRoomId) ?? [];
+        if (!current.includes(spaceRoom.roomId)) {
+          parentMap.set(childRoomId, current.concat(spaceRoom.roomId));
+        }
+      });
+    });
+
+  return parentMap;
+};
+
 const isMutedAction = (actions: unknown): boolean =>
   Array.isArray(actions) && (actions.length === 0 || actions[0] === 'dont_notify');
 
@@ -854,15 +1665,19 @@ const getFileInfo = (file: File): Record<string, unknown> => ({
 const roomToSummary = (
   client: MatrixClient,
   room: Room,
-  directRoomIds: Set<string>
+  directRoomIds: Set<string>,
+  parentSpaceIds: string[] = []
 ): RoomSummary => {
   const membership = room.getMyMembership();
   const direct = directRoomIds.has(room.roomId) || isDirectInvite(room, client.getUserId());
   const lastMessage = getLastMessagePreview(client, room);
-  const unread = room.getUnreadNotificationCount?.() ?? 0;
-  const highlight =
-    (room as unknown as { getUnreadNotificationCount?: (type?: string) => number })
-      .getUnreadNotificationCount?.('highlight') ?? 0;
+  const unreadInfo =
+    membership === 'join'
+      ? getUnreadInfo(client, room)
+      : {
+          total: room.getUnreadNotificationCount?.(NotificationCountType.Total) ?? 0,
+          highlight: room.getUnreadNotificationCount?.(NotificationCountType.Highlight) ?? 0,
+        };
 
   return {
     id: room.roomId,
@@ -870,13 +1685,14 @@ const roomToSummary = (
     canonicalAlias: room.getCanonicalAlias() ?? undefined,
     topic: room.currentState?.getStateEvents('m.room.topic', '')?.getContent()?.topic,
     avatarUrl: getRoomAvatarUrl(client, room, direct),
+    parentSpaceIds,
     encrypted: room.hasEncryptionStateEvent(),
     muted: getRoomMuted(client, room.roomId),
     direct,
     space: room.isSpaceRoom(),
     membership,
-    unread,
-    highlight,
+    unread: unreadInfo.total,
+    highlight: unreadInfo.highlight,
     memberCount: getRoomMemberCount(room),
     lastMessage: lastMessage.text,
     lastTs: lastMessage.ts,
@@ -885,9 +1701,10 @@ const roomToSummary = (
 
 const buildSnapshot = (client: MatrixClient): MatrixSnapshot => {
   const directRoomIds = getDirectRoomIds(client);
-  const rooms = client
-    .getRooms()
-    .map((room) => roomToSummary(client, room, directRoomIds))
+  const mxRooms = client.getRooms();
+  const parentSpaceMap = getSpaceParentMap(mxRooms);
+  const rooms = mxRooms
+    .map((room) => roomToSummary(client, room, directRoomIds, parentSpaceMap.get(room.roomId) ?? []))
     .sort((a, b) => {
       if (a.membership === 'invite' && b.membership !== 'invite') return -1;
       if (b.membership === 'invite' && a.membership !== 'invite') return 1;
@@ -991,7 +1808,10 @@ export async function createMatrixRuntime(
   };
 
   client.on(ClientEvent.Sync, handleSync);
+  client.on(ClientEvent.AccountData, refresh);
   client.on(RoomEvent.Timeline, refresh);
+  client.on(RoomEvent.AccountData, refresh);
+  client.on(RoomEvent.Receipt, refresh);
   client.on(RoomEvent.MyMembership, refresh);
 
   await client.startClient({
@@ -1003,7 +1823,10 @@ export async function createMatrixRuntime(
     client,
     stop: () => {
       client.removeListener(ClientEvent.Sync, handleSync);
+      client.removeListener(ClientEvent.AccountData, refresh);
       client.removeListener(RoomEvent.Timeline, refresh);
+      client.removeListener(RoomEvent.AccountData, refresh);
+      client.removeListener(RoomEvent.Receipt, refresh);
       client.removeListener(RoomEvent.MyMembership, refresh);
       client.stopClient();
     },
@@ -1069,9 +1892,16 @@ export function getRoomMediaItems(client: MatrixClient, roomId: string): RoomMed
       kind: message.attachment!.kind,
       url: message.attachment!.url,
       authUrl: message.attachment!.authUrl,
+      previewEncryptedFile: message.attachment!.previewEncryptedFile,
+      previewMimeType: message.attachment!.previewMimeType,
       downloadUrl: message.attachment!.downloadUrl,
       authDownloadUrl: message.attachment!.authDownloadUrl,
+      encryptedFile: message.attachment!.encryptedFile,
       name: message.attachment!.name ?? message.body,
+      mimeType: message.attachment!.mimeType,
+      durationMs: message.attachment!.durationMs,
+      width: message.attachment!.width,
+      height: message.attachment!.height,
       senderName: message.senderName,
       timestamp: message.timestamp,
     }))
@@ -1130,6 +1960,279 @@ export function getRoomMembers(client: MatrixClient, roomId: string): RoomMember
     .sort((a, b) => b.powerLevel - a.powerLevel || a.name.localeCompare(b.name, 'zh-Hans-CN'));
 }
 
+const normalizeEmojiUsage = (
+  imageUsage: unknown,
+  packUsage: unknown
+): CustomEmojiUsage[] => {
+  const rawUsage = Array.isArray(imageUsage) && imageUsage.length > 0 ? imageUsage : packUsage;
+  const usage = Array.isArray(rawUsage)
+    ? rawUsage.filter((item): item is CustomEmojiUsage => item === 'emoticon' || item === 'sticker')
+    : [];
+
+  return usage.length > 0 ? Array.from(new Set(usage)) : ['emoticon', 'sticker'];
+};
+
+const CINNY_SYNC_SOURCE_PACK_ID = 'in.cinny.source_pack_id';
+
+const filterSyncedPersonalPackImages = (
+  content: Record<string, unknown> | undefined
+): Record<string, unknown> | undefined => {
+  if (!content) return undefined;
+
+  const images =
+    content.images && typeof content.images === 'object'
+      ? (content.images as Record<string, Record<string, unknown> | undefined>)
+      : undefined;
+
+  if (!images) return content;
+
+  const filteredImages = Object.fromEntries(
+    Object.entries(images).filter(
+      ([, image]) => !(image && typeof image[CINNY_SYNC_SOURCE_PACK_ID] === 'string')
+    )
+  );
+
+  if (Object.keys(filteredImages).length === Object.keys(images).length) {
+    return content;
+  }
+
+  if (Object.keys(filteredImages).length === 0) {
+    const { images: _ignored, ...rest } = content;
+    return rest;
+  }
+
+  return {
+    ...content,
+    images: filteredImages,
+  };
+};
+
+const collectCustomEmojiPackItems = (
+  client: MatrixClient,
+  packId: string,
+  content: Record<string, unknown> | undefined,
+  fallbackPackName: string
+): CustomEmojiItem[] => {
+  if (!content) return [];
+
+  const pack = content.pack && typeof content.pack === 'object'
+    ? (content.pack as Record<string, unknown>)
+    : {};
+  const images =
+    content.images && typeof content.images === 'object'
+      ? (content.images as Record<string, Record<string, unknown> | undefined>)
+      : {};
+  const packName =
+    typeof pack.display_name === 'string' && pack.display_name.trim()
+      ? pack.display_name.trim()
+      : fallbackPackName;
+
+  return Object.entries(images).flatMap(([shortcode, image]) => {
+    if (!image) return [];
+    const mxcUrl = image.url;
+    if (typeof mxcUrl !== 'string' || !mxcUrl.startsWith('mxc://')) return [];
+
+    const info = image.info && typeof image.info === 'object'
+      ? (image.info as Record<string, unknown>)
+      : undefined;
+    const body =
+      typeof image.body === 'string' && image.body.trim()
+        ? image.body.trim()
+        : shortcode;
+
+    return [
+      {
+        id: `${packId}:${shortcode}:${mxcUrl}`,
+        packId,
+        shortcode,
+        body,
+        packName,
+        usage: normalizeEmojiUsage(image.usage, pack.usage),
+        mxcUrl,
+        url: mxcToHttp(client, mxcUrl, 256, 256),
+        authUrl: mxcToHttp(client, mxcUrl, 256, 256, true),
+        info,
+      },
+    ];
+  });
+};
+
+export function getCustomEmojiItems(client: MatrixClient, roomId?: string): CustomEmojiItem[] {
+  const items: CustomEmojiItem[] = [];
+
+  const userPack = filterSyncedPersonalPackImages(getAccountDataContent(client, 'im.ponies.user_emotes'));
+  items.push(...collectCustomEmojiPackItems(client, 'user', userPack, '我的表情'));
+
+  const cinnyPacks = getAccountDataContent(client, 'in.cinny.user_emoji_packs');
+  const customPacks =
+    cinnyPacks?.packs && typeof cinnyPacks.packs === 'object'
+      ? (cinnyPacks.packs as Record<string, Record<string, unknown> | undefined>)
+      : {};
+  const orderedPackIds = Array.isArray(cinnyPacks?.order)
+    ? (cinnyPacks.order as unknown[]).filter((packId): packId is string => typeof packId === 'string')
+    : [];
+  const packIds = [
+    ...orderedPackIds,
+    ...Object.keys(customPacks).filter((packId) => !orderedPackIds.includes(packId)),
+  ];
+
+  packIds.forEach((packId) => {
+    items.push(...collectCustomEmojiPackItems(client, packId, customPacks[packId], packId));
+  });
+
+  const roomsToRead = new Set<string>();
+  if (roomId) roomsToRead.add(roomId);
+
+  const globalRooms = getAccountDataContent(client, 'im.ponies.emote_rooms')?.rooms;
+  if (globalRooms && typeof globalRooms === 'object') {
+    Object.keys(globalRooms).forEach((id) => roomsToRead.add(id));
+  }
+
+  client.getRooms().forEach((room) => {
+    if (room.getMyMembership() === 'join') roomsToRead.add(room.roomId);
+  });
+
+  roomsToRead.forEach((id) => {
+    const room = client.getRoom(id);
+    const events =
+      (room?.currentState?.getStateEvents('im.ponies.room_emotes') as MatrixEvent[] | undefined) ?? [];
+    events.forEach((event) => {
+      const stateKey = event.getStateKey() ?? '';
+      const packId = event.getId() ?? `${id}:${stateKey}`;
+      items.push(
+        ...collectCustomEmojiPackItems(
+          client,
+          packId,
+          event.getContent() as Record<string, unknown>,
+          room?.name ?? '房间表情'
+        )
+      );
+    });
+  });
+
+  const seen = new Set<string>();
+  return items
+    .filter((item) => {
+      const key = `${item.packId}:${item.shortcode}:${item.mxcUrl}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .slice(0, 512);
+}
+
+export function getCustomEmojiDebugSummary(
+  client: MatrixClient,
+  roomId?: string
+): CustomEmojiDebugSummary {
+  const rawUserPack = getAccountDataContent(client, 'im.ponies.user_emotes');
+  const rawUserImages =
+    rawUserPack?.images && typeof rawUserPack.images === 'object'
+      ? (rawUserPack.images as Record<string, Record<string, unknown> | undefined>)
+      : {};
+
+  const defaultPackSyncedSourcePackIds = Array.from(
+    new Set(
+      Object.values(rawUserImages)
+        .map((image) =>
+          typeof image?.[CINNY_SYNC_SOURCE_PACK_ID] === 'string'
+            ? image[CINNY_SYNC_SOURCE_PACK_ID]
+            : undefined
+        )
+        .filter((packId): packId is string => typeof packId === 'string' && packId.length > 0)
+    )
+  ).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
+
+  const cinnyContent = getAccountDataContent(client, 'in.cinny.user_emoji_packs');
+  const cinnyPacks =
+    cinnyContent?.packs && typeof cinnyContent.packs === 'object'
+      ? (cinnyContent.packs as Record<string, Record<string, unknown> | undefined>)
+      : {};
+  const cinnyOrder = Array.isArray(cinnyContent?.order)
+    ? (cinnyContent.order as unknown[]).filter((packId): packId is string => typeof packId === 'string')
+    : [];
+  const cinnyPackIds = [
+    ...cinnyOrder,
+    ...Object.keys(cinnyPacks).filter((packId) => !cinnyOrder.includes(packId)),
+  ];
+
+  const roomPackIds = new Set<string>();
+  if (roomId) roomPackIds.add(roomId);
+
+  const globalRooms = getAccountDataContent(client, 'im.ponies.emote_rooms')?.rooms;
+  if (globalRooms && typeof globalRooms === 'object') {
+    Object.keys(globalRooms).forEach((id) => roomPackIds.add(id));
+  }
+
+  client.getRooms().forEach((room) => {
+    if (room.getMyMembership() === 'join') roomPackIds.add(room.roomId);
+  });
+
+  const dedupedItems = getCustomEmojiItems(client, roomId);
+  const packSummaryMap = new Map<
+    string,
+    {
+      packId: string;
+      packName: string;
+      total: number;
+      emoticonCount: number;
+      stickerCount: number;
+    }
+  >();
+
+  dedupedItems.forEach((item) => {
+    const summary = packSummaryMap.get(item.packId) ?? {
+      packId: item.packId,
+      packName: item.packName,
+      total: 0,
+      emoticonCount: 0,
+      stickerCount: 0,
+    };
+    summary.total += 1;
+    if (item.usage.includes('emoticon')) summary.emoticonCount += 1;
+    if (item.usage.includes('sticker')) summary.stickerCount += 1;
+    packSummaryMap.set(item.packId, summary);
+  });
+
+  return {
+    defaultPackImageCount: Object.keys(rawUserImages).length,
+    defaultPackSyncedImageCount: Object.values(rawUserImages).filter(
+      (image) => typeof image?.[CINNY_SYNC_SOURCE_PACK_ID] === 'string'
+    ).length,
+    defaultPackLocalImageCount: Object.values(rawUserImages).filter(
+      (image) => typeof image?.[CINNY_SYNC_SOURCE_PACK_ID] !== 'string'
+    ).length,
+    defaultPackSyncedSourcePackIds,
+    cinnyRootKeys: cinnyContent ? Object.keys(cinnyContent).sort() : [],
+    cinnyOrder,
+    cinnyPackIds,
+    cinnyPacks: cinnyPackIds.map((packId) => {
+      const packContent = cinnyPacks[packId];
+      const packMeta =
+        packContent?.pack && typeof packContent.pack === 'object'
+          ? (packContent.pack as Record<string, unknown>)
+          : {};
+      const images =
+        packContent?.images && typeof packContent.images === 'object'
+          ? (packContent.images as Record<string, unknown>)
+          : {};
+      return {
+        packId,
+        packName:
+          typeof packMeta.display_name === 'string' && packMeta.display_name.trim()
+            ? packMeta.display_name.trim()
+            : packId,
+        imageCount: Object.keys(images).length,
+        sampleShortcodes: Object.keys(images).slice(0, 8),
+      };
+    }),
+    roomPackCount: roomPackIds.size,
+    dedupedPackSummaries: Array.from(packSummaryMap.values()).sort((a, b) =>
+      a.packName.localeCompare(b.packName, 'zh-Hans-CN')
+    ),
+  };
+}
+
 export function getDirectRoomIdForUser(client: MatrixClient, userId: string): string | undefined {
   const content = getAccountDataContent(client, 'm.direct');
   const roomIds = content?.[userId];
@@ -1164,6 +2267,44 @@ export async function sendTextMessage(
         }
       : {}),
   } as never);
+}
+
+const cloneForwardContent = (content: Record<string, unknown>): Record<string, unknown> =>
+  JSON.parse(JSON.stringify(content)) as Record<string, unknown>;
+
+const sanitizeForwardContent = (content: Record<string, unknown>): Record<string, unknown> => {
+  const forwardedContent = cloneForwardContent(content);
+  delete forwardedContent['m.relates_to'];
+  delete forwardedContent['m.mentions'];
+  return forwardedContent;
+};
+
+export async function forwardMessagesToRooms(
+  client: MatrixClient,
+  roomIds: string[],
+  messages: ChatMessage[]
+): Promise<void> {
+  const sortedMessages = [...messages]
+    .filter((message) => message.kind === 'message' && message.forwardContent)
+    .sort((a, b) => a.timestamp - b.timestamp);
+
+  for (const roomId of roomIds) {
+    for (const message of sortedMessages) {
+      const forwardedContent = sanitizeForwardContent(message.forwardContent!);
+
+      if (message.eventType === 'm.sticker') {
+        await client.sendEvent(roomId, 'm.sticker' as never, forwardedContent as never);
+        continue;
+      }
+
+      if (message.eventType === 'm.room.message') {
+        await client.sendMessage(roomId, forwardedContent as never);
+        continue;
+      }
+
+      await client.sendEvent(roomId, message.eventType as never, forwardedContent as never);
+    }
+  }
 }
 
 const getCryptoApi = (client: MatrixClient) => {
@@ -1234,9 +2375,39 @@ export async function restoreKeyBackupWithPassphrase(
 ): Promise<KeyRestoreResult> {
   const trimmed = passphrase.trim();
   if (!trimmed) throw new Error('请输入恢复密钥或密钥备份口令。');
-  return getCryptoApi(client).restoreKeyBackupWithPassphrase(trimmed, {
-    progressCallback: onProgress,
+  const api = getCryptoApi(client);
+  let secretStorageError: unknown;
+
+  const cachedSecretStorageKey = await cacheSecretStorageKeyFromInput(client, trimmed).catch((error) => {
+    secretStorageError = error;
+    return { cached: false as const };
   });
+
+  if (cachedSecretStorageKey.cached) {
+    try {
+      await api.loadSessionBackupPrivateKeyFromSecretStorage();
+      return await api.restoreKeyBackup({ progressCallback: onProgress });
+    } catch (error) {
+      secretStorageError = error;
+    }
+  }
+
+  try {
+    return await api.restoreKeyBackupWithPassphrase(trimmed, {
+      progressCallback: onProgress,
+    });
+  } catch (backupError) {
+    if (secretStorageError) {
+      const storageMessage =
+        secretStorageError instanceof Error ? secretStorageError.message : String(secretStorageError);
+      const backupMessage =
+        backupError instanceof Error ? backupError.message : String(backupError);
+      throw new Error(
+        `恢复失败：安全存储无法打开（${storageMessage}）；密钥备份口令也无法恢复（${backupMessage}）。`
+      );
+    }
+    throw backupError;
+  }
 }
 
 export async function sendEmoteMessage(
@@ -1251,6 +2422,22 @@ export async function sendEmoteMessage(
     msgtype: MsgType.Emote,
     body: trimmed,
   } as never);
+}
+
+export async function sendStickerMessage(
+  client: MatrixClient,
+  roomId: string,
+  sticker: CustomEmojiItem
+): Promise<void> {
+  await client.sendEvent(
+    roomId,
+    'm.sticker' as never,
+    {
+      body: sticker.body || sticker.shortcode,
+      url: sticker.mxcUrl,
+      info: sticker.info ?? {},
+    } as never
+  );
 }
 
 export async function sendReplyMessage(
@@ -1371,6 +2558,59 @@ export async function getOwnProfile(client: MatrixClient): Promise<OwnProfile> {
   };
 }
 
+export function getExploreSources(client: MatrixClient): ExploreSource[] {
+  const content = getAccountDataContent(client, 'in.cinny.explore_sources');
+  const sourceItems = content?.sources;
+  if (!Array.isArray(sourceItems)) return [];
+
+  return sourceItems.reduce<ExploreSource[]>((sources, item) => {
+    if (!item || typeof item !== 'object') return sources;
+
+    const source = item as Record<string, unknown>;
+    const id = trimOptionalText(source.id);
+    if (!id || !isExploreSourceKind(source.kind)) return sources;
+
+    const fallbackTimestamp = Date.now();
+
+    try {
+      const normalizedValue =
+        source.kind === 'nav'
+          ? normalizeOptionalText(source.value)
+          : normalizeExploreSourceValue(source.kind, source.value);
+      const title = trimOptionalText(source.title) ?? getDefaultExploreSourceTitle(source.kind, normalizedValue);
+
+      sources.push({
+        id,
+        kind: source.kind,
+        title,
+        value: normalizedValue,
+        createdAt: toTimestamp(source.createdAt, fallbackTimestamp),
+        updatedAt: toTimestamp(source.updatedAt, fallbackTimestamp),
+        webOpenMode:
+          source.kind === 'web' && isExploreWebOpenMode(source.webOpenMode)
+            ? source.webOpenMode
+            : source.kind === 'web'
+              ? 'auto'
+              : undefined,
+        webEmbedStatus:
+          source.kind === 'web' && isExploreWebEmbedStatus(source.webEmbedStatus)
+            ? source.webEmbedStatus
+            : source.kind === 'web'
+              ? 'unknown'
+              : undefined,
+        navSections:
+          source.kind === 'nav'
+            ? normalizeExploreNavSections(source.navSections) ?? []
+            : undefined,
+      });
+    } catch {
+      // Ignore malformed saved entries.
+    }
+
+    return sources;
+  }, []);
+}
+
 export async function updateOwnAvatar(client: MatrixClient, file: File): Promise<void> {
   const upload = await client.uploadContent(file, {
     name: file.name,
@@ -1483,20 +2723,38 @@ export async function sendReaction(
   );
 }
 
-export async function markRoomRead(client: MatrixClient, roomId: string): Promise<void> {
+export async function markRoomRead(
+  client: MatrixClient,
+  roomId: string,
+  options?: { sendReceipt?: boolean }
+): Promise<void> {
   const room = client.getRoom(roomId);
   const events = room?.getLiveTimeline().getEvents() ?? [];
   const lastEvent = events[events.length - 1];
   const eventId = lastEvent?.getId();
   if (!room || !lastEvent || !eventId) return;
 
-  await Promise.allSettled([
+  const sendReceipt = options?.sendReceipt ?? true;
+  setOptimisticRoomReadMarker(roomId, eventId, client.getUserId());
+
+  const tasks: Array<Promise<unknown> | undefined> = [
     (client as unknown as {
-      setRoomReadMarkers?: (targetRoomId: string, readEventId: string, event: MatrixEvent) => Promise<unknown>;
-    }).setRoomReadMarkers?.(roomId, eventId, lastEvent),
-    (client as unknown as { sendReadReceipt?: (event: MatrixEvent) => Promise<unknown> })
-      .sendReadReceipt?.(lastEvent),
-  ]);
+      setRoomReadMarkers?: (
+        targetRoomId: string,
+        readEventId: string,
+        readReceiptEvent?: MatrixEvent
+      ) => Promise<unknown>;
+    }).setRoomReadMarkers?.(roomId, eventId, sendReceipt ? lastEvent : undefined),
+  ];
+
+  if (sendReceipt) {
+    tasks.push(
+      (client as unknown as { sendReadReceipt?: (event: MatrixEvent) => Promise<unknown> })
+        .sendReadReceipt?.(lastEvent)
+    );
+  }
+
+  await Promise.allSettled(tasks);
 }
 
 export async function acceptInvite(client: MatrixClient, roomId: string): Promise<void> {
