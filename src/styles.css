@@ -299,7 +299,9 @@ h2 {
 .theme-dark .profile-card,
 .theme-dark .preference-card,
 .theme-dark .room-profile-form,
-.theme-dark .media-strip {
+.theme-dark .media-strip,
+.theme-dark .pinned-list,
+.theme-dark .pinned-bar {
   color: #e5edf5;
   border-color: #2f3a4c;
   background: #182231;
@@ -315,6 +317,7 @@ h2 {
 
 .theme-dark .chat-header,
 .theme-dark .chat-tools,
+.theme-dark .chat-status-stack,
 .theme-dark .composer,
 .theme-dark .bottom-nav {
   border-color: #273244;
@@ -376,9 +379,15 @@ h2 {
 }
 
 .theme-dark .command-hint,
-.theme-dark .member-action {
+.theme-dark .member-action,
+.theme-dark .pinned-count {
   color: #c8f3fb;
   background: #123744;
+}
+
+.theme-dark .pinned-summary,
+.theme-dark .pinned-row button:first-child {
+  color: #d9e5ee;
 }
 
 .density-compact .room-row {
@@ -864,6 +873,22 @@ h2 {
   background: #fbfcfd;
 }
 
+.chat-status-stack {
+  display: grid;
+  gap: 8px;
+  padding: 8px 16px 0;
+  background: #ffffff;
+}
+
+.chat-status-stack:empty {
+  padding: 0;
+}
+
+.chat-status-stack .message-box.inline {
+  width: 100%;
+  margin: 0;
+}
+
 .tool-button {
   min-height: 38px;
   padding: 0 12px;
@@ -874,6 +899,68 @@ h2 {
   background: #eef2f6;
   font-size: 13px;
   font-weight: 800;
+}
+
+.pinned-bar {
+  min-height: 44px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px;
+  border: 1px solid #dbe3ea;
+  border-radius: 8px;
+  background: #f6fafb;
+}
+
+.pinned-summary {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  color: #334155;
+  text-align: left;
+  background: transparent;
+}
+
+.pinned-summary span,
+.pinned-row span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+}
+
+.pinned-summary strong,
+.pinned-summary small,
+.pinned-row strong,
+.pinned-row small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pinned-summary strong,
+.pinned-row strong {
+  font-size: 13px;
+}
+
+.pinned-summary small,
+.pinned-row small {
+  color: #667085;
+  font-size: 12px;
+}
+
+.pinned-count {
+  min-width: 32px;
+  height: 32px;
+  border: 0;
+  border-radius: 8px;
+  color: #0f6b82;
+  background: #e0f1f4;
+  font-weight: 850;
 }
 
 .timeline {
@@ -1312,6 +1399,7 @@ h2 {
   background: #fbfcfd;
 }
 
+.pinned-list,
 .media-strip,
 .profile-card,
 .preference-card {
@@ -1319,6 +1407,37 @@ h2 {
   border: 1px solid #dbe3ea;
   border-radius: 8px;
   background: #fbfcfd;
+}
+
+.pinned-list {
+  display: grid;
+  gap: 8px;
+}
+
+.pinned-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.pinned-row button:first-child {
+  min-width: 0;
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 8px;
+  color: #334155;
+  text-align: left;
+  background: transparent;
+}
+
+.pinned-row button:first-child:hover {
+  background: #eef6f8;
 }
 
 .media-grid {
@@ -1550,6 +1669,10 @@ h2 {
   overflow: auto;
 }
 
+.member-search {
+  margin-bottom: 8px;
+}
+
 .section-title {
   display: flex;
   justify-content: space-between;
@@ -1585,12 +1708,28 @@ h2 {
 .member-action {
   min-height: 30px;
   padding: 0 9px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
   border: 0;
   border-radius: 8px;
   color: #0f6b82;
   background: #e0f1f4;
   font-size: 12px;
   font-weight: 850;
+}
+
+.member-action.subtle {
+  color: #52606d;
+  background: #eef2f6;
+}
+
+.member-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 5px;
+  flex-wrap: wrap;
 }
 
 .explore-panel,
@@ -1753,6 +1892,10 @@ h2 {
     padding: 8px 10px;
   }
 
+  .chat-status-stack {
+    padding: 8px 10px 0;
+  }
+
   .tool-button {
     width: 38px;
     padding: 0;
@@ -1781,5 +1924,23 @@ h2 {
   .stat-grid,
   .sheet-actions {
     grid-template-columns: 1fr;
+  }
+
+  .pinned-row {
+    grid-template-columns: 1fr;
+  }
+
+  .pinned-row .member-action {
+    justify-self: start;
+  }
+
+  .member-row {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .member-actions {
+    grid-column: 2;
+    justify-content: flex-start;
   }
 }

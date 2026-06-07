@@ -18,11 +18,14 @@ import {
   History,
   Image as ImageIcon,
   Info,
+  Link2,
   Lock,
   LogOut,
   MessageCircle,
   MessageSquarePlus,
   Moon,
+  Pin,
+  PinOff,
   Plus,
   Reply,
   Search,
@@ -58,8 +61,10 @@ import {
   createGroupRoom,
   createMatrixRuntime,
   editTextMessage,
+  getDirectRoomIdForUser,
   getMatrixSnapshot,
   getOwnProfile,
+  getPinnedMessages,
   getRoomMediaItems,
   getRoomMembers,
   getRoomMessages,
@@ -72,6 +77,7 @@ import {
   MatrixSnapshot,
   OwnProfile,
   paginateRoomMessages,
+  PinnedMessageSummary,
   PublicRoomSummary,
   redactMessage,
   rejectInvite,
@@ -84,6 +90,7 @@ import {
   sendReplyMessage,
   sendReaction,
   sendTextMessage,
+  setMessagePinned,
   setRoomMuted,
   updateOwnAvatar,
   updateOwnDisplayName,
@@ -277,6 +284,19 @@ const extractMentionUserIds = (body: string, members: RoomMemberSummary[]): stri
     .filter((member) => body.includes(member.id) || body.includes(`@${member.name}`))
     .map((member) => member.id);
 
+const buildMatrixPermalink = (room: Pick<RoomSummary, 'id' | 'canonicalAlias'>, eventId?: string): string => {
+  const roomPart = encodeURIComponent(room.canonicalAlias ?? room.id);
+  const eventPart = eventId ? `/${encodeURIComponent(eventId)}` : '';
+  return `https://matrix.to/#/${roomPart}${eventPart}`;
+};
+
+const memberRoleLabel = (powerLevel = 0): string => {
+  if (powerLevel >= 100) return '管理员';
+  if (powerLevel >= 50) return '版主';
+  if (powerLevel > 0) return `权限 ${powerLevel}`;
+  return '成员';
+};
+
 export function App() {
   const runtimeStopRef = useRef<(() => void) | undefined>();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -313,6 +333,7 @@ export function App() {
   const [roomMembers, setRoomMembers] = useState<RoomMemberSummary[]>([]);
   const [typingMembers, setTypingMembers] = useState<string[]>([]);
   const [roomMediaItems, setRoomMediaItems] = useState<RoomMediaItem[]>([]);
+  const [pinnedMessages, setPinnedMessages] = useState<PinnedMessageSummary[]>([]);
   const [previewMedia, setPreviewMedia] = useState<RoomMediaItem>();
   const [pendingScrollEventId, setPendingScrollEventId] = useState<string>();
   const [highlightedMessageId, setHighlightedMessageId] = useState<string>();
@@ -363,6 +384,7 @@ export function App() {
     setRoomMembers([]);
     setTypingMembers([]);
     setRoomMediaItems([]);
+    setPinnedMessages([]);
     setPendingScrollEventId(undefined);
     setHighlightedMessageId(undefined);
   }, []);
@@ -523,10 +545,12 @@ export function App() {
       setRoomMembers([]);
       setTypingMembers([]);
       setRoomMediaItems([]);
+      setPinnedMessages([]);
       return;
     }
     setRoomMembers(getRoomMembers(client, selectedRoomId));
     setRoomMediaItems(getRoomMediaItems(client, selectedRoomId));
+    setPinnedMessages(getPinnedMessages(client, selectedRoomId));
   }, [client, selectedRoomId, snapshot.version]);
 
   useEffect(() => {
@@ -773,6 +797,21 @@ export function App() {
     setNotice('消息已复制');
   };
 
+  const handleCopyMessageLink = async (message: ChatMessage) => {
+    const room = snapshot.rooms.find((item) => item.id === message.roomId);
+    if (!room) return;
+    await navigator.clipboard?.writeText(buildMatrixPermalink(room, message.id));
+    setNotice('消息链接已复制');
+  };
+
+  const handleTogglePinMessage = async (message: ChatMessage) => {
+    if (!client) return;
+    await runAction(
+      () => setMessagePinned(client, message.roomId, message.id, !message.pinned),
+      message.pinned ? '已取消置顶' : '已置顶消息'
+    );
+  };
+
   const handleEditMessage = (message: ChatMessage) => {
     setComposerMode({ type: 'edit', message });
     setMessageDraft(message.body);
@@ -862,6 +901,34 @@ export function App() {
     }
     setSheet(undefined);
     setMobilePane('chat');
+  };
+
+  const handleCopyMember = async (member: RoomMemberSummary) => {
+    await navigator.clipboard?.writeText(member.id);
+    setNotice('成员 ID 已复制');
+  };
+
+  const handleDirectMember = async (member: RoomMemberSummary) => {
+    if (!client) return;
+    if (member.id === session?.userId) {
+      setNotice('这是你自己的账号');
+      return;
+    }
+
+    await runAction(async () => {
+      const existingRoomId = getDirectRoomIdForUser(client, member.id);
+      const roomId =
+        existingRoomId ??
+        (await createDirectRoom(client, {
+          userId: member.id,
+          encrypted: selectedRoom?.encrypted ?? true,
+        }));
+
+      setSelectedRoomId(roomId);
+      setActiveView('direct');
+      setSheet(undefined);
+      setMobilePane('chat');
+    }, '已打开私聊');
   };
 
   const toggleFavoriteRoom = (roomId: string) => {
@@ -1184,8 +1251,17 @@ export function App() {
               </button>
             </div>
 
-            {error && <button className="message-box danger inline" type="button" onClick={() => setError(undefined)}>{error}</button>}
-            {notice && <button className="message-box success inline" type="button" onClick={() => setNotice(undefined)}>{notice}</button>}
+            <div className="chat-status-stack">
+              {pinnedMessages.length > 0 && (
+                <PinnedBar
+                  items={pinnedMessages}
+                  onOpen={(eventId) => setPendingScrollEventId(eventId)}
+                  onOpenAll={() => setSheet('roomInfo')}
+                />
+              )}
+              {error && <button className="message-box danger inline" type="button" onClick={() => setError(undefined)}>{error}</button>}
+              {notice && <button className="message-box success inline" type="button" onClick={() => setNotice(undefined)}>{notice}</button>}
+            </div>
 
             <div className="timeline" ref={timelineRef}>
               <button className="load-older" onClick={handleLoadOlder} disabled={loadingOlder}>
@@ -1213,6 +1289,8 @@ export function App() {
                     onEdit={() => handleEditMessage(message)}
                     onRedact={() => handleRedactMessage(message)}
                     onCopy={() => handleCopyMessage(message)}
+                    onCopyLink={() => handleCopyMessageLink(message)}
+                    onTogglePin={() => handleTogglePinMessage(message)}
                     onReact={(key) =>
                       client &&
                       runAction(() => sendReaction(client, message.roomId, message.id, key), '已添加回应')
@@ -1314,13 +1392,28 @@ export function App() {
           profileForm={roomProfileForm}
           favorite={favoriteRoomIds.includes(selectedRoom.id)}
           mediaItems={roomMediaItems}
+          pinnedMessages={pinnedMessages}
+          currentUserId={session?.userId}
           onClose={() => setSheet(undefined)}
           onInvite={handleInviteSubmit}
           onProfileChange={setRoomProfileForm}
           onProfileSubmit={handleRoomProfileSubmit}
           onAvatarSelected={handleRoomAvatarSelected}
           onPreviewMedia={setPreviewMedia}
+          onOpenPinned={(eventId) => {
+            setSheet(undefined);
+            setPendingScrollEventId(eventId);
+          }}
+          onUnpinMessage={(eventId) =>
+            client &&
+            runAction(
+              () => setMessagePinned(client, selectedRoom.id, eventId, false),
+              '已取消置顶'
+            )
+          }
           onMentionMember={handleMentionMember}
+          onCopyMember={handleCopyMember}
+          onDirectMember={handleDirectMember}
           onToggleMute={() =>
             client &&
             runAction(
@@ -1500,6 +1593,34 @@ function LocalSearchDigest({
   );
 }
 
+function PinnedBar({
+  items,
+  onOpen,
+  onOpenAll,
+}: {
+  items: PinnedMessageSummary[];
+  onOpen: (eventId: string) => void;
+  onOpenAll: () => void;
+}) {
+  const first = items[0];
+  if (!first) return null;
+
+  return (
+    <section className="pinned-bar">
+      <button className="pinned-summary" onClick={() => onOpen(first.id)}>
+        <Pin size={16} />
+        <span>
+          <strong>{first.senderName ?? '置顶消息'}</strong>
+          <small>{first.body}</small>
+        </span>
+      </button>
+      <button className="pinned-count" onClick={onOpenAll}>
+        {items.length}
+      </button>
+    </section>
+  );
+}
+
 function MessageBubble({
   message,
   favorite,
@@ -1509,6 +1630,8 @@ function MessageBubble({
   onEdit,
   onRedact,
   onCopy,
+  onCopyLink,
+  onTogglePin,
   onReact,
 }: {
   message: ChatMessage;
@@ -1519,6 +1642,8 @@ function MessageBubble({
   onEdit: () => void;
   onRedact: () => void;
   onCopy: () => void;
+  onCopyLink: () => void;
+  onTogglePin: () => void;
   onReact: (key: string) => void;
 }) {
   if (message.kind === 'system') {
@@ -1540,6 +1665,7 @@ function MessageBubble({
           {!message.mine && <strong>{message.senderName ?? message.sender}</strong>}
           <span>{formatTime(message.timestamp)}</span>
           {message.encrypted && <Shield size={13} />}
+          {message.pinned && <Pin size={13} />}
           {message.edited && <span>已编辑</span>}
         </div>
         <div className="bubble">
@@ -1585,9 +1711,17 @@ function MessageBubble({
             <Star size={14} />
             收藏
           </button>
+          <button className={message.pinned ? 'active' : ''} onClick={onTogglePin}>
+            {message.pinned ? <PinOff size={14} /> : <Pin size={14} />}
+            {message.pinned ? '取消置顶' : '置顶'}
+          </button>
           <button onClick={onCopy}>
             <Copy size={14} />
             复制
+          </button>
+          <button onClick={onCopyLink}>
+            <Link2 size={14} />
+            链接
           </button>
           {message.canRedact && (
             <button className="danger" onClick={onRedact}>
@@ -1737,14 +1871,20 @@ function RoomInfoSheet({
   members,
   profileForm,
   mediaItems,
+  pinnedMessages,
   favorite,
+  currentUserId,
   onClose,
   onInvite,
   onProfileChange,
   onProfileSubmit,
   onAvatarSelected,
   onPreviewMedia,
+  onOpenPinned,
+  onUnpinMessage,
   onMentionMember,
+  onCopyMember,
+  onDirectMember,
   onToggleMute,
   onFavorite,
   onLeave,
@@ -1753,18 +1893,35 @@ function RoomInfoSheet({
   members: RoomMemberSummary[];
   profileForm: { name: string; topic: string };
   mediaItems: RoomMediaItem[];
+  pinnedMessages: PinnedMessageSummary[];
   favorite: boolean;
+  currentUserId?: string;
   onClose: () => void;
   onInvite: (evt: FormEvent<HTMLFormElement>) => void;
   onProfileChange: (value: { name: string; topic: string }) => void;
   onProfileSubmit: (evt: FormEvent<HTMLFormElement>) => void;
   onAvatarSelected: (file: File) => void;
   onPreviewMedia: (media: RoomMediaItem) => void;
+  onOpenPinned: (eventId: string) => void;
+  onUnpinMessage: (eventId: string) => void;
   onMentionMember: (member: RoomMemberSummary) => void;
+  onCopyMember: (member: RoomMemberSummary) => void;
+  onDirectMember: (member: RoomMemberSummary) => void;
   onToggleMute: () => void;
   onFavorite: () => void;
   onLeave: () => void;
 }) {
+  const [memberQuery, setMemberQuery] = useState('');
+  const visibleMembers = useMemo(() => {
+    const query = memberQuery.trim().toLowerCase();
+    if (!query) return members;
+    return members.filter((member) =>
+      `${member.name} ${member.id} ${memberRoleLabel(member.powerLevel)}`
+        .toLowerCase()
+        .includes(query)
+    );
+  }, [memberQuery, members]);
+
   return (
     <div className="sheet-backdrop">
       <section className="sheet room-sheet">
@@ -1841,15 +1998,44 @@ function RoomInfoSheet({
             <Bell size={17} />
             {room.muted ? '取消静音' : '静音'}
           </button>
-          <button onClick={() => navigator.clipboard?.writeText(room.canonicalAlias ?? room.id)}>
+          <button onClick={() => navigator.clipboard?.writeText(buildMatrixPermalink(room))}>
             <Copy size={17} />
-            复制地址
+            复制链接
           </button>
           <button className="danger" onClick={onLeave}>
             <DoorOpen size={17} />
             离开
           </button>
         </div>
+
+        <section className="pinned-list">
+          <div className="section-title">
+            <span>置顶消息</span>
+            <strong>{pinnedMessages.length}</strong>
+          </div>
+          {pinnedMessages.length === 0 ? (
+            <p className="digest-empty">长按或使用消息操作里的置顶，把重要内容固定在这里。</p>
+          ) : (
+            pinnedMessages.map((message) => (
+              <div className="pinned-row" key={message.id}>
+                <button onClick={() => onOpenPinned(message.id)}>
+                  <Pin size={16} />
+                  <span>
+                    <strong>{message.senderName ?? '置顶消息'}</strong>
+                    <small>
+                      {!message.available ? '未同步 · ' : ''}
+                      {message.timestamp ? `${formatTime(message.timestamp)} · ` : ''}
+                      {message.body}
+                    </small>
+                  </span>
+                </button>
+                <button className="member-action subtle" onClick={() => onUnpinMessage(message.id)}>
+                  移除
+                </button>
+              </div>
+            ))
+          )}
+        </section>
 
         <MediaStrip items={mediaItems} onPreview={onPreviewMedia} />
 
@@ -1863,18 +2049,40 @@ function RoomInfoSheet({
         <div className="member-list">
           <div className="section-title">
             <span>成员</span>
-            <strong>{members.length}</strong>
+            <strong>{visibleMembers.length}/{members.length}</strong>
           </div>
-          {members.slice(0, 80).map((member) => (
+          <label className="search-field member-search">
+            <Search size={15} />
+            <input
+              value={memberQuery}
+              placeholder="搜索成员、Matrix ID 或角色"
+              autoCapitalize="none"
+              autoCorrect="off"
+              onChange={(evt) => setMemberQuery(evt.target.value)}
+            />
+          </label>
+          {visibleMembers.slice(0, 120).map((member) => (
             <div className="member-row" key={member.id}>
               <Avatar name={member.name} src={member.avatarUrl} small />
               <span>
                 <strong>{member.name}</strong>
-                <small>{member.id}</small>
+                <small>{memberRoleLabel(member.powerLevel)} · {member.id}</small>
               </span>
-              <button className="member-action" onClick={() => onMentionMember(member)}>
-                提及
-              </button>
+              <div className="member-actions">
+                <button className="member-action" onClick={() => onMentionMember(member)}>
+                  <AtSign size={13} />
+                  提及
+                </button>
+                {member.id !== currentUserId && (
+                  <button className="member-action" onClick={() => onDirectMember(member)}>
+                    <MessageCircle size={13} />
+                    私聊
+                  </button>
+                )}
+                <button className="member-action subtle" onClick={() => onCopyMember(member)}>
+                  <Copy size={13} />
+                </button>
+              </div>
             </div>
           ))}
         </div>

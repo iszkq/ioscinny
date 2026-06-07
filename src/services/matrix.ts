@@ -76,6 +76,7 @@ export type ChatMessage = {
   encrypted: boolean;
   canEdit: boolean;
   canRedact: boolean;
+  pinned: boolean;
   replyTo?: ChatReply;
   attachment?: ChatAttachment;
   reactions: ChatReaction[];
@@ -103,6 +104,15 @@ export type RoomMediaItem = {
   name: string;
   senderName?: string;
   timestamp: number;
+};
+
+export type PinnedMessageSummary = {
+  id: string;
+  roomId: string;
+  body: string;
+  senderName?: string;
+  timestamp?: number;
+  available: boolean;
 };
 
 export type LocalMessageSearchResult = {
@@ -268,6 +278,15 @@ const getPlainBody = (content: Record<string, unknown>): string => {
 
 const getEventById = (room: Room, eventId: string): MatrixEvent | undefined =>
   room.getLiveTimeline().getEvents().find((event) => event.getId() === eventId);
+
+const getRoomPinnedEventIds = (room: Room): string[] => {
+  const event = room.currentState?.getStateEvents('m.room.pinned_events', '');
+  const content = event?.getContent() as Record<string, unknown> | undefined;
+  const pinned = content?.pinned;
+  return Array.isArray(pinned)
+    ? pinned.filter((eventId): eventId is string => typeof eventId === 'string')
+    : [];
+};
 
 const getReplyPreview = (
   client: MatrixClient,
@@ -532,6 +551,7 @@ const eventToChatMessage = (
   const relationType = getRelationType(content);
   if (relationType === 'm.replace' || relationType === 'm.annotation') return undefined;
 
+  const pinnedEventIds = getRoomPinnedEventIds(room);
   const sender = event.getSender() ?? undefined;
   const latestEditContent = getLatestEditContent(room, id, eventType, sender);
   const displayContent = latestEditContent ?? content;
@@ -553,6 +573,7 @@ const eventToChatMessage = (
       (displayContent.msgtype === MsgType.Text || displayContent.msgtype === 'm.text') &&
       !event.isRedacted?.(),
     canRedact: sender === client.getUserId() && !event.isRedacted?.(),
+    pinned: pinnedEventIds.includes(id),
     replyTo: getReplyPreview(client, room, content),
     reactions: getEventReactions(client, room, id),
   };
@@ -935,6 +956,34 @@ export function getRoomMediaItems(client: MatrixClient, roomId: string): RoomMed
     .reverse();
 }
 
+export function getPinnedMessages(client: MatrixClient, roomId: string): PinnedMessageSummary[] {
+  const room = client.getRoom(roomId);
+  if (!room) return [];
+
+  return getRoomPinnedEventIds(room).map((eventId) => {
+    const event = getEventById(room, eventId);
+    const message = event ? eventToChatMessage(client, room, event) : undefined;
+
+    if (message) {
+      return {
+        id: message.id,
+        roomId,
+        body: message.body,
+        senderName: message.senderName,
+        timestamp: message.timestamp,
+        available: true,
+      };
+    }
+
+    return {
+      id: eventId,
+      roomId,
+      body: '这条置顶消息还没有同步到本地时间线',
+      available: false,
+    };
+  });
+}
+
 export function getRoomMembers(client: MatrixClient, roomId: string): RoomMemberSummary[] {
   const room = client.getRoom(roomId);
   if (!room) return [];
@@ -957,6 +1006,21 @@ export function getRoomMembers(client: MatrixClient, roomId: string): RoomMember
           : 0,
     }))
     .sort((a, b) => b.powerLevel - a.powerLevel || a.name.localeCompare(b.name, 'zh-Hans-CN'));
+}
+
+export function getDirectRoomIdForUser(client: MatrixClient, userId: string): string | undefined {
+  const event = client.getAccountData('m.direct');
+  const content = event?.getContent() as Record<string, unknown> | undefined;
+  const roomIds = content?.[userId];
+
+  if (!Array.isArray(roomIds)) return undefined;
+
+  return roomIds.find((roomId): roomId is string => {
+    if (typeof roomId !== 'string') return false;
+    const room = client.getRoom(roomId);
+    const membership = room?.getMyMembership();
+    return membership === 'join' || membership === 'invite';
+  });
 }
 
 export async function sendTextMessage(
@@ -1078,6 +1142,28 @@ export async function setRoomMuted(
   await (client as unknown as {
     setRoomMutePushRule: (scope: string, targetRoomId: string, mute: boolean) => Promise<unknown>;
   }).setRoomMutePushRule('global', roomId, muted);
+}
+
+export async function setMessagePinned(
+  client: MatrixClient,
+  roomId: string,
+  eventId: string,
+  pinned: boolean
+): Promise<void> {
+  const room = client.getRoom(roomId);
+  if (!room) return;
+
+  const currentPinnedEventIds = getRoomPinnedEventIds(room);
+  const nextPinnedEventIds = pinned
+    ? Array.from(new Set([eventId, ...currentPinnedEventIds]))
+    : currentPinnedEventIds.filter((id) => id !== eventId);
+
+  await client.sendStateEvent(
+    roomId,
+    'm.room.pinned_events' as never,
+    { pinned: nextPinnedEventIds } as never,
+    ''
+  );
 }
 
 export async function getOwnProfile(client: MatrixClient): Promise<OwnProfile> {
