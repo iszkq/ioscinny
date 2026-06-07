@@ -1311,6 +1311,28 @@ export async function inviteUser(client: MatrixClient, roomId: string, userId: s
   await client.invite(roomId, trimmed);
 }
 
+export async function kickMember(
+  client: MatrixClient,
+  roomId: string,
+  userId: string,
+  reason = ''
+): Promise<void> {
+  await (client as unknown as {
+    kick: (targetRoomId: string, targetUserId: string, kickReason?: string) => Promise<unknown>;
+  }).kick(roomId, userId, reason.trim() || undefined);
+}
+
+export async function banMember(
+  client: MatrixClient,
+  roomId: string,
+  userId: string,
+  reason = ''
+): Promise<void> {
+  await (client as unknown as {
+    ban: (targetRoomId: string, targetUserId: string, banReason?: string) => Promise<unknown>;
+  }).ban(roomId, userId, reason.trim() || undefined);
+}
+
 export async function updateRoomProfile(
   client: MatrixClient,
   roomId: string,

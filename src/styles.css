@@ -299,6 +299,9 @@ h2 {
 .theme-dark .profile-card,
 .theme-dark .preference-card,
 .theme-dark .room-profile-form,
+.theme-dark .message-detail-preview,
+.theme-dark .message-detail-grid,
+.theme-dark .reaction-panel,
 .theme-dark .media-strip,
 .theme-dark .pinned-list,
 .theme-dark .pinned-bar {
@@ -378,11 +381,25 @@ h2 {
   background: #0f6b82;
 }
 
+.theme-dark .detail-row strong {
+  color: #e5edf5;
+}
+
 .theme-dark .command-hint,
 .theme-dark .member-action,
 .theme-dark .pinned-count {
   color: #c8f3fb;
   background: #123744;
+}
+
+.theme-dark .date-separator span,
+.theme-dark .reaction-picker button,
+.theme-dark .reaction-list button,
+.theme-dark .message-info-actions button,
+.theme-dark .quick-reactions {
+  color: #d6e1ec;
+  border-color: #334155;
+  background: #202b3a;
 }
 
 .theme-dark .pinned-summary,
@@ -992,6 +1009,26 @@ h2 {
   font-weight: 850;
 }
 
+.date-separator {
+  align-self: center;
+  display: grid;
+  place-items: center;
+  margin: 4px 0;
+}
+
+.date-separator span {
+  min-height: 28px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid #d9e2ec;
+  border-radius: 999px;
+  color: #667085;
+  background: rgba(255, 255, 255, 0.92);
+  font-size: 12px;
+  font-weight: 850;
+}
+
 .message {
   max-width: 82%;
   display: flex;
@@ -1134,6 +1171,25 @@ h2 {
   background: #ffffff;
   font-size: 12px;
   font-weight: 800;
+}
+
+.quick-reactions {
+  min-height: 26px;
+  padding: 0 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  border: 1px solid #d9e2ec;
+  border-radius: 999px;
+  color: #667085;
+  background: #ffffff;
+}
+
+.quick-reactions button {
+  min-width: 24px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
 }
 
 .message-actions button.active {
@@ -1397,6 +1453,112 @@ h2 {
   border: 1px solid #dbe3ea;
   border-radius: 8px;
   background: #fbfcfd;
+}
+
+.message-sheet {
+  grid-template-rows: auto auto auto auto 1fr;
+}
+
+.message-detail-preview,
+.message-detail-grid,
+.reaction-panel {
+  padding: 12px;
+  border: 1px solid #dbe3ea;
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.message-detail-preview {
+  display: grid;
+  gap: 8px;
+}
+
+.message-detail-preview p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.55;
+}
+
+.message-detail-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.detail-row {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 82px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  color: #667085;
+  font-size: 13px;
+}
+
+.detail-row strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: #172033;
+  font-weight: 750;
+}
+
+.reaction-panel {
+  display: grid;
+  gap: 8px;
+}
+
+.reaction-picker,
+.reaction-list,
+.message-info-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.reaction-picker button,
+.reaction-list button,
+.message-info-actions button {
+  min-height: 34px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 1px solid #d9e2ec;
+  border-radius: 8px;
+  color: #344054;
+  background: #ffffff;
+  font-weight: 850;
+}
+
+.reaction-picker button {
+  min-width: 42px;
+  font-size: 18px;
+}
+
+.reaction-list button.active,
+.message-info-actions button.active {
+  color: #a15c00;
+  border-color: #f3d38b;
+  background: #fff7df;
+}
+
+.message-info-actions button.danger {
+  color: #b42318;
+  border-color: #ffd3cc;
+  background: #fff4f2;
+}
+
+.theme-dark .reaction-list button.active,
+.theme-dark .message-info-actions button.active {
+  color: #fde68a;
+  border-color: #785f1d;
+  background: #3c3216;
+}
+
+.theme-dark .message-info-actions button.danger {
+  color: #fecaca;
+  border-color: #6b2a30;
+  background: #4a1f24;
 }
 
 .pinned-list,
@@ -1725,6 +1887,16 @@ h2 {
   background: #eef2f6;
 }
 
+.member-action.danger {
+  color: #b42318;
+  background: #fff1f0;
+}
+
+.theme-dark .member-action.danger {
+  color: #fecaca;
+  background: #4a1f24;
+}
+
 .member-actions {
   display: flex;
   justify-content: flex-end;
@@ -1932,6 +2104,15 @@ h2 {
 
   .pinned-row .member-action {
     justify-self: start;
+  }
+
+  .detail-row {
+    grid-template-columns: 1fr;
+    gap: 3px;
+  }
+
+  .message-info-actions button {
+    flex: 1 1 120px;
   }
 
   .member-row {

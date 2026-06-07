@@ -4,6 +4,7 @@ import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import {
   Archive,
   AtSign,
+  Ban,
   Bell,
   Check,
   ChevronLeft,
@@ -36,6 +37,7 @@ import {
   Sparkles,
   Star,
   Trash2,
+  UserMinus,
   UserPlus,
   Users,
   X,
@@ -43,6 +45,7 @@ import {
 import { MatrixClient, SyncState } from 'matrix-js-sdk';
 import {
   ChangeEvent,
+  Fragment,
   FormEvent,
   KeyboardEvent,
   ReactNode,
@@ -55,6 +58,7 @@ import {
 
 import {
   acceptInvite,
+  banMember,
   ChatReply,
   ChatMessage,
   createDirectRoom,
@@ -71,6 +75,7 @@ import {
   getRoomTypingMembers,
   inviteUser,
   joinRoom,
+  kickMember,
   leaveRoom,
   loginWithPassword,
   markRoomRead,
@@ -110,7 +115,7 @@ type BootState = 'booting' | 'signedOut' | 'connecting' | 'signedIn' | 'error';
 type PrimaryView = 'home' | 'direct' | 'rooms' | 'spaces' | 'invites' | 'favorites' | 'explore' | 'settings';
 type RoomListView = Exclude<PrimaryView, 'explore' | 'settings'>;
 type MobilePane = 'list' | 'chat';
-type Sheet = 'new' | 'roomInfo' | undefined;
+type Sheet = 'new' | 'roomInfo' | { type: 'messageInfo'; message: ChatMessage } | undefined;
 type ComposerMode =
   | { type: 'normal' }
   | { type: 'reply'; message: ChatMessage }
@@ -136,6 +141,7 @@ const favoriteRoomsKey = 'ioscinny.favoriteRooms';
 const favoriteMessagesKey = 'ioscinny.favoriteMessages';
 const appPreferencesKey = 'ioscinny.preferences';
 const roomDraftsKey = 'ioscinny.roomDrafts';
+const quickReactionOptions = ['👍', '❤️', '😂', '🎉', '👀', '✅'];
 
 const emptySnapshot: MatrixSnapshot = {
   version: 0,
@@ -203,6 +209,37 @@ const formatTime = (ts: number): string => {
     return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
   }
   return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+};
+
+const formatFullTime = (ts: number): string =>
+  ts
+    ? new Date(ts).toLocaleString('zh-CN', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      })
+    : '';
+
+const getDayKey = (ts: number): string => new Date(ts).toDateString();
+
+const formatDateSeparator = (ts: number): string => {
+  const date = new Date(ts);
+  const today = new Date();
+  const yesterday = new Date();
+  yesterday.setDate(today.getDate() - 1);
+
+  if (date.toDateString() === today.toDateString()) return '今天';
+  if (date.toDateString() === yesterday.toDateString()) return '昨天';
+
+  return date.toLocaleDateString('zh-CN', {
+    year: date.getFullYear() === today.getFullYear() ? undefined : 'numeric',
+    month: 'long',
+    day: 'numeric',
+    weekday: 'short',
+  });
 };
 
 const loadStringArray = (key: string): string[] => {
@@ -496,6 +533,25 @@ export function App() {
     return getRoomMessages(client, selectedRoomId, messageQuery);
   }, [client, messageQuery, selectedRoomId, snapshot.version]);
 
+  const messageInfoMessage = useMemo(() => {
+    if (!client || typeof sheet !== 'object' || !sheet || sheet.type !== 'messageInfo') {
+      return undefined;
+    }
+
+    return (
+      getRoomMessages(client, sheet.message.roomId).find((message) => message.id === sheet.message.id) ??
+      sheet.message
+    );
+  }, [client, sheet, snapshot.version]);
+
+  const messageInfoRoom = useMemo(
+    () =>
+      messageInfoMessage
+        ? snapshot.rooms.find((room) => room.id === messageInfoMessage.roomId)
+        : undefined,
+    [messageInfoMessage, snapshot.rooms]
+  );
+
   const favoriteMessageItems = useMemo(() => {
     if (!client) return [];
 
@@ -601,7 +657,11 @@ export function App() {
     const target = timelineRef.current?.querySelector<HTMLElement>(
       `[data-message-id="${CSS.escape(pendingScrollEventId)}"]`
     );
-    if (!target) return;
+    if (!target) {
+      setNotice('目标消息还没有同步到本地时间线，可以先加载更早消息');
+      setPendingScrollEventId(undefined);
+      return;
+    }
 
     target.scrollIntoView({ block: 'center', behavior: 'smooth' });
     setHighlightedMessageId(pendingScrollEventId);
@@ -812,14 +872,20 @@ export function App() {
     );
   };
 
+  const handleOpenMessageInfo = (message: ChatMessage) => {
+    setSheet({ type: 'messageInfo', message });
+  };
+
   const handleEditMessage = (message: ChatMessage) => {
     setComposerMode({ type: 'edit', message });
     setMessageDraft(message.body);
+    setSheet(undefined);
   };
 
   const handleRedactMessage = async (message: ChatMessage) => {
     if (!client) return;
     await runAction(() => redactMessage(client, message.roomId, message.id), '消息已撤回');
+    setSheet(undefined);
   };
 
   const handleFileSelected = async (evt: ChangeEvent<HTMLInputElement>) => {
@@ -929,6 +995,26 @@ export function App() {
       setSheet(undefined);
       setMobilePane('chat');
     }, '已打开私聊');
+  };
+
+  const handleKickMember = async (member: RoomMemberSummary) => {
+    if (!client || !selectedRoom) return;
+    if (!window.confirm(`确定要把 ${member.name} 移出这个房间吗？`)) return;
+
+    await runAction(
+      () => kickMember(client, selectedRoom.id, member.id, 'Removed by room moderator'),
+      '已移出成员'
+    );
+  };
+
+  const handleBanMember = async (member: RoomMemberSummary) => {
+    if (!client || !selectedRoom) return;
+    if (!window.confirm(`确定要封禁 ${member.name} 吗？对方将不能重新加入。`)) return;
+
+    await runAction(
+      () => banMember(client, selectedRoom.id, member.id, 'Banned by room moderator'),
+      '已封禁成员'
+    );
   };
 
   const toggleFavoriteRoom = (roomId: string) => {
@@ -1275,28 +1361,38 @@ export function App() {
                   copy={messageQuery ? '换一个关键词试试。' : '发出第一条消息，或者等待同步更多历史记录。'}
                 />
               ) : (
-                selectedRoomMessages.map((message) => (
-                  <MessageBubble
-                    key={message.id}
-                    message={message}
-                    favorite={favoriteMessageIds[message.roomId]?.includes(message.id) ?? false}
-                    highlighted={message.id === highlightedMessageId}
-                    onFavorite={() => toggleFavoriteMessage(message)}
-                    onReply={() => {
-                      setComposerMode({ type: 'reply', message });
-                      setMessageDraft('');
-                    }}
-                    onEdit={() => handleEditMessage(message)}
-                    onRedact={() => handleRedactMessage(message)}
-                    onCopy={() => handleCopyMessage(message)}
-                    onCopyLink={() => handleCopyMessageLink(message)}
-                    onTogglePin={() => handleTogglePinMessage(message)}
-                    onReact={(key) =>
-                      client &&
-                      runAction(() => sendReaction(client, message.roomId, message.id, key), '已添加回应')
-                    }
-                  />
-                ))
+                selectedRoomMessages.map((message, index) => {
+                  const previousMessage = selectedRoomMessages[index - 1];
+                  const showDateSeparator =
+                    !previousMessage || getDayKey(previousMessage.timestamp) !== getDayKey(message.timestamp);
+
+                  return (
+                    <Fragment key={message.id}>
+                      {showDateSeparator && <TimelineDateSeparator timestamp={message.timestamp} />}
+                      <MessageBubble
+                        message={message}
+                        favorite={favoriteMessageIds[message.roomId]?.includes(message.id) ?? false}
+                        highlighted={message.id === highlightedMessageId}
+                        onFavorite={() => toggleFavoriteMessage(message)}
+                        onReply={() => {
+                          setComposerMode({ type: 'reply', message });
+                          setMessageDraft('');
+                        }}
+                        onOpenReply={(eventId) => setPendingScrollEventId(eventId)}
+                        onInfo={() => handleOpenMessageInfo(message)}
+                        onEdit={() => handleEditMessage(message)}
+                        onRedact={() => handleRedactMessage(message)}
+                        onCopy={() => handleCopyMessage(message)}
+                        onCopyLink={() => handleCopyMessageLink(message)}
+                        onTogglePin={() => handleTogglePinMessage(message)}
+                        onReact={(key) =>
+                          client &&
+                          runAction(() => sendReaction(client, message.roomId, message.id, key), '已添加回应')
+                        }
+                      />
+                    </Fragment>
+                  );
+                })
               )}
             </div>
 
@@ -1414,6 +1510,8 @@ export function App() {
           onMentionMember={handleMentionMember}
           onCopyMember={handleCopyMember}
           onDirectMember={handleDirectMember}
+          onKickMember={handleKickMember}
+          onBanMember={handleBanMember}
           onToggleMute={() =>
             client &&
             runAction(
@@ -1430,6 +1528,30 @@ export function App() {
               setMobilePane('list');
             }, '已离开房间')
           }
+        />
+      )}
+
+      {messageInfoMessage && (
+        <MessageInfoSheet
+          message={messageInfoMessage}
+          room={messageInfoRoom}
+          favorite={favoriteMessageIds[messageInfoMessage.roomId]?.includes(messageInfoMessage.id) ?? false}
+          onClose={() => setSheet(undefined)}
+          onReply={() => {
+            setComposerMode({ type: 'reply', message: messageInfoMessage });
+            setMessageDraft('');
+            setSheet(undefined);
+          }}
+          onEdit={() => handleEditMessage(messageInfoMessage)}
+          onFavorite={() => toggleFavoriteMessage(messageInfoMessage)}
+          onTogglePin={() => handleTogglePinMessage(messageInfoMessage)}
+          onCopy={() => handleCopyMessage(messageInfoMessage)}
+          onCopyLink={() => handleCopyMessageLink(messageInfoMessage)}
+          onReact={(key) =>
+            client &&
+            runAction(() => sendReaction(client, messageInfoMessage.roomId, messageInfoMessage.id, key), '已添加回应')
+          }
+          onRedact={() => handleRedactMessage(messageInfoMessage)}
         />
       )}
 
@@ -1621,12 +1743,22 @@ function PinnedBar({
   );
 }
 
+function TimelineDateSeparator({ timestamp }: { timestamp: number }) {
+  return (
+    <div className="date-separator">
+      <span>{formatDateSeparator(timestamp)}</span>
+    </div>
+  );
+}
+
 function MessageBubble({
   message,
   favorite,
   highlighted,
   onFavorite,
   onReply,
+  onOpenReply,
+  onInfo,
   onEdit,
   onRedact,
   onCopy,
@@ -1639,6 +1771,8 @@ function MessageBubble({
   highlighted: boolean;
   onFavorite: () => void;
   onReply: () => void;
+  onOpenReply: (eventId: string) => void;
+  onInfo: () => void;
   onEdit: () => void;
   onRedact: () => void;
   onCopy: () => void;
@@ -1670,7 +1804,7 @@ function MessageBubble({
         </div>
         <div className="bubble">
           {message.replyTo && (
-            <button className="reply-preview" onClick={onReply}>
+            <button className="reply-preview" onClick={() => onOpenReply(message.replyTo!.eventId)}>
               <strong>{message.replyTo.senderName ?? '回复'}</strong>
               <span>{message.replyTo.body}</span>
             </button>
@@ -1703,10 +1837,14 @@ function MessageBubble({
               编辑
             </button>
           )}
-          <button onClick={() => onReact('👍')}>
+          <div className="quick-reactions" aria-label="快速回应">
             <SmilePlus size={14} />
-            回应
-          </button>
+            {quickReactionOptions.map((reaction) => (
+              <button key={reaction} onClick={() => onReact(reaction)}>
+                {reaction}
+              </button>
+            ))}
+          </div>
           <button className={favorite ? 'active' : ''} onClick={onFavorite}>
             <Star size={14} />
             收藏
@@ -1722,6 +1860,10 @@ function MessageBubble({
           <button onClick={onCopyLink}>
             <Link2 size={14} />
             链接
+          </button>
+          <button onClick={onInfo}>
+            <Info size={14} />
+            详情
           </button>
           {message.canRedact && (
             <button className="danger" onClick={onRedact}>
@@ -1866,6 +2008,144 @@ function NewConversationSheet({
   );
 }
 
+function MessageInfoSheet({
+  message,
+  room,
+  favorite,
+  onClose,
+  onReply,
+  onEdit,
+  onFavorite,
+  onTogglePin,
+  onCopy,
+  onCopyLink,
+  onReact,
+  onRedact,
+}: {
+  message: ChatMessage;
+  room?: RoomSummary;
+  favorite: boolean;
+  onClose: () => void;
+  onReply: () => void;
+  onEdit: () => void;
+  onFavorite: () => void;
+  onTogglePin: () => void;
+  onCopy: () => void;
+  onCopyLink: () => void;
+  onReact: (key: string) => void;
+  onRedact: () => void;
+}) {
+  return (
+    <div className="sheet-backdrop">
+      <section className="sheet message-sheet">
+        <header className="sheet-header">
+          <div>
+            <p className="eyebrow">Message</p>
+            <h2>消息详情</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">
+            <X size={20} />
+          </button>
+        </header>
+
+        <div className="message-detail-preview">
+          <div className="message-meta">
+            <strong>{message.senderName ?? message.sender ?? '未知成员'}</strong>
+            <span>{formatFullTime(message.timestamp)}</span>
+          </div>
+          <p>{message.body}</p>
+        </div>
+
+        <div className="message-detail-grid">
+          <DetailRow label="房间" value={room?.name ?? message.roomId} />
+          <DetailRow label="发送者" value={message.sender ?? '未知'} />
+          <DetailRow label="事件 ID" value={message.id} />
+          <DetailRow label="房间 ID" value={message.roomId} />
+          <DetailRow label="类型" value={message.eventType} />
+          <DetailRow label="状态" value={`${message.encrypted ? '已加密' : '未加密'} · ${message.edited ? '已编辑' : '原始'}`} />
+          {message.attachment && (
+            <DetailRow
+              label="附件"
+              value={`${message.attachment.kind} · ${message.attachment.name ?? message.attachment.mimeType ?? '未命名'}`}
+            />
+          )}
+        </div>
+
+        <section className="reaction-panel">
+          <div className="section-title">
+            <span>回应</span>
+            <strong>{message.reactions.reduce((count, reaction) => count + reaction.count, 0)}</strong>
+          </div>
+          <div className="reaction-picker">
+            {quickReactionOptions.map((reaction) => (
+              <button key={reaction} onClick={() => onReact(reaction)}>
+                {reaction}
+              </button>
+            ))}
+          </div>
+          {message.reactions.length > 0 && (
+            <div className="reaction-list">
+              {message.reactions.map((reaction) => (
+                <button
+                  key={reaction.key}
+                  className={reaction.reactedByMe ? 'active' : ''}
+                  onClick={() => onReact(reaction.key)}
+                >
+                  {reaction.key} {reaction.count}
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <div className="message-info-actions">
+          <button onClick={onReply}>
+            <Reply size={16} />
+            回复
+          </button>
+          {message.canEdit && (
+            <button onClick={onEdit}>
+              <Edit3 size={16} />
+              编辑
+            </button>
+          )}
+          <button className={favorite ? 'active' : ''} onClick={onFavorite}>
+            <Star size={16} />
+            {favorite ? '取消收藏' : '收藏'}
+          </button>
+          <button className={message.pinned ? 'active' : ''} onClick={onTogglePin}>
+            {message.pinned ? <PinOff size={16} /> : <Pin size={16} />}
+            {message.pinned ? '取消置顶' : '置顶'}
+          </button>
+          <button onClick={onCopy}>
+            <Copy size={16} />
+            复制文本
+          </button>
+          <button onClick={onCopyLink}>
+            <Link2 size={16} />
+            复制链接
+          </button>
+          {message.canRedact && (
+            <button className="danger" onClick={onRedact}>
+              <Trash2 size={16} />
+              撤回
+            </button>
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function DetailRow({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="detail-row">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
 function RoomInfoSheet({
   room,
   members,
@@ -1885,6 +2165,8 @@ function RoomInfoSheet({
   onMentionMember,
   onCopyMember,
   onDirectMember,
+  onKickMember,
+  onBanMember,
   onToggleMute,
   onFavorite,
   onLeave,
@@ -1907,11 +2189,15 @@ function RoomInfoSheet({
   onMentionMember: (member: RoomMemberSummary) => void;
   onCopyMember: (member: RoomMemberSummary) => void;
   onDirectMember: (member: RoomMemberSummary) => void;
+  onKickMember: (member: RoomMemberSummary) => void;
+  onBanMember: (member: RoomMemberSummary) => void;
   onToggleMute: () => void;
   onFavorite: () => void;
   onLeave: () => void;
 }) {
   const [memberQuery, setMemberQuery] = useState('');
+  const myPowerLevel = members.find((member) => member.id === currentUserId)?.powerLevel ?? 0;
+  const canModerate = myPowerLevel >= 50;
   const visibleMembers = useMemo(() => {
     const query = memberQuery.trim().toLowerCase();
     if (!query) return members;
@@ -2078,6 +2364,18 @@ function RoomInfoSheet({
                     <MessageCircle size={13} />
                     私聊
                   </button>
+                )}
+                {canModerate && member.id !== currentUserId && (member.powerLevel ?? 0) < myPowerLevel && (
+                  <>
+                    <button className="member-action danger" onClick={() => onKickMember(member)}>
+                      <UserMinus size={13} />
+                      移出
+                    </button>
+                    <button className="member-action danger" onClick={() => onBanMember(member)}>
+                      <Ban size={13} />
+                      封禁
+                    </button>
+                  </>
                 )}
                 <button className="member-action subtle" onClick={() => onCopyMember(member)}>
                   <Copy size={13} />
