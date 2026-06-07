@@ -12,9 +12,11 @@ import {
   Copy,
   DoorOpen,
   Edit3,
+  Eye,
   FileUp,
   Hash,
   History,
+  Image as ImageIcon,
   Info,
   Lock,
   LogOut,
@@ -57,6 +59,8 @@ import {
   createMatrixRuntime,
   editTextMessage,
   getMatrixSnapshot,
+  getOwnProfile,
+  getRoomMediaItems,
   getRoomMembers,
   getRoomMessages,
   getRoomTypingMembers,
@@ -66,16 +70,21 @@ import {
   loginWithPassword,
   markRoomRead,
   MatrixSnapshot,
+  OwnProfile,
   paginateRoomMessages,
   PublicRoomSummary,
   redactMessage,
   rejectInvite,
+  RoomMediaItem,
   RoomMemberSummary,
   RoomSummary,
   searchPublicRooms,
+  searchLocalMessages,
   sendReplyMessage,
   sendReaction,
   sendTextMessage,
+  setRoomMuted,
+  updateOwnDisplayName,
   updateRoomProfile,
   updateTypingStatus,
   uploadFileMessage,
@@ -105,10 +114,17 @@ type CreateFormState = {
   encrypted: boolean;
   publicRoom: boolean;
 };
+type AppearanceMode = 'light' | 'dark';
+type DensityMode = 'comfortable' | 'compact';
+type AppPreferences = {
+  appearance: AppearanceMode;
+  density: DensityMode;
+};
 
 const defaultHomeserver = 'https://mtx01.cc';
 const favoriteRoomsKey = 'ioscinny.favoriteRooms';
 const favoriteMessagesKey = 'ioscinny.favoriteMessages';
+const appPreferencesKey = 'ioscinny.preferences';
 
 const emptySnapshot: MatrixSnapshot = {
   version: 0,
@@ -206,6 +222,23 @@ const saveFavoriteMessages = (value: Record<string, string[]>) => {
   window.localStorage.setItem(favoriteMessagesKey, JSON.stringify(value));
 };
 
+const loadPreferences = (): AppPreferences => {
+  try {
+    const value = window.localStorage.getItem(appPreferencesKey);
+    const parsed = value ? (JSON.parse(value) as Partial<AppPreferences>) : {};
+    return {
+      appearance: parsed.appearance === 'dark' ? 'dark' : 'light',
+      density: parsed.density === 'compact' ? 'compact' : 'comfortable',
+    };
+  } catch {
+    return { appearance: 'light', density: 'comfortable' };
+  }
+};
+
+const savePreferences = (value: AppPreferences) => {
+  window.localStorage.setItem(appPreferencesKey, JSON.stringify(value));
+};
+
 const initials = (name: string): string => {
   const trimmed = name.trim();
   if (!trimmed) return '?';
@@ -250,8 +283,13 @@ export function App() {
   const [favoriteMessageIds, setFavoriteMessageIds] = useState<Record<string, string[]>>(
     () => loadFavoriteMessages()
   );
+  const [preferences, setPreferences] = useState<AppPreferences>(() => loadPreferences());
+  const [ownProfile, setOwnProfile] = useState<OwnProfile>();
+  const [profileForm, setProfileForm] = useState({ displayName: '' });
   const [roomMembers, setRoomMembers] = useState<RoomMemberSummary[]>([]);
   const [typingMembers, setTypingMembers] = useState<string[]>([]);
+  const [roomMediaItems, setRoomMediaItems] = useState<RoomMediaItem[]>([]);
+  const [previewMedia, setPreviewMedia] = useState<RoomMediaItem>();
   const [roomProfileForm, setRoomProfileForm] = useState({ name: '', topic: '' });
   const [publicRooms, setPublicRooms] = useState<PublicRoomSummary[]>([]);
   const [publicSearch, setPublicSearch] = useState({ server: '', query: '' });
@@ -298,6 +336,7 @@ export function App() {
     setSelectedRoomId(undefined);
     setRoomMembers([]);
     setTypingMembers([]);
+    setRoomMediaItems([]);
   }, []);
 
   const refreshSnapshot = useCallback(
@@ -420,6 +459,13 @@ export function App() {
     });
   }, [client, favoriteMessageIds, snapshot.rooms, snapshot.version]);
 
+  const localSearchResults = useMemo(() => {
+    if (!client || roomQuery.trim().length < 2 || activeView === 'explore' || activeView === 'settings') {
+      return [];
+    }
+    return searchLocalMessages(client, roomQuery, 50);
+  }, [activeView, client, roomQuery, snapshot.version]);
+
   const unreadByView = useMemo(
     () => ({
       home: roomBuckets.home.reduce((count, room) => count + room.unread, 0),
@@ -448,10 +494,21 @@ export function App() {
     if (!client || !selectedRoomId) {
       setRoomMembers([]);
       setTypingMembers([]);
+      setRoomMediaItems([]);
       return;
     }
     setRoomMembers(getRoomMembers(client, selectedRoomId));
+    setRoomMediaItems(getRoomMediaItems(client, selectedRoomId));
   }, [client, selectedRoomId, snapshot.version]);
+
+  useEffect(() => {
+    if (!client || !session) return;
+
+    void getOwnProfile(client).then((profile) => {
+      setOwnProfile(profile);
+      setProfileForm({ displayName: profile.displayName ?? profile.userId });
+    });
+  }, [client, session?.userId]);
 
   useEffect(() => {
     if (!selectedRoom) {
@@ -491,6 +548,10 @@ export function App() {
   useEffect(() => {
     saveFavoriteMessages(favoriteMessageIds);
   }, [favoriteMessageIds]);
+
+  useEffect(() => {
+    savePreferences(preferences);
+  }, [preferences]);
 
   const runAction = async (action: () => Promise<void>, success?: string) => {
     setError(undefined);
@@ -719,6 +780,17 @@ export function App() {
     }
   };
 
+  const handleProfileSubmit = async (evt: FormEvent<HTMLFormElement>) => {
+    evt.preventDefault();
+    if (!client) return;
+    await runAction(async () => {
+      await updateOwnDisplayName(client, profileForm.displayName);
+      const profile = await getOwnProfile(client);
+      setOwnProfile(profile);
+      setProfileForm({ displayName: profile.displayName ?? profile.userId });
+    }, '个人资料已更新');
+  };
+
   const favoriteMessageCount = Object.values(favoriteMessageIds).reduce(
     (count, ids) => count + ids.length,
     0
@@ -796,7 +868,7 @@ export function App() {
   }
 
   return (
-    <main className={`app-frame mobile-${mobilePane}`}>
+    <main className={`app-frame mobile-${mobilePane} theme-${preferences.appearance} density-${preferences.density}`}>
       <aside className="rail">
         <div className="rail-brand">
           <Sparkles size={22} />
@@ -869,6 +941,12 @@ export function App() {
                   onOpen={(roomId) => handleSelectRoom(roomId)}
                 />
               )}
+              {localSearchResults.length > 0 && (
+                <LocalSearchDigest
+                  results={localSearchResults}
+                  onOpen={(roomId) => handleSelectRoom(roomId)}
+                />
+              )}
             </div>
           </>
         )}
@@ -899,6 +977,12 @@ export function App() {
             snapshot={snapshot}
             favoriteMessageCount={favoriteMessageCount}
             onLogout={handleLogout}
+            ownProfile={ownProfile}
+            profileForm={profileForm}
+            preferences={preferences}
+            onProfileChange={setProfileForm}
+            onProfileSubmit={handleProfileSubmit}
+            onPreferencesChange={setPreferences}
             onClearLocal={() => {
               window.localStorage.removeItem(favoriteRoomsKey);
               window.localStorage.removeItem(favoriteMessagesKey);
@@ -1082,10 +1166,19 @@ export function App() {
           members={roomMembers}
           profileForm={roomProfileForm}
           favorite={favoriteRoomIds.includes(selectedRoom.id)}
+          mediaItems={roomMediaItems}
           onClose={() => setSheet(undefined)}
           onInvite={handleInviteSubmit}
           onProfileChange={setRoomProfileForm}
           onProfileSubmit={handleRoomProfileSubmit}
+          onPreviewMedia={setPreviewMedia}
+          onToggleMute={() =>
+            client &&
+            runAction(
+              () => setRoomMuted(client, selectedRoom.id, !selectedRoom.muted),
+              selectedRoom.muted ? '已取消静音' : '已静音'
+            )
+          }
           onFavorite={() => toggleFavoriteRoom(selectedRoom.id)}
           onLeave={() =>
             client &&
@@ -1096,6 +1189,10 @@ export function App() {
             }, '已离开房间')
           }
         />
+      )}
+
+      {previewMedia && (
+        <MediaPreview media={previewMedia} onClose={() => setPreviewMedia(undefined)} />
       )}
     </main>
   );
@@ -1160,6 +1257,7 @@ function RoomList({
             </span>
             <span className="room-row-sub">
               {room.encrypted && <Lock size={12} />}
+              {room.muted && <Bell size={12} />}
               {favoriteRoomIds.includes(room.id) && <Star size={12} />}
               <span>{room.lastMessage}</span>
             </span>
@@ -1220,6 +1318,33 @@ function FavoriteMessageDigest({
           </button>
         ))
       )}
+    </section>
+  );
+}
+
+function LocalSearchDigest({
+  results,
+  onOpen,
+}: {
+  results: Array<{ room: RoomSummary; message: ChatMessage }>;
+  onOpen: (roomId: string) => void;
+}) {
+  return (
+    <section className="search-digest">
+      <div className="section-title">
+        <span>消息结果</span>
+        <strong>{results.length}</strong>
+      </div>
+      {results.slice(0, 30).map(({ room, message }) => (
+        <button key={message.id} className="search-result" onClick={() => onOpen(room.id)}>
+          <Avatar name={room.name} src={room.avatarUrl} small />
+          <span>
+            <strong>{room.name}</strong>
+            <small>{message.senderName ?? message.sender} · {formatTime(message.timestamp)}</small>
+            <p>{message.body}</p>
+          </span>
+        </button>
+      ))}
     </section>
   );
 }
@@ -1455,22 +1580,28 @@ function RoomInfoSheet({
   room,
   members,
   profileForm,
+  mediaItems,
   favorite,
   onClose,
   onInvite,
   onProfileChange,
   onProfileSubmit,
+  onPreviewMedia,
+  onToggleMute,
   onFavorite,
   onLeave,
 }: {
   room: RoomSummary;
   members: RoomMemberSummary[];
   profileForm: { name: string; topic: string };
+  mediaItems: RoomMediaItem[];
   favorite: boolean;
   onClose: () => void;
   onInvite: (evt: FormEvent<HTMLFormElement>) => void;
   onProfileChange: (value: { name: string; topic: string }) => void;
   onProfileSubmit: (evt: FormEvent<HTMLFormElement>) => void;
+  onPreviewMedia: (media: RoomMediaItem) => void;
+  onToggleMute: () => void;
   onFavorite: () => void;
   onLeave: () => void;
 }) {
@@ -1534,6 +1665,10 @@ function RoomInfoSheet({
             <Star size={17} />
             {favorite ? '取消收藏' : '收藏房间'}
           </button>
+          <button onClick={onToggleMute}>
+            <Bell size={17} />
+            {room.muted ? '取消静音' : '静音'}
+          </button>
           <button onClick={() => navigator.clipboard?.writeText(room.canonicalAlias ?? room.id)}>
             <Copy size={17} />
             复制地址
@@ -1543,6 +1678,8 @@ function RoomInfoSheet({
             离开
           </button>
         </div>
+
+        <MediaStrip items={mediaItems} onPreview={onPreviewMedia} />
 
         <form className="invite-form" onSubmit={onInvite}>
           <input name="userId" placeholder="邀请 @user:server" autoCapitalize="none" autoCorrect="off" />
@@ -1566,6 +1703,71 @@ function RoomInfoSheet({
               {member.powerLevel ? <em>{member.powerLevel}</em> : null}
             </div>
           ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function MediaStrip({
+  items,
+  onPreview,
+}: {
+  items: RoomMediaItem[];
+  onPreview: (media: RoomMediaItem) => void;
+}) {
+  return (
+    <section className="media-strip">
+      <div className="section-title">
+        <span>媒体与文件</span>
+        <strong>{items.length}</strong>
+      </div>
+      {items.length === 0 ? (
+        <p className="digest-empty">当前同步范围内还没有附件。</p>
+      ) : (
+        <div className="media-grid">
+          {items.slice(0, 24).map((item) => (
+            <button key={item.messageId} className="media-tile" onClick={() => onPreview(item)}>
+              {item.kind === 'image' && item.url ? (
+                <img src={item.url} alt={item.name} />
+              ) : (
+                <span>
+                  {item.kind === 'image' ? <ImageIcon size={22} /> : <FileUp size={22} />}
+                </span>
+              )}
+              <small>{item.name}</small>
+            </button>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function MediaPreview({ media, onClose }: { media: RoomMediaItem; onClose: () => void }) {
+  return (
+    <div className="media-preview-backdrop">
+      <section className="media-preview">
+        <header>
+          <span>
+            <strong>{media.name}</strong>
+            <small>{media.senderName} · {formatTime(media.timestamp)}</small>
+          </span>
+          <button className="icon-button" onClick={onClose} aria-label="关闭预览">
+            <X size={20} />
+          </button>
+        </header>
+        <div className="media-preview-body">
+          {media.kind === 'image' && media.url ? (
+            <img src={media.url} alt={media.name} />
+          ) : media.url ? (
+            <a className="secondary-button" href={media.url} target="_blank" rel="noreferrer">
+              <Eye size={18} />
+              打开文件
+            </a>
+          ) : (
+            <p>这个附件没有可预览的地址。</p>
+          )}
         </div>
       </section>
     </div>
@@ -1635,18 +1837,73 @@ function SettingsPanel({
   deviceName,
   snapshot,
   favoriteMessageCount,
+  ownProfile,
+  profileForm,
+  preferences,
   onLogout,
+  onProfileChange,
+  onProfileSubmit,
+  onPreferencesChange,
   onClearLocal,
 }: {
   session?: StoredMatrixSession;
   deviceName: string;
   snapshot: MatrixSnapshot;
   favoriteMessageCount: number;
+  ownProfile?: OwnProfile;
+  profileForm: { displayName: string };
+  preferences: AppPreferences;
   onLogout: () => void;
+  onProfileChange: (value: { displayName: string }) => void;
+  onProfileSubmit: (evt: FormEvent<HTMLFormElement>) => void;
+  onPreferencesChange: (value: AppPreferences) => void;
   onClearLocal: () => void;
 }) {
   return (
     <div className="settings-list">
+      <form className="profile-card" onSubmit={onProfileSubmit}>
+        <Avatar name={ownProfile?.displayName ?? session?.userId ?? 'Me'} src={ownProfile?.avatarUrl} />
+        <label>
+          显示名
+          <input
+            value={profileForm.displayName}
+            onChange={(evt) => onProfileChange({ displayName: evt.target.value })}
+          />
+        </label>
+        <button type="submit">
+          <Check size={17} />
+          保存
+        </button>
+      </form>
+
+      <section className="preference-card">
+        <div className="section-title">
+          <span>外观</span>
+        </div>
+        <div className="segmented two">
+          {(['light', 'dark'] as AppearanceMode[]).map((mode) => (
+            <button
+              key={mode}
+              className={preferences.appearance === mode ? 'active' : ''}
+              onClick={() => onPreferencesChange({ ...preferences, appearance: mode })}
+            >
+              {mode === 'light' ? '浅色' : '深色'}
+            </button>
+          ))}
+        </div>
+        <div className="segmented two">
+          {(['comfortable', 'compact'] as DensityMode[]).map((density) => (
+            <button
+              key={density}
+              className={preferences.density === density ? 'active' : ''}
+              onClick={() => onPreferencesChange({ ...preferences, density })}
+            >
+              {density === 'comfortable' ? '舒适' : '紧凑'}
+            </button>
+          ))}
+        </div>
+      </section>
+
       <div className="settings-item">
         <Shield size={19} />
         <span>

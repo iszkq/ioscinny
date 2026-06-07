@@ -30,6 +30,7 @@ export type RoomSummary = {
   topic?: string;
   avatarUrl?: string;
   encrypted: boolean;
+  muted: boolean;
   direct: boolean;
   space: boolean;
   membership: RoomMembership;
@@ -86,6 +87,27 @@ export type RoomMemberSummary = {
   avatarUrl?: string;
   membership?: string;
   powerLevel?: number;
+};
+
+export type OwnProfile = {
+  userId: string;
+  displayName?: string;
+  avatarUrl?: string;
+};
+
+export type RoomMediaItem = {
+  messageId: string;
+  roomId: string;
+  kind: ChatAttachment['kind'];
+  url?: string;
+  name: string;
+  senderName?: string;
+  timestamp: number;
+};
+
+export type LocalMessageSearchResult = {
+  room: RoomSummary;
+  message: ChatMessage;
 };
 
 export type MatrixSnapshot = {
@@ -669,6 +691,26 @@ const getRoomMemberCount = (room: Room): number => {
   }
 };
 
+const isMutedAction = (actions: unknown): boolean =>
+  Array.isArray(actions) && (actions.length === 0 || actions[0] === 'dont_notify');
+
+const getRoomMuted = (client: MatrixClient, roomId: string): boolean => {
+  try {
+    const directRule = (client as unknown as {
+      getRoomPushRule?: (scope: string, targetRoomId: string) => { actions?: unknown } | undefined;
+    }).getRoomPushRule?.('global', roomId);
+    if (directRule) return isMutedAction(directRule.actions);
+
+    const pushRules = client.getAccountData('m.push_rules')?.getContent() as
+      | { global?: { override?: Array<{ rule_id?: string; actions?: unknown }> } }
+      | undefined;
+    const overrideRule = pushRules?.global?.override?.find((rule) => rule.rule_id === roomId);
+    return overrideRule ? isMutedAction(overrideRule.actions) : false;
+  } catch {
+    return false;
+  }
+};
+
 const roomToSummary = (
   client: MatrixClient,
   room: Room,
@@ -689,6 +731,7 @@ const roomToSummary = (
     topic: room.currentState?.getStateEvents('m.room.topic', '')?.getContent()?.topic,
     avatarUrl: getRoomAvatarUrl(client, room, direct),
     encrypted: room.hasEncryptionStateEvent(),
+    muted: getRoomMuted(client, room.roomId),
     direct,
     space: room.isSpaceRoom(),
     membership,
@@ -843,6 +886,50 @@ export function getRoomMessages(
   );
 }
 
+export function searchLocalMessages(
+  client: MatrixClient,
+  query: string,
+  limit = 80
+): LocalMessageSearchResult[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (normalizedQuery.length < 2) return [];
+
+  const snapshot = buildSnapshot(client);
+  return snapshot.rooms
+    .filter((room) => room.membership === 'join' && !room.space)
+    .flatMap((room) => {
+      const mxRoom = client.getRoom(room.id);
+      if (!mxRoom) return [];
+      return getTimelineMessages(client, mxRoom, 220)
+        .filter((message) =>
+          `${room.name} ${message.senderName ?? ''} ${message.body}`
+            .toLowerCase()
+            .includes(normalizedQuery)
+        )
+        .map((message) => ({ room, message }));
+    })
+    .sort((a, b) => b.message.timestamp - a.message.timestamp)
+    .slice(0, limit);
+}
+
+export function getRoomMediaItems(client: MatrixClient, roomId: string): RoomMediaItem[] {
+  const room = client.getRoom(roomId);
+  if (!room) return [];
+
+  return getTimelineMessages(client, room, 260)
+    .filter((message) => message.attachment)
+    .map((message) => ({
+      messageId: message.id,
+      roomId: message.roomId,
+      kind: message.attachment!.kind,
+      url: message.attachment!.url,
+      name: message.attachment!.name ?? message.body,
+      senderName: message.senderName,
+      timestamp: message.timestamp,
+    }))
+    .reverse();
+}
+
 export function getRoomMembers(client: MatrixClient, roomId: string): RoomMemberSummary[] {
   const room = client.getRoom(roomId);
   if (!room) return [];
@@ -954,6 +1041,36 @@ export async function updateTypingStatus(
   await (client as unknown as {
     setTyping: (targetRoomId: string, isTyping: boolean, timeoutMs?: number) => Promise<unknown>;
   }).setTyping(roomId, typing, typing ? 8000 : 0);
+}
+
+export async function setRoomMuted(
+  client: MatrixClient,
+  roomId: string,
+  muted: boolean
+): Promise<void> {
+  await (client as unknown as {
+    setRoomMutePushRule: (scope: string, targetRoomId: string, mute: boolean) => Promise<unknown>;
+  }).setRoomMutePushRule('global', roomId, muted);
+}
+
+export async function getOwnProfile(client: MatrixClient): Promise<OwnProfile> {
+  const userId = client.getUserId() ?? '';
+  const profile = await client.getProfileInfo(userId).catch(() => undefined);
+
+  return {
+    userId,
+    displayName: profile?.displayname,
+    avatarUrl: mxcToHttp(client, profile?.avatar_url, 128, 128),
+  };
+}
+
+export async function updateOwnDisplayName(
+  client: MatrixClient,
+  displayName: string
+): Promise<void> {
+  const trimmed = displayName.trim();
+  if (!trimmed) throw new Error('显示名不能为空。');
+  await client.setDisplayName(trimmed);
 }
 
 export function getRoomTypingMembers(client: MatrixClient, roomId: string): string[] {
