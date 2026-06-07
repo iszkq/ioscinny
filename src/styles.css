@@ -128,13 +128,15 @@ h2 {
 }
 
 .login-form,
-.stack-form {
+.stack-form,
+.room-profile-form {
   display: grid;
   gap: 16px;
 }
 
 .login-form label,
-.stack-form label {
+.stack-form label,
+.room-profile-form label {
   display: grid;
   gap: 8px;
   color: #334155;
@@ -145,6 +147,8 @@ h2 {
 .login-form input,
 .stack-form input,
 .stack-form textarea,
+.room-profile-form input,
+.room-profile-form textarea,
 .invite-form input,
 .search-field input,
 .composer textarea {
@@ -158,18 +162,22 @@ h2 {
 
 .login-form input,
 .stack-form input,
+.room-profile-form input,
 .invite-form input {
   min-height: 46px;
   padding: 0 13px;
 }
 
-.stack-form textarea {
+.stack-form textarea,
+.room-profile-form textarea {
   padding: 12px 13px;
 }
 
 .login-form input:focus,
 .stack-form input:focus,
 .stack-form textarea:focus,
+.room-profile-form input:focus,
+.room-profile-form textarea:focus,
 .invite-form input:focus,
 .search-field input:focus,
 .composer textarea:focus {
@@ -183,6 +191,7 @@ h2 {
 .icon-button,
 .tool-button,
 .settings-action,
+.room-profile-form button,
 .sheet-actions button,
 .bottom-button,
 .rail-button,
@@ -472,6 +481,14 @@ h2 {
   overflow: auto;
 }
 
+.room-list-stack {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 10px;
+  overflow: hidden;
+}
+
 .room-list {
   display: grid;
   align-content: start;
@@ -542,6 +559,66 @@ h2 {
 
 .unread.hot {
   background: #d92d20;
+}
+
+.favorite-digest {
+  max-height: 34vh;
+  min-height: 0;
+  padding: 8px;
+  border: 1px solid #dbe3ea;
+  border-radius: 8px;
+  background: #ffffff;
+  overflow: auto;
+}
+
+.digest-empty {
+  padding: 10px 2px;
+  color: #667085;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.favorite-message {
+  width: 100%;
+  display: grid;
+  gap: 5px;
+  padding: 9px 4px;
+  border: 0;
+  border-radius: 8px;
+  text-align: left;
+  color: #172033;
+  background: transparent;
+}
+
+.favorite-message:hover {
+  background: #f4f7fa;
+}
+
+.favorite-message span {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.favorite-message strong,
+.favorite-message small,
+.favorite-message p {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.favorite-message small {
+  color: #7b8794;
+  font-size: 12px;
+}
+
+.favorite-message p {
+  color: #475569;
+  font-size: 13px;
 }
 
 .invite-actions {
@@ -640,6 +717,21 @@ h2 {
   background-size: 28px 28px;
 }
 
+.load-older {
+  align-self: center;
+  min-height: 34px;
+  padding: 0 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid #d9e2ec;
+  border-radius: 999px;
+  color: #52606d;
+  background: rgba(255, 255, 255, 0.92);
+  font-size: 12px;
+  font-weight: 850;
+}
+
 .message {
   max-width: 82%;
   display: flex;
@@ -697,6 +789,42 @@ h2 {
   line-height: 1.55;
 }
 
+.reply-preview {
+  width: 100%;
+  margin: 0 0 8px;
+  padding: 8px 9px;
+  display: grid;
+  gap: 3px;
+  border: 0;
+  border-left: 3px solid #6cb5c5;
+  border-radius: 6px;
+  text-align: left;
+  color: #334155;
+  background: rgba(15, 107, 130, 0.08);
+}
+
+.message.mine .reply-preview {
+  color: #e6f5f8;
+  border-left-color: #b8e2ea;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.reply-preview strong,
+.reply-preview span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reply-preview strong {
+  font-size: 12px;
+}
+
+.reply-preview span {
+  font-size: 12px;
+}
+
 .message-image {
   display: block;
   width: min(420px, 66vw);
@@ -749,6 +877,12 @@ h2 {
   background: #fff7df;
 }
 
+.message-actions button.danger {
+  color: #b42318;
+  border-color: #ffd3cc;
+  background: #fff4f2;
+}
+
 .system-message {
   align-self: center;
   max-width: 86%;
@@ -769,6 +903,58 @@ h2 {
   padding: 12px 16px max(12px, env(safe-area-inset-bottom));
   border-top: 1px solid #e3e9ef;
   background: #ffffff;
+}
+
+.typing-line,
+.composer-context {
+  grid-column: 1 / -1;
+}
+
+.typing-line {
+  min-height: 20px;
+  color: #667085;
+  font-size: 12px;
+}
+
+.composer-context {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border: 1px solid #cfe4eb;
+  border-radius: 8px;
+  color: #164e63;
+  background: #f0fbfd;
+}
+
+.composer-context span {
+  min-width: 0;
+  display: grid;
+  gap: 2px;
+  font-size: 13px;
+  font-weight: 850;
+}
+
+.composer-context small {
+  min-width: 0;
+  overflow: hidden;
+  color: #667085;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 650;
+}
+
+.composer-context button {
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border: 0;
+  border-radius: 7px;
+  color: #164e63;
+  background: transparent;
 }
 
 .composer textarea {
@@ -904,6 +1090,29 @@ h2 {
   color: #52606d;
   background: #f4f7fa;
   line-height: 1.55;
+}
+
+.room-profile-form {
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #dbe3ea;
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.room-profile-form label {
+  font-size: 13px;
+}
+
+.room-profile-form button {
+  min-height: 42px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  color: #ffffff;
+  background: #0f6b82;
+  font-weight: 850;
 }
 
 .stat-grid {

@@ -11,8 +11,10 @@ import {
   Compass,
   Copy,
   DoorOpen,
+  Edit3,
   FileUp,
   Hash,
+  History,
   Info,
   Lock,
   LogOut,
@@ -20,6 +22,7 @@ import {
   MessageSquarePlus,
   Moon,
   Plus,
+  Reply,
   Search,
   Send,
   Settings,
@@ -27,6 +30,7 @@ import {
   SmilePlus,
   Sparkles,
   Star,
+  Trash2,
   UserPlus,
   Users,
   X,
@@ -46,26 +50,34 @@ import {
 
 import {
   acceptInvite,
+  ChatReply,
   ChatMessage,
   createDirectRoom,
   createGroupRoom,
   createMatrixRuntime,
+  editTextMessage,
   getMatrixSnapshot,
   getRoomMembers,
   getRoomMessages,
+  getRoomTypingMembers,
   inviteUser,
   joinRoom,
   leaveRoom,
   loginWithPassword,
   markRoomRead,
   MatrixSnapshot,
+  paginateRoomMessages,
   PublicRoomSummary,
+  redactMessage,
   rejectInvite,
   RoomMemberSummary,
   RoomSummary,
   searchPublicRooms,
+  sendReplyMessage,
   sendReaction,
   sendTextMessage,
+  updateRoomProfile,
+  updateTypingStatus,
   uploadFileMessage,
 } from './services/matrix';
 import {
@@ -80,6 +92,10 @@ type PrimaryView = 'home' | 'direct' | 'rooms' | 'spaces' | 'invites' | 'favorit
 type RoomListView = Exclude<PrimaryView, 'explore' | 'settings'>;
 type MobilePane = 'list' | 'chat';
 type Sheet = 'new' | 'roomInfo' | undefined;
+type ComposerMode =
+  | { type: 'normal' }
+  | { type: 'reply'; message: ChatMessage }
+  | { type: 'edit'; message: ChatMessage };
 type CreateFormState = {
   mode: 'direct' | 'group' | 'join';
   userId: string;
@@ -211,6 +227,7 @@ export function App() {
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const sheetRef = useRef<Sheet>(undefined);
   const mobilePaneRef = useRef<MobilePane>('list');
+  const typingTimeoutRef = useRef<number | undefined>(undefined);
   const [bootState, setBootState] = useState<BootState>('booting');
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -225,13 +242,17 @@ export function App() {
   const [roomQuery, setRoomQuery] = useState('');
   const [messageQuery, setMessageQuery] = useState('');
   const [messageDraft, setMessageDraft] = useState('');
+  const [composerMode, setComposerMode] = useState<ComposerMode>({ type: 'normal' });
   const [sending, setSending] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const [deviceName, setDeviceName] = useState('iPhone');
   const [favoriteRoomIds, setFavoriteRoomIds] = useState<string[]>(() => loadStringArray(favoriteRoomsKey));
   const [favoriteMessageIds, setFavoriteMessageIds] = useState<Record<string, string[]>>(
     () => loadFavoriteMessages()
   );
   const [roomMembers, setRoomMembers] = useState<RoomMemberSummary[]>([]);
+  const [typingMembers, setTypingMembers] = useState<string[]>([]);
+  const [roomProfileForm, setRoomProfileForm] = useState({ name: '', topic: '' });
   const [publicRooms, setPublicRooms] = useState<PublicRoomSummary[]>([]);
   const [publicSearch, setPublicSearch] = useState({ server: '', query: '' });
   const [publicLoading, setPublicLoading] = useState(false);
@@ -260,6 +281,14 @@ export function App() {
     mobilePaneRef.current = mobilePane;
   }, [mobilePane]);
 
+  useEffect(() => {
+    return () => {
+      if (typingTimeoutRef.current) {
+        window.clearTimeout(typingTimeoutRef.current);
+      }
+    };
+  }, []);
+
   const stopRuntime = useCallback(() => {
     runtimeStopRef.current?.();
     runtimeStopRef.current = undefined;
@@ -268,6 +297,7 @@ export function App() {
     setSyncState(null);
     setSelectedRoomId(undefined);
     setRoomMembers([]);
+    setTypingMembers([]);
   }, []);
 
   const refreshSnapshot = useCallback(
@@ -377,6 +407,19 @@ export function App() {
     return getRoomMessages(client, selectedRoomId, messageQuery);
   }, [client, messageQuery, selectedRoomId, snapshot.version]);
 
+  const favoriteMessageItems = useMemo(() => {
+    if (!client) return [];
+
+    return Object.entries(favoriteMessageIds).flatMap(([roomId, ids]) => {
+      const room = snapshot.rooms.find((item) => item.id === roomId);
+      if (!room) return [];
+      const messages = getRoomMessages(client, roomId);
+      return messages
+        .filter((message) => ids.includes(message.id))
+        .map((message) => ({ room, message }));
+    });
+  }, [client, favoriteMessageIds, snapshot.rooms, snapshot.version]);
+
   const unreadByView = useMemo(
     () => ({
       home: roomBuckets.home.reduce((count, room) => count + room.unread, 0),
@@ -404,9 +447,34 @@ export function App() {
   useEffect(() => {
     if (!client || !selectedRoomId) {
       setRoomMembers([]);
+      setTypingMembers([]);
       return;
     }
     setRoomMembers(getRoomMembers(client, selectedRoomId));
+  }, [client, selectedRoomId, snapshot.version]);
+
+  useEffect(() => {
+    if (!selectedRoom) {
+      setRoomProfileForm({ name: '', topic: '' });
+      setComposerMode({ type: 'normal' });
+      setMessageDraft('');
+      return;
+    }
+
+    setRoomProfileForm({
+      name: selectedRoom.name,
+      topic: selectedRoom.topic ?? '',
+    });
+    setComposerMode({ type: 'normal' });
+  }, [selectedRoom?.id]);
+
+  useEffect(() => {
+    if (!client || !selectedRoomId) return undefined;
+
+    const refreshTyping = () => setTypingMembers(getRoomTypingMembers(client, selectedRoomId));
+    refreshTyping();
+    const interval = window.setInterval(refreshTyping, 2500);
+    return () => window.clearInterval(interval);
   }, [client, selectedRoomId, snapshot.version]);
 
   useEffect(() => {
@@ -463,6 +531,8 @@ export function App() {
     setSelectedRoomId(roomId);
     setMobilePane('chat');
     setMessageQuery('');
+    setComposerMode({ type: 'normal' });
+    setMessageDraft('');
   };
 
   const handleSendMessage = async (evt?: FormEvent<HTMLFormElement>) => {
@@ -473,7 +543,26 @@ export function App() {
     setMessageDraft('');
     setSending(true);
     try {
-      await sendTextMessage(client, selectedRoom.id, body);
+      if (typingTimeoutRef.current) {
+        window.clearTimeout(typingTimeoutRef.current);
+        typingTimeoutRef.current = undefined;
+      }
+      await updateTypingStatus(client, selectedRoom.id, false).catch(() => undefined);
+
+      if (composerMode.type === 'edit') {
+        await editTextMessage(client, selectedRoom.id, composerMode.message.id, body);
+      } else if (composerMode.type === 'reply') {
+        const replyTo: ChatReply = {
+          eventId: composerMode.message.id,
+          senderName: composerMode.message.senderName ?? composerMode.message.sender,
+          body: composerMode.message.body,
+        };
+        await sendReplyMessage(client, selectedRoom.id, replyTo, body);
+      } else {
+        await sendTextMessage(client, selectedRoom.id, body);
+      }
+
+      setComposerMode({ type: 'normal' });
       await Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
       refreshSnapshot();
     } catch (err) {
@@ -489,6 +578,43 @@ export function App() {
       evt.preventDefault();
       void handleSendMessage();
     }
+  };
+
+  const handleDraftChange = (value: string) => {
+    setMessageDraft(value);
+    if (!client || !selectedRoom || selectedRoom.membership !== 'join') return;
+
+    void updateTypingStatus(client, selectedRoom.id, Boolean(value.trim())).catch(() => undefined);
+    if (typingTimeoutRef.current) {
+      window.clearTimeout(typingTimeoutRef.current);
+    }
+    typingTimeoutRef.current = window.setTimeout(() => {
+      if (client && selectedRoom) {
+        void updateTypingStatus(client, selectedRoom.id, false).catch(() => undefined);
+      }
+    }, 5000);
+  };
+
+  const handleLoadOlder = async () => {
+    if (!client || !selectedRoom || loadingOlder) return;
+    setLoadingOlder(true);
+    await runAction(() => paginateRoomMessages(client, selectedRoom.id), '已加载更早消息');
+    setLoadingOlder(false);
+  };
+
+  const handleCopyMessage = async (message: ChatMessage) => {
+    await navigator.clipboard?.writeText(message.body);
+    setNotice('消息已复制');
+  };
+
+  const handleEditMessage = (message: ChatMessage) => {
+    setComposerMode({ type: 'edit', message });
+    setMessageDraft(message.body);
+  };
+
+  const handleRedactMessage = async (message: ChatMessage) => {
+    if (!client) return;
+    await runAction(() => redactMessage(client, message.roomId, message.id), '消息已撤回');
   };
 
   const handleFileSelected = async (evt: ChangeEvent<HTMLInputElement>) => {
@@ -547,6 +673,15 @@ export function App() {
 
     await runAction(() => inviteUser(client, selectedRoom.id, userId), '邀请已发送');
     formElement.reset();
+  };
+
+  const handleRoomProfileSubmit = async (evt: FormEvent<HTMLFormElement>) => {
+    evt.preventDefault();
+    if (!client || !selectedRoom) return;
+    await runAction(
+      () => updateRoomProfile(client, selectedRoom.id, roomProfileForm),
+      '房间资料已更新'
+    );
   };
 
   const toggleFavoriteRoom = (roomId: string) => {
@@ -715,18 +850,26 @@ export function App() {
                 onChange={(evt) => setRoomQuery(evt.target.value)}
               />
             </label>
-            <RoomList
-              rooms={visibleRooms}
-              selectedRoomId={selectedRoomId}
-              favoriteRoomIds={favoriteRoomIds}
-              onSelectRoom={handleSelectRoom}
-              onAccept={(roomId) =>
-                client && runAction(() => acceptInvite(client, roomId), '已加入房间')
-              }
-              onReject={(roomId) =>
-                client && runAction(() => rejectInvite(client, roomId), '已拒绝邀请')
-              }
-            />
+            <div className="room-list-stack">
+              <RoomList
+                rooms={visibleRooms}
+                selectedRoomId={selectedRoomId}
+                favoriteRoomIds={favoriteRoomIds}
+                onSelectRoom={handleSelectRoom}
+                onAccept={(roomId) =>
+                  client && runAction(() => acceptInvite(client, roomId), '已加入房间')
+                }
+                onReject={(roomId) =>
+                  client && runAction(() => rejectInvite(client, roomId), '已拒绝邀请')
+                }
+              />
+              {activeView === 'favorites' && (
+                <FavoriteMessageDigest
+                  items={favoriteMessageItems}
+                  onOpen={(roomId) => handleSelectRoom(roomId)}
+                />
+              )}
+            </div>
           </>
         )}
 
@@ -820,6 +963,10 @@ export function App() {
             {notice && <button className="message-box success inline" type="button" onClick={() => setNotice(undefined)}>{notice}</button>}
 
             <div className="timeline" ref={timelineRef}>
+              <button className="load-older" onClick={handleLoadOlder} disabled={loadingOlder}>
+                <History size={15} />
+                {loadingOlder ? '加载中' : '加载更早消息'}
+              </button>
               {selectedRoomMessages.length === 0 ? (
                 <EmptyState
                   icon={<MessageCircle size={30} />}
@@ -833,6 +980,13 @@ export function App() {
                     message={message}
                     favorite={favoriteMessageIds[message.roomId]?.includes(message.id) ?? false}
                     onFavorite={() => toggleFavoriteMessage(message)}
+                    onReply={() => {
+                      setComposerMode({ type: 'reply', message });
+                      setMessageDraft('');
+                    }}
+                    onEdit={() => handleEditMessage(message)}
+                    onRedact={() => handleRedactMessage(message)}
+                    onCopy={() => handleCopyMessage(message)}
                     onReact={(key) =>
                       client &&
                       runAction(() => sendReaction(client, message.roomId, message.id, key), '已添加回应')
@@ -843,6 +997,28 @@ export function App() {
             </div>
 
             <form className="composer" onSubmit={handleSendMessage}>
+              {typingMembers.length > 0 && (
+                <div className="typing-line">
+                  {typingMembers.slice(0, 3).join('、')} 正在输入
+                </div>
+              )}
+              {composerMode.type !== 'normal' && (
+                <div className="composer-context">
+                  <span>
+                    {composerMode.type === 'edit' ? '编辑消息' : `回复 ${composerMode.message.senderName ?? '消息'}`}
+                    <small>{composerMode.message.body}</small>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setComposerMode({ type: 'normal' });
+                      setMessageDraft('');
+                    }}
+                  >
+                    <X size={16} />
+                  </button>
+                </div>
+              )}
               <input ref={fileInputRef} type="file" hidden onChange={handleFileSelected} />
               <button
                 className="icon-button"
@@ -858,7 +1034,7 @@ export function App() {
                 placeholder={selectedRoom.membership === 'join' ? '输入消息' : '需要先加入房间'}
                 disabled={selectedRoom.membership !== 'join'}
                 onKeyDown={handleComposerKeyDown}
-                onChange={(evt) => setMessageDraft(evt.target.value)}
+                onChange={(evt) => handleDraftChange(evt.target.value)}
               />
               <button className="send-button" type="submit" disabled={!messageDraft.trim() || sending}>
                 <Send size={19} />
@@ -904,9 +1080,12 @@ export function App() {
         <RoomInfoSheet
           room={selectedRoom}
           members={roomMembers}
+          profileForm={roomProfileForm}
           favorite={favoriteRoomIds.includes(selectedRoom.id)}
           onClose={() => setSheet(undefined)}
           onInvite={handleInviteSubmit}
+          onProfileChange={setRoomProfileForm}
+          onProfileSubmit={handleRoomProfileSubmit}
           onFavorite={() => toggleFavoriteRoom(selectedRoom.id)}
           onLeave={() =>
             client &&
@@ -1015,15 +1194,53 @@ function RoomList({
   );
 }
 
+function FavoriteMessageDigest({
+  items,
+  onOpen,
+}: {
+  items: Array<{ room: RoomSummary; message: ChatMessage }>;
+  onOpen: (roomId: string) => void;
+}) {
+  return (
+    <section className="favorite-digest">
+      <div className="section-title">
+        <span>收藏消息</span>
+        <strong>{items.length}</strong>
+      </div>
+      {items.length === 0 ? (
+        <p className="digest-empty">收藏单条消息后会出现在这里。</p>
+      ) : (
+        items.slice(0, 24).map(({ room, message }) => (
+          <button key={message.id} className="favorite-message" onClick={() => onOpen(room.id)}>
+            <span>
+              <strong>{room.name}</strong>
+              <small>{message.senderName ?? message.sender} · {formatTime(message.timestamp)}</small>
+            </span>
+            <p>{message.body}</p>
+          </button>
+        ))
+      )}
+    </section>
+  );
+}
+
 function MessageBubble({
   message,
   favorite,
   onFavorite,
+  onReply,
+  onEdit,
+  onRedact,
+  onCopy,
   onReact,
 }: {
   message: ChatMessage;
   favorite: boolean;
   onFavorite: () => void;
+  onReply: () => void;
+  onEdit: () => void;
+  onRedact: () => void;
+  onCopy: () => void;
   onReact: (key: string) => void;
 }) {
   if (message.kind === 'system') {
@@ -1045,6 +1262,12 @@ function MessageBubble({
           {message.edited && <span>已编辑</span>}
         </div>
         <div className="bubble">
+          {message.replyTo && (
+            <button className="reply-preview" onClick={onReply}>
+              <strong>{message.replyTo.senderName ?? '回复'}</strong>
+              <span>{message.replyTo.body}</span>
+            </button>
+          )}
           {message.attachment?.kind === 'image' && message.attachment.url && (
             <img className="message-image" src={message.attachment.url} alt={message.attachment.name ?? message.body} />
           )}
@@ -1063,6 +1286,16 @@ function MessageBubble({
           {message.body && <p>{message.body}</p>}
         </div>
         <div className="message-actions">
+          <button onClick={onReply}>
+            <Reply size={14} />
+            回复
+          </button>
+          {message.canEdit && (
+            <button onClick={onEdit}>
+              <Edit3 size={14} />
+              编辑
+            </button>
+          )}
           <button onClick={() => onReact('👍')}>
             <SmilePlus size={14} />
             回应
@@ -1071,6 +1304,16 @@ function MessageBubble({
             <Star size={14} />
             收藏
           </button>
+          <button onClick={onCopy}>
+            <Copy size={14} />
+            复制
+          </button>
+          {message.canRedact && (
+            <button className="danger" onClick={onRedact}>
+              <Trash2 size={14} />
+              撤回
+            </button>
+          )}
           {message.reactions.map((reaction) => (
             <button
               key={reaction.key}
@@ -1211,17 +1454,23 @@ function NewConversationSheet({
 function RoomInfoSheet({
   room,
   members,
+  profileForm,
   favorite,
   onClose,
   onInvite,
+  onProfileChange,
+  onProfileSubmit,
   onFavorite,
   onLeave,
 }: {
   room: RoomSummary;
   members: RoomMemberSummary[];
+  profileForm: { name: string; topic: string };
   favorite: boolean;
   onClose: () => void;
   onInvite: (evt: FormEvent<HTMLFormElement>) => void;
+  onProfileChange: (value: { name: string; topic: string }) => void;
+  onProfileSubmit: (evt: FormEvent<HTMLFormElement>) => void;
   onFavorite: () => void;
   onLeave: () => void;
 }) {
@@ -1242,6 +1491,28 @@ function RoomInfoSheet({
         </header>
 
         {room.topic && <p className="room-topic">{room.topic}</p>}
+
+        <form className="room-profile-form" onSubmit={onProfileSubmit}>
+          <label>
+            房间名称
+            <input
+              value={profileForm.name}
+              onChange={(evt) => onProfileChange({ ...profileForm, name: evt.target.value })}
+            />
+          </label>
+          <label>
+            主题
+            <textarea
+              rows={3}
+              value={profileForm.topic}
+              onChange={(evt) => onProfileChange({ ...profileForm, topic: evt.target.value })}
+            />
+          </label>
+          <button type="submit">
+            <Check size={17} />
+            保存资料
+          </button>
+        </form>
 
         <div className="stat-grid">
           <span>

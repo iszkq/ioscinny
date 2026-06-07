@@ -54,6 +54,12 @@ export type ChatReaction = {
   reactedByMe: boolean;
 };
 
+export type ChatReply = {
+  eventId: string;
+  senderName?: string;
+  body: string;
+};
+
 export type ChatMessage = {
   id: string;
   roomId: string;
@@ -67,6 +73,9 @@ export type ChatMessage = {
   mine: boolean;
   edited: boolean;
   encrypted: boolean;
+  canEdit: boolean;
+  canRedact: boolean;
+  replyTo?: ChatReply;
   attachment?: ChatAttachment;
   reactions: ChatReaction[];
 };
@@ -202,6 +211,17 @@ const getRelationType = (content: Record<string, unknown>): string | undefined =
   return (relation as Record<string, unknown>).rel_type as string | undefined;
 };
 
+const getReplyEventId = (content: Record<string, unknown>): string | undefined => {
+  const relation = content['m.relates_to'];
+  if (!relation || typeof relation !== 'object') return undefined;
+
+  const inReplyTo = (relation as Record<string, unknown>)['m.in_reply_to'];
+  if (!inReplyTo || typeof inReplyTo !== 'object') return undefined;
+
+  const eventId = (inReplyTo as Record<string, unknown>).event_id;
+  return typeof eventId === 'string' ? eventId : undefined;
+};
+
 const trimReplyFallback = (body: string): string => {
   const match = body.match(/^> <.+?> .+\n(>.*\n)*?\n/m);
   if (!match) return body;
@@ -222,6 +242,34 @@ const getPlainBody = (content: Record<string, unknown>): string => {
   if (typeof name === 'string') return name;
 
   return '';
+};
+
+const getEventById = (room: Room, eventId: string): MatrixEvent | undefined =>
+  room.getLiveTimeline().getEvents().find((event) => event.getId() === eventId);
+
+const getReplyPreview = (
+  client: MatrixClient,
+  room: Room,
+  content: Record<string, unknown>
+): ChatReply | undefined => {
+  const eventId = getReplyEventId(content);
+  if (!eventId) return undefined;
+
+  const replyEvent = getEventById(room, eventId);
+  if (!replyEvent) {
+    return {
+      eventId,
+      body: '回复了一条较早的消息',
+    };
+  }
+
+  const sender = replyEvent.getSender() ?? undefined;
+  const replyContent = getEventContent(replyEvent);
+  return {
+    eventId,
+    senderName: sender ? getMemberDisplayName(room, sender) : undefined,
+    body: getPlainBody(replyContent) || '附件或状态消息',
+  };
 };
 
 const getMemberDisplayName = (room: Room, userId?: string): string => {
@@ -375,6 +423,40 @@ const getEventReactions = (
   }
 };
 
+const getLatestEditContent = (
+  room: Room,
+  eventId: string,
+  eventType: string,
+  sender?: string
+): Record<string, unknown> | undefined => {
+  try {
+    const relations = (
+      room.getUnfilteredTimelineSet() as unknown as {
+        relations?: {
+          getChildEventsForEvent?: (
+            targetEventId: string,
+            relationType: string,
+            childEventType: string
+          ) => { getRelations: () => MatrixEvent[] } | undefined;
+        };
+      }
+    ).relations?.getChildEventsForEvent?.(eventId, 'm.replace', eventType);
+
+    const latestEdit = relations
+      ?.getRelations()
+      .filter((editEvent) => !sender || editEvent.getSender() === sender)
+      .sort((a, b) => b.getTs() - a.getTs())[0];
+
+    const content = latestEdit ? getEventContent(latestEdit) : undefined;
+    const newContent = content?.['m.new_content'];
+    return newContent && typeof newContent === 'object'
+      ? (newContent as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 const describeMemberEvent = (event: MatrixEvent): string => {
   const content = getEventContent(event);
   const prevContent =
@@ -429,6 +511,8 @@ const eventToChatMessage = (
   if (relationType === 'm.replace' || relationType === 'm.annotation') return undefined;
 
   const sender = event.getSender() ?? undefined;
+  const latestEditContent = getLatestEditContent(room, id, eventType, sender);
+  const displayContent = latestEditContent ?? content;
   const member = sender ? room.getMember(sender) : undefined;
   const baseMessage = {
     id,
@@ -439,8 +523,15 @@ const eventToChatMessage = (
     senderAvatarUrl: getMemberAvatarUrl(client, member, 72),
     timestamp: event.getTs(),
     mine: sender === client.getUserId(),
-    edited: Boolean(content['m.new_content']),
+    edited: Boolean(latestEditContent ?? content['m.new_content']),
     encrypted: event.isEncrypted?.() ?? eventType === 'm.room.encrypted',
+    canEdit:
+      sender === client.getUserId() &&
+      eventType === 'm.room.message' &&
+      (displayContent.msgtype === MsgType.Text || displayContent.msgtype === 'm.text') &&
+      !event.isRedacted?.(),
+    canRedact: sender === client.getUserId() && !event.isRedacted?.(),
+    replyTo: getReplyPreview(client, room, content),
     reactions: getEventReactions(client, room, id),
   };
 
@@ -478,11 +569,11 @@ const eventToChatMessage = (
     return {
       ...baseMessage,
       kind: 'message',
-      body: getPlainBody(content) || '贴纸',
+      body: getPlainBody(displayContent) || '贴纸',
       attachment: {
         kind: 'image',
-        url: mxcToHttp(client, content.url, 420, 420),
-        name: getPlainBody(content) || '贴纸',
+        url: mxcToHttp(client, displayContent.url, 420, 420),
+        name: getPlainBody(displayContent) || '贴纸',
       },
     };
   }
@@ -497,8 +588,8 @@ const eventToChatMessage = (
 
   if (eventType !== 'm.room.message') return undefined;
 
-  const attachment = getAttachment(client, content);
-  const body = getPlainBody(content);
+  const attachment = getAttachment(client, displayContent);
+  const body = getPlainBody(displayContent);
 
   return {
     ...baseMessage,
@@ -790,6 +881,91 @@ export async function sendTextMessage(
   });
 }
 
+export async function sendReplyMessage(
+  client: MatrixClient,
+  roomId: string,
+  replyTo: ChatReply,
+  body: string
+): Promise<void> {
+  const trimmed = body.trim();
+  if (!trimmed) return;
+
+  const quotedBody = replyTo.body.replace(/\n/g, '\n> ');
+
+  await client.sendMessage(roomId, {
+    msgtype: MsgType.Text,
+    body: `> <${replyTo.senderName ?? 'user'}> ${quotedBody}\n\n${trimmed}`,
+    'm.relates_to': {
+      'm.in_reply_to': {
+        event_id: replyTo.eventId,
+      },
+    },
+  } as never);
+}
+
+export async function editTextMessage(
+  client: MatrixClient,
+  roomId: string,
+  eventId: string,
+  body: string
+): Promise<void> {
+  const trimmed = body.trim();
+  if (!trimmed) return;
+
+  await client.sendMessage(roomId, {
+    msgtype: MsgType.Text,
+    body: `* ${trimmed}`,
+    'm.new_content': {
+      msgtype: MsgType.Text,
+      body: trimmed,
+    },
+    'm.relates_to': {
+      rel_type: 'm.replace',
+      event_id: eventId,
+    },
+  } as never);
+}
+
+export async function redactMessage(
+  client: MatrixClient,
+  roomId: string,
+  eventId: string
+): Promise<void> {
+  await (client as unknown as {
+    redactEvent: (targetRoomId: string, targetEventId: string) => Promise<unknown>;
+  }).redactEvent(roomId, eventId);
+}
+
+export async function paginateRoomMessages(
+  client: MatrixClient,
+  roomId: string,
+  limit = 40
+): Promise<void> {
+  const room = client.getRoom(roomId);
+  if (!room) return;
+  await client.scrollback(room, limit);
+}
+
+export async function updateTypingStatus(
+  client: MatrixClient,
+  roomId: string,
+  typing: boolean
+): Promise<void> {
+  await (client as unknown as {
+    setTyping: (targetRoomId: string, isTyping: boolean, timeoutMs?: number) => Promise<unknown>;
+  }).setTyping(roomId, typing, typing ? 8000 : 0);
+}
+
+export function getRoomTypingMembers(client: MatrixClient, roomId: string): string[] {
+  const room = client.getRoom(roomId);
+  if (!room) return [];
+
+  return room
+    .getTypingMembers()
+    .filter((member) => member.userId !== client.getUserId())
+    .map((member) => member.rawDisplayName || member.userId);
+}
+
 export async function uploadFileMessage(
   client: MatrixClient,
   roomId: string,
@@ -872,6 +1048,21 @@ export async function inviteUser(client: MatrixClient, roomId: string, userId: s
   const trimmed = userId.trim();
   if (!trimmed) return;
   await client.invite(roomId, trimmed);
+}
+
+export async function updateRoomProfile(
+  client: MatrixClient,
+  roomId: string,
+  input: { name: string; topic: string }
+): Promise<void> {
+  const name = input.name.trim();
+  const topic = input.topic.trim();
+
+  if (name) {
+    await client.sendStateEvent(roomId, 'm.room.name' as never, { name } as never, '');
+  }
+
+  await client.sendStateEvent(roomId, 'm.room.topic' as never, { topic } as never, '');
 }
 
 export async function joinRoom(client: MatrixClient, roomIdOrAlias: string): Promise<string> {
