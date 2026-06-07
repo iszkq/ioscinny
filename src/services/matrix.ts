@@ -44,6 +44,9 @@ export type RoomSummary = {
 export type ChatAttachment = {
   kind: 'image' | 'video' | 'audio' | 'file';
   url?: string;
+  authUrl?: string;
+  downloadUrl?: string;
+  authDownloadUrl?: string;
   name?: string;
   mimeType?: string;
   size?: number;
@@ -101,6 +104,9 @@ export type RoomMediaItem = {
   roomId: string;
   kind: ChatAttachment['kind'];
   url?: string;
+  authUrl?: string;
+  downloadUrl?: string;
+  authDownloadUrl?: string;
   name: string;
   senderName?: string;
   timestamp: number;
@@ -135,6 +141,27 @@ export type PublicRoomSummary = {
   avatarUrl?: string;
   joinedMembers: number;
   worldReadable: boolean;
+};
+
+export type CryptoStatus = {
+  cryptoReady: boolean;
+  secretStorageReady?: boolean;
+  activeBackupVersion?: string | null;
+  backupVersion?: string | null;
+  backupTrusted?: boolean;
+  backupMatchesDecryptionKey?: boolean;
+};
+
+export type KeyRestoreProgress = {
+  stage?: string;
+  successes?: number;
+  failures?: number;
+  total?: number;
+};
+
+export type KeyRestoreResult = {
+  total: number;
+  imported: number;
 };
 
 export type MatrixRuntime = {
@@ -373,7 +400,8 @@ const mxcToHttp = (
   client: MatrixClient,
   mxcUrl: unknown,
   width?: number,
-  height?: number
+  height?: number,
+  useAuthentication = false
 ): string | undefined => {
   if (typeof mxcUrl !== 'string' || !mxcUrl.startsWith('mxc://')) return undefined;
   return (
@@ -387,7 +415,15 @@ const mxcToHttp = (
         allowRedirects?: boolean,
         useAuthentication?: boolean
       ) => string | null;
-    }).mxcUrlToHttp(mxcUrl, width, height, 'scale', undefined, false, false) ?? undefined
+    }).mxcUrlToHttp(
+      mxcUrl,
+      width,
+      height,
+      width || height ? 'scale' : undefined,
+      false,
+      useAuthentication ? true : false,
+      useAuthentication
+    ) ?? undefined
   );
 };
 
@@ -403,14 +439,20 @@ const getAttachment = (
       : typeof content.body === 'string'
         ? content.body
         : undefined;
-  const url = mxcToHttp(client, content.url, 980, 760);
+  const thumbnailUrl = mxcToHttp(client, content.url, 980, 760);
+  const authThumbnailUrl = mxcToHttp(client, content.url, 980, 760, true);
+  const downloadUrl = mxcToHttp(client, content.url);
+  const authDownloadUrl = mxcToHttp(client, content.url, undefined, undefined, true);
   const mimeType = (info as Record<string, unknown>).mimetype;
   const size = (info as Record<string, unknown>).size;
 
   if (msgType === MsgType.Image || msgType === 'm.image') {
     return {
       kind: 'image',
-      url,
+      url: thumbnailUrl ?? downloadUrl,
+      authUrl: authThumbnailUrl ?? authDownloadUrl,
+      downloadUrl,
+      authDownloadUrl,
       name,
       mimeType: typeof mimeType === 'string' ? mimeType : undefined,
       size: typeof size === 'number' ? size : undefined,
@@ -420,7 +462,10 @@ const getAttachment = (
   if (msgType === MsgType.Video || msgType === 'm.video') {
     return {
       kind: 'video',
-      url,
+      url: thumbnailUrl ?? downloadUrl,
+      authUrl: authThumbnailUrl ?? authDownloadUrl,
+      downloadUrl,
+      authDownloadUrl,
       name,
       mimeType: typeof mimeType === 'string' ? mimeType : undefined,
       size: typeof size === 'number' ? size : undefined,
@@ -430,7 +475,10 @@ const getAttachment = (
   if (msgType === MsgType.Audio || msgType === 'm.audio') {
     return {
       kind: 'audio',
-      url,
+      url: downloadUrl,
+      authUrl: authDownloadUrl,
+      downloadUrl,
+      authDownloadUrl,
       name,
       mimeType: typeof mimeType === 'string' ? mimeType : undefined,
       size: typeof size === 'number' ? size : undefined,
@@ -440,7 +488,10 @@ const getAttachment = (
   if (msgType === MsgType.File || msgType === 'm.file') {
     return {
       kind: 'file',
-      url,
+      url: downloadUrl,
+      authUrl: authDownloadUrl,
+      downloadUrl,
+      authDownloadUrl,
       name,
       mimeType: typeof mimeType === 'string' ? mimeType : undefined,
       size: typeof size === 'number' ? size : undefined,
@@ -677,6 +728,9 @@ const eventToChatMessage = (
       attachment: {
         kind: 'image',
         url: mxcToHttp(client, displayContent.url, 420, 420),
+        authUrl: mxcToHttp(client, displayContent.url, 420, 420, true),
+        downloadUrl: mxcToHttp(client, displayContent.url),
+        authDownloadUrl: mxcToHttp(client, displayContent.url, undefined, undefined, true),
         name: getPlainBody(displayContent) || '贴纸',
       },
     };
@@ -1014,6 +1068,9 @@ export function getRoomMediaItems(client: MatrixClient, roomId: string): RoomMed
       roomId: message.roomId,
       kind: message.attachment!.kind,
       url: message.attachment!.url,
+      authUrl: message.attachment!.authUrl,
+      downloadUrl: message.attachment!.downloadUrl,
+      authDownloadUrl: message.attachment!.authDownloadUrl,
       name: message.attachment!.name ?? message.body,
       senderName: message.senderName,
       timestamp: message.timestamp,
@@ -1107,6 +1164,79 @@ export async function sendTextMessage(
         }
       : {}),
   } as never);
+}
+
+const getCryptoApi = (client: MatrixClient) => {
+  const crypto = client.getCrypto();
+  if (!crypto) throw new Error('当前 Matrix 客户端还没有启用端到端加密。');
+  return crypto as unknown as {
+    isSecretStorageReady: () => Promise<boolean>;
+    getActiveSessionBackupVersion: () => Promise<string | null>;
+    getKeyBackupInfo: () => Promise<{ version?: string } | null>;
+    checkKeyBackupAndEnable: () => Promise<
+      | {
+          backupInfo?: { version?: string };
+          trustInfo?: { trusted?: boolean; matchesDecryptionKey?: boolean };
+        }
+      | null
+    >;
+    loadSessionBackupPrivateKeyFromSecretStorage: () => Promise<void>;
+    restoreKeyBackup: (opts?: {
+      progressCallback?: (progress: KeyRestoreProgress) => void;
+    }) => Promise<KeyRestoreResult>;
+    restoreKeyBackupWithPassphrase: (
+      passphrase: string,
+      opts?: { progressCallback?: (progress: KeyRestoreProgress) => void }
+    ) => Promise<KeyRestoreResult>;
+  };
+};
+
+export async function getCryptoStatus(client: MatrixClient): Promise<CryptoStatus> {
+  const crypto = client.getCrypto();
+  if (!crypto) return { cryptoReady: false };
+
+  const api = getCryptoApi(client);
+  const [secretStorageReady, activeBackupVersion, backupInfo, backupCheck] = await Promise.allSettled([
+    api.isSecretStorageReady(),
+    api.getActiveSessionBackupVersion(),
+    api.getKeyBackupInfo(),
+    api.checkKeyBackupAndEnable(),
+  ]);
+
+  const checkedBackup = backupCheck.status === 'fulfilled' ? backupCheck.value : null;
+  const serverBackup = backupInfo.status === 'fulfilled' ? backupInfo.value : null;
+
+  return {
+    cryptoReady: true,
+    secretStorageReady:
+      secretStorageReady.status === 'fulfilled' ? secretStorageReady.value : undefined,
+    activeBackupVersion:
+      activeBackupVersion.status === 'fulfilled' ? activeBackupVersion.value : undefined,
+    backupVersion: checkedBackup?.backupInfo?.version ?? serverBackup?.version ?? null,
+    backupTrusted: checkedBackup?.trustInfo?.trusted,
+    backupMatchesDecryptionKey: checkedBackup?.trustInfo?.matchesDecryptionKey,
+  };
+}
+
+export async function restoreKeyBackupFromSecretStorage(
+  client: MatrixClient,
+  onProgress?: (progress: KeyRestoreProgress) => void
+): Promise<KeyRestoreResult> {
+  const api = getCryptoApi(client);
+  await api.loadSessionBackupPrivateKeyFromSecretStorage();
+  return api.restoreKeyBackup({ progressCallback: onProgress });
+}
+
+export async function restoreKeyBackupWithPassphrase(
+  client: MatrixClient,
+  passphrase: string,
+  onProgress?: (progress: KeyRestoreProgress) => void
+): Promise<KeyRestoreResult> {
+  const trimmed = passphrase.trim();
+  if (!trimmed) throw new Error('请输入恢复密钥或密钥备份口令。');
+  return getCryptoApi(client).restoreKeyBackupWithPassphrase(trimmed, {
+    progressCallback: onProgress,
+  });
 }
 
 export async function sendEmoteMessage(

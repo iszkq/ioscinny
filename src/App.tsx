@@ -15,19 +15,24 @@ import {
   Edit3,
   Eye,
   FileUp,
+  Forward,
   Hash,
   History,
   Image as ImageIcon,
   Info,
+  KeyRound,
   Link2,
   Lock,
   LogOut,
   MessageCircle,
   MessageSquarePlus,
+  Mic,
   Moon,
   MoreHorizontal,
+  Pause,
   Pin,
   PinOff,
+  Play,
   Plus,
   Reply,
   Search,
@@ -41,6 +46,7 @@ import {
   UserMinus,
   UserPlus,
   Users,
+  Volume2,
   X,
 } from 'lucide-react';
 import { MatrixClient, SyncState } from 'matrix-js-sdk';
@@ -62,10 +68,12 @@ import {
   banMember,
   ChatReply,
   ChatMessage,
+  CryptoStatus,
   createDirectRoom,
   createGroupRoom,
   createMatrixRuntime,
   editTextMessage,
+  getCryptoStatus,
   getDirectRoomIdForUser,
   getMatrixSnapshot,
   getOwnProfile,
@@ -98,6 +106,8 @@ import {
   sendTextMessage,
   setMessagePinned,
   setRoomMuted,
+  restoreKeyBackupFromSecretStorage,
+  restoreKeyBackupWithPassphrase,
   updateOwnAvatar,
   updateOwnDisplayName,
   updateRoomAvatar,
@@ -117,7 +127,14 @@ type PrimaryView = 'home' | 'direct' | 'rooms' | 'spaces' | 'invites' | 'favorit
 type RoomListView = Exclude<PrimaryView, 'explore' | 'settings'>;
 type RoomFilter = 'all' | 'unread' | 'mentions' | 'drafts';
 type MobilePane = 'list' | 'chat';
-type Sheet = 'new' | 'roomInfo' | { type: 'messageInfo'; message: ChatMessage } | undefined;
+type Sheet =
+  | 'new'
+  | 'roomInfo'
+  | 'moreNav'
+  | 'security'
+  | { type: 'messageInfo'; message: ChatMessage }
+  | { type: 'forward'; message: ChatMessage }
+  | undefined;
 type ComposerMode =
   | { type: 'normal' }
   | { type: 'reply'; message: ChatMessage }
@@ -137,6 +154,16 @@ type AppPreferences = {
   appearance: AppearanceMode;
   density: DensityMode;
 };
+type SpeechRecognitionLike = {
+  lang: string;
+  interimResults: boolean;
+  continuous: boolean;
+  onresult: ((event: { results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null;
+  onerror: ((event: { error?: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
 
 const defaultHomeserver = 'https://mtx01.cc';
 const favoriteRoomsKey = 'ioscinny.favoriteRooms';
@@ -144,6 +171,34 @@ const favoriteMessagesKey = 'ioscinny.favoriteMessages';
 const appPreferencesKey = 'ioscinny.preferences';
 const roomDraftsKey = 'ioscinny.roomDrafts';
 const quickReactionOptions = ['👍', '❤️', '😂', '🎉', '👀', '✅'];
+const composerEmojiOptions = [
+  '😀',
+  '😂',
+  '🥰',
+  '😍',
+  '😭',
+  '😅',
+  '👍',
+  '🙏',
+  '💪',
+  '🔥',
+  '✨',
+  '🎉',
+  '❤️',
+  '💛',
+  '🌻',
+  '✅',
+  '👀',
+  '🙌',
+  '🤝',
+  '📌',
+  '📷',
+  '🎧',
+  '🎤',
+  '📝',
+];
+const bottomPrimaryViews: PrimaryView[] = ['home', 'direct', 'rooms', 'settings'];
+const moreNavViews: PrimaryView[] = ['spaces', 'invites', 'favorites', 'explore'];
 const roomFilterLabels: Record<RoomFilter, string> = {
   all: '全部',
   unread: '未读',
@@ -257,6 +312,90 @@ const getReadableMessageBody = (body: string): string => {
   return body;
 };
 
+const getReadableKeyRestoreError = (err: unknown): string => {
+  const message = err instanceof Error ? err.message : String(err);
+  if (/getSecretStorageKey callback/i.test(message)) {
+    return '当前客户端无法直接弹出安全存储密钥输入框。请在下面输入恢复密钥或密钥备份口令，然后点击“使用恢复密钥恢复”。';
+  }
+  if (/No backup|backup/i.test(message) && /not/i.test(message)) {
+    return '当前账号没有可用的服务端密钥备份，或这台设备还没有信任该备份。';
+  }
+  return message;
+};
+
+const formatDuration = (seconds: number): string => {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '0:00';
+  const totalSeconds = Math.round(seconds);
+  const minutes = Math.floor(totalSeconds / 60);
+  const rest = totalSeconds % 60;
+  return `${minutes}:${rest.toString().padStart(2, '0')}`;
+};
+
+const toAuthenticatedMediaUrl = (src?: string): string | undefined => {
+  if (!src) return undefined;
+  try {
+    const url = new URL(src);
+    if (url.pathname.startsWith('/_matrix/client/v1/media/')) return url.href;
+    if (!url.pathname.startsWith('/_matrix/media/v3/')) return undefined;
+    url.pathname = url.pathname.replace('/_matrix/media/v3/', '/_matrix/client/v1/media/');
+    url.searchParams.set('allow_redirect', 'true');
+    return url.href;
+  } catch {
+    return undefined;
+  }
+};
+
+const useAuthenticatedMediaUrl = (
+  src?: string,
+  accessToken?: string,
+  fallbackSrc?: string
+): string | undefined => {
+  const [resolvedSrc, setResolvedSrc] = useState<string | undefined>(fallbackSrc ?? src);
+
+  useEffect(() => {
+    let objectUrl: string | undefined;
+    let cancelled = false;
+
+    if (!src) {
+      setResolvedSrc(fallbackSrc);
+      return undefined;
+    }
+
+    const authenticatedSrc = accessToken ? toAuthenticatedMediaUrl(src) : undefined;
+    const requestSrc = authenticatedSrc ?? src;
+    const needsAuth = Boolean(authenticatedSrc && accessToken);
+    if (!needsAuth) {
+      setResolvedSrc(requestSrc);
+      return undefined;
+    }
+
+    setResolvedSrc(undefined);
+    void fetch(requestSrc, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+      },
+    })
+      .then((response) => {
+        if (!response.ok) throw new Error(`Media request failed: ${response.status}`);
+        return response.blob();
+      })
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob);
+        if (!cancelled) setResolvedSrc(objectUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setResolvedSrc(fallbackSrc);
+      });
+
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [accessToken, fallbackSrc, src]);
+
+  return resolvedSrc;
+};
+
 const loadStringArray = (key: string): string[] => {
   try {
     const value = window.localStorage.getItem(key);
@@ -357,6 +496,7 @@ const memberRoleLabel = (powerLevel = 0): string => {
 export function App() {
   const runtimeStopRef = useRef<(() => void) | undefined>();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const speechRecognitionRef = useRef<SpeechRecognitionLike | undefined>();
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const sheetRef = useRef<Sheet>(undefined);
   const mobilePaneRef = useRef<MobilePane>('list');
@@ -377,6 +517,8 @@ export function App() {
   const [messageQuery, setMessageQuery] = useState('');
   const [messageDraft, setMessageDraft] = useState('');
   const [composerMode, setComposerMode] = useState<ComposerMode>({ type: 'normal' });
+  const [emojiOpen, setEmojiOpen] = useState(false);
+  const [listening, setListening] = useState(false);
   const [sending, setSending] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [deviceName, setDeviceName] = useState('iPhone');
@@ -393,6 +535,10 @@ export function App() {
   const [roomMediaItems, setRoomMediaItems] = useState<RoomMediaItem[]>([]);
   const [pinnedMessages, setPinnedMessages] = useState<PinnedMessageSummary[]>([]);
   const [previewMedia, setPreviewMedia] = useState<RoomMediaItem>();
+  const [cryptoStatus, setCryptoStatus] = useState<CryptoStatus>({ cryptoReady: false });
+  const [recoveryPassphrase, setRecoveryPassphrase] = useState('');
+  const [keyRestoreProgress, setKeyRestoreProgress] = useState('');
+  const [keyRestoreMessage, setKeyRestoreMessage] = useState<{ type: 'success' | 'error'; text: string }>();
   const [pendingScrollEventId, setPendingScrollEventId] = useState<string>();
   const [highlightedMessageId, setHighlightedMessageId] = useState<string>();
   const [roomProfileForm, setRoomProfileForm] = useState({ name: '', topic: '' });
@@ -429,6 +575,7 @@ export function App() {
       if (typingTimeoutRef.current) {
         window.clearTimeout(typingTimeoutRef.current);
       }
+      speechRecognitionRef.current?.stop();
     };
   }, []);
 
@@ -455,6 +602,21 @@ export function App() {
     [client]
   );
 
+  const refreshCryptoStatus = useCallback(
+    async (mx = client) => {
+      if (!mx) {
+        setCryptoStatus({ cryptoReady: false });
+        return;
+      }
+      try {
+        setCryptoStatus(await getCryptoStatus(mx));
+      } catch {
+        setCryptoStatus({ cryptoReady: Boolean(mx.getCrypto()) });
+      }
+    },
+    [client]
+  );
+
   const connectSession = useCallback(
     async (nextSession: StoredMatrixSession) => {
       stopRuntime();
@@ -467,6 +629,7 @@ export function App() {
         setClient(runtime.client);
         setSession(nextSession);
         setBootState('signedIn');
+        void refreshCryptoStatus(runtime.client);
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
         setBootState('error');
@@ -670,6 +833,11 @@ export function App() {
   }, [client, selectedRoomId, snapshot.version]);
 
   useEffect(() => {
+    if (!client) return;
+    void refreshCryptoStatus(client);
+  }, [client, refreshCryptoStatus, snapshot.version]);
+
+  useEffect(() => {
     if (!client || !session) return;
 
     void getOwnProfile(client).then((profile) => {
@@ -856,6 +1024,7 @@ export function App() {
       }
 
       setComposerMode({ type: 'normal' });
+      setEmojiOpen(false);
       setRoomDrafts((current) => {
         const next = { ...current };
         delete next[selectedRoom.id];
@@ -957,6 +1126,155 @@ export function App() {
       () => uploadFileMessage(client, selectedRoom.id, file),
       `已发送附件：${file.name}`
     );
+  };
+
+  const handlePreviewAttachment = (message: ChatMessage) => {
+    if (!message.attachment) return;
+    setPreviewMedia({
+      messageId: message.id,
+      roomId: message.roomId,
+      kind: message.attachment.kind,
+      url: message.attachment.url,
+      authUrl: message.attachment.authUrl,
+      downloadUrl: message.attachment.downloadUrl,
+      authDownloadUrl: message.attachment.authDownloadUrl,
+      name: message.attachment.name ?? message.body,
+      senderName: message.senderName,
+      timestamp: message.timestamp,
+    });
+  };
+
+  const handleForwardMessage = async (message: ChatMessage, targetRoomId: string) => {
+    if (!client) return;
+    const targetRoom = snapshot.rooms.find((room) => room.id === targetRoomId);
+    const sourceRoom = snapshot.rooms.find((room) => room.id === message.roomId);
+    if (!targetRoom || targetRoom.membership !== 'join') {
+      setError('请选择一个已加入的房间。');
+      return;
+    }
+
+    const attachmentLine = message.attachment
+      ? `\n附件：${message.attachment.name ?? message.body}${message.attachment.url ? `\n${message.attachment.url}` : ''}`
+      : '';
+    const body = [
+      `转发自 ${sourceRoom?.name ?? '未知会话'} · ${message.senderName ?? message.sender ?? '未知成员'}`,
+      getReadableMessageBody(message.body),
+      attachmentLine,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    await runAction(async () => {
+      await sendTextMessage(client, targetRoomId, body);
+      setSheet(undefined);
+      setSelectedRoomId(targetRoomId);
+      setActiveView(targetRoom.direct ? 'direct' : 'rooms');
+      setMobilePane('chat');
+    }, `已转发到 ${targetRoom.name}`);
+  };
+
+  const handleInsertEmoji = (emoji: string) => {
+    const nextDraft = `${messageDraft}${emoji}`;
+    handleDraftChange(nextDraft);
+  };
+
+  const handleToggleVoiceInput = () => {
+    if (listening) {
+      speechRecognitionRef.current?.stop();
+      setListening(false);
+      return;
+    }
+
+    const SpeechRecognitionCtor =
+      (window as unknown as { SpeechRecognition?: new () => SpeechRecognitionLike }).SpeechRecognition ??
+      (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognitionLike }).webkitSpeechRecognition;
+
+    if (!SpeechRecognitionCtor) {
+      setError('当前浏览器不支持系统语音听写；在 iOS Safari/WebView 支持时会自动启用。');
+      return;
+    }
+
+    const baseDraft = messageDraft;
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = 'zh-CN';
+    recognition.interimResults = true;
+    recognition.continuous = false;
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results)
+        .map((result) => result[0]?.transcript ?? '')
+        .join('')
+        .trim();
+      if (!transcript) return;
+      handleDraftChange(`${baseDraft}${baseDraft && !baseDraft.endsWith(' ') ? ' ' : ''}${transcript}`);
+    };
+    recognition.onerror = (event) => {
+      setListening(false);
+      setError(event.error ? `语音听写失败：${event.error}` : '语音听写失败');
+    };
+    recognition.onend = () => setListening(false);
+    speechRecognitionRef.current = recognition;
+    setListening(true);
+    recognition.start();
+  };
+
+  const handleTranscribeAudio = (message: ChatMessage) => {
+    const name = message.attachment?.name ?? message.body;
+    setNotice(`音频“${name}”需要接入服务端语音识别后才能转文字；当前已支持输入框语音听写。`);
+  };
+
+  const handleRestoreFromSecretStorage = async () => {
+    if (!client) return;
+    setKeyRestoreProgress('正在从安全存储读取密钥备份...');
+    setKeyRestoreMessage(undefined);
+    setError(undefined);
+    try {
+      const result = await restoreKeyBackupFromSecretStorage(client, (progress) => {
+        setKeyRestoreProgress(
+          `正在恢复密钥 ${progress.successes ?? 0}/${progress.total ?? '?'}`
+        );
+      });
+      setNotice(`密钥恢复完成：导入 ${result.imported}/${result.total}`);
+      setKeyRestoreMessage({
+        type: 'success',
+        text: `密钥恢复完成：导入 ${result.imported}/${result.total}`,
+      });
+      setKeyRestoreProgress('');
+      await refreshCryptoStatus(client);
+      refreshSnapshot(client);
+    } catch (err) {
+      setKeyRestoreProgress('');
+      const message = getReadableKeyRestoreError(err);
+      setKeyRestoreMessage({ type: 'error', text: message });
+      setError(message);
+    }
+  };
+
+  const handleRestoreWithPassphrase = async () => {
+    if (!client) return;
+    setKeyRestoreProgress('正在使用恢复密钥读取备份...');
+    setKeyRestoreMessage(undefined);
+    setError(undefined);
+    try {
+      const result = await restoreKeyBackupWithPassphrase(client, recoveryPassphrase, (progress) => {
+        setKeyRestoreProgress(
+          `正在恢复密钥 ${progress.successes ?? 0}/${progress.total ?? '?'}`
+        );
+      });
+      setNotice(`密钥恢复完成：导入 ${result.imported}/${result.total}`);
+      setKeyRestoreMessage({
+        type: 'success',
+        text: `密钥恢复完成：导入 ${result.imported}/${result.total}`,
+      });
+      setRecoveryPassphrase('');
+      setKeyRestoreProgress('');
+      await refreshCryptoStatus(client);
+      refreshSnapshot(client);
+    } catch (err) {
+      setKeyRestoreProgress('');
+      const message = getReadableKeyRestoreError(err);
+      setKeyRestoreMessage({ type: 'error', text: message });
+      setError(message);
+    }
   };
 
   const handleCreateSubmit = async (evt: FormEvent<HTMLFormElement>) => {
@@ -1346,10 +1664,12 @@ export function App() {
             ownProfile={ownProfile}
             profileForm={profileForm}
             preferences={preferences}
+            cryptoStatus={cryptoStatus}
             onProfileChange={setProfileForm}
             onProfileSubmit={handleProfileSubmit}
             onAvatarSelected={handleProfileAvatarSelected}
             onPreferencesChange={setPreferences}
+            onOpenSecurity={() => setSheet('security')}
             onClearLocal={() => {
               window.localStorage.removeItem(favoriteRoomsKey);
               window.localStorage.removeItem(favoriteMessagesKey);
@@ -1386,6 +1706,13 @@ export function App() {
                 aria-label="收藏房间"
               >
                 <Star size={19} />
+              </button>
+              <button
+                className={cryptoStatus.cryptoReady ? 'icon-button' : 'icon-button warning'}
+                onClick={() => setSheet('security')}
+                aria-label="加密与密钥恢复"
+              >
+                <KeyRound size={19} />
               </button>
               <button className="icon-button" onClick={() => setSheet('roomInfo')} aria-label="房间信息">
                 <Info size={19} />
@@ -1446,6 +1773,7 @@ export function App() {
                         message={message}
                         favorite={favoriteMessageIds[message.roomId]?.includes(message.id) ?? false}
                         highlighted={message.id === highlightedMessageId}
+                        mediaAccessToken={session?.accessToken}
                         onFavorite={() => toggleFavoriteMessage(message)}
                         onReply={() => {
                           setComposerMode({ type: 'reply', message });
@@ -1458,6 +1786,9 @@ export function App() {
                         onCopy={() => handleCopyMessage(message)}
                         onCopyLink={() => handleCopyMessageLink(message)}
                         onTogglePin={() => handleTogglePinMessage(message)}
+                        onForward={() => setSheet({ type: 'forward', message })}
+                        onPreviewAttachment={() => handlePreviewAttachment(message)}
+                        onTranscribeAudio={() => handleTranscribeAudio(message)}
                         onReact={(key) =>
                           client &&
                           runAction(() => sendReaction(client, message.roomId, message.id, key), '已更新回应')
@@ -1503,15 +1834,39 @@ export function App() {
                   onPick={handlePickMentionSuggestion}
                 />
               )}
+              {emojiOpen && selectedRoom.membership === 'join' && (
+                <EmojiTray emojis={composerEmojiOptions} onPick={handleInsertEmoji} />
+              )}
               <input ref={fileInputRef} type="file" hidden onChange={handleFileSelected} />
-              <button
-                className="icon-button"
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                aria-label="发送附件"
-              >
-                <FileUp size={20} />
-              </button>
+              <div className="composer-tools" aria-label="输入工具">
+                <button
+                  className="icon-button"
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
+                  aria-label="发送附件"
+                  disabled={selectedRoom.membership !== 'join'}
+                >
+                  <FileUp size={19} />
+                </button>
+                <button
+                  className={emojiOpen ? 'icon-button active' : 'icon-button'}
+                  type="button"
+                  onClick={() => setEmojiOpen((open) => !open)}
+                  aria-label="表情"
+                  disabled={selectedRoom.membership !== 'join'}
+                >
+                  <SmilePlus size={19} />
+                </button>
+                <button
+                  className={listening ? 'icon-button active recording' : 'icon-button'}
+                  type="button"
+                  onClick={handleToggleVoiceInput}
+                  aria-label={listening ? '停止语音听写' : '语音听写'}
+                  disabled={selectedRoom.membership !== 'join'}
+                >
+                  <Mic size={19} />
+                </button>
+              </div>
               <textarea
                 value={messageDraft}
                 rows={1}
@@ -1535,7 +1890,7 @@ export function App() {
       </section>
 
       <nav className="bottom-nav" aria-label="底部导航">
-        {(['home', 'direct', 'rooms', 'spaces', 'invites', 'favorites', 'explore', 'settings'] as PrimaryView[]).map((view) => (
+        {bottomPrimaryViews.map((view) => (
           <button
             key={view}
             className={activeView === view ? 'bottom-button active' : 'bottom-button'}
@@ -1548,7 +1903,40 @@ export function App() {
             <span>{viewLabels[view]}</span>
           </button>
         ))}
+        <button
+          className={moreNavViews.includes(activeView) ? 'bottom-button active' : 'bottom-button'}
+          onClick={() => setSheet('moreNav')}
+        >
+          <MoreHorizontal size={20} />
+          <span>更多</span>
+        </button>
       </nav>
+
+      {sheet === 'moreNav' && (
+        <MoreNavSheet
+          activeView={activeView}
+          unreadByView={unreadByView}
+          onClose={() => setSheet(undefined)}
+          onPick={(view) => {
+            setActiveView(view);
+            setMobilePane('list');
+            setSheet(undefined);
+          }}
+        />
+      )}
+
+      {sheet === 'security' && (
+        <SecuritySheet
+          status={cryptoStatus}
+          passphrase={recoveryPassphrase}
+          progress={keyRestoreProgress}
+          message={keyRestoreMessage}
+          onPassphraseChange={setRecoveryPassphrase}
+          onRestoreFromSecretStorage={handleRestoreFromSecretStorage}
+          onRestoreWithPassphrase={handleRestoreWithPassphrase}
+          onClose={() => setSheet(undefined)}
+        />
+      )}
 
       {sheet === 'new' && (
         <NewConversationSheet
@@ -1567,6 +1955,7 @@ export function App() {
           profileForm={roomProfileForm}
           favorite={favoriteRoomIds.includes(selectedRoom.id)}
           mediaItems={roomMediaItems}
+          mediaAccessToken={session?.accessToken}
           pinnedMessages={pinnedMessages}
           currentUserId={session?.userId}
           onClose={() => setSheet(undefined)}
@@ -1610,6 +1999,15 @@ export function App() {
         />
       )}
 
+      {typeof sheet === 'object' && sheet?.type === 'forward' && (
+        <ForwardSheet
+          message={sheet.message}
+          rooms={snapshot.rooms.filter((room) => room.membership === 'join')}
+          onClose={() => setSheet(undefined)}
+          onForward={(roomId) => void handleForwardMessage(sheet.message, roomId)}
+        />
+      )}
+
       {messageInfoMessage && (
         <MessageInfoSheet
           message={messageInfoMessage}
@@ -1626,6 +2024,9 @@ export function App() {
           onTogglePin={() => handleTogglePinMessage(messageInfoMessage)}
           onCopy={() => handleCopyMessage(messageInfoMessage)}
           onCopyLink={() => handleCopyMessageLink(messageInfoMessage)}
+          onForward={() => setSheet({ type: 'forward', message: messageInfoMessage })}
+          onPreviewAttachment={() => handlePreviewAttachment(messageInfoMessage)}
+          onTranscribeAudio={() => handleTranscribeAudio(messageInfoMessage)}
           onReact={(key) =>
             client &&
             runAction(() => sendReaction(client, messageInfoMessage.roomId, messageInfoMessage.id, key), '已更新回应')
@@ -1635,7 +2036,11 @@ export function App() {
       )}
 
       {previewMedia && (
-        <MediaPreview media={previewMedia} onClose={() => setPreviewMedia(undefined)} />
+        <MediaPreview
+          media={previewMedia}
+          mediaAccessToken={session?.accessToken}
+          onClose={() => setPreviewMedia(undefined)}
+        />
       )}
     </main>
   );
@@ -1651,9 +2056,19 @@ function LoadingScreen({ label }: { label: string }) {
 }
 
 function Avatar({ name, src, small = false }: { name: string; src?: string; small?: boolean }) {
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    setFailed(false);
+  }, [src]);
+
   return (
     <div className={small ? 'avatar small' : 'avatar'}>
-      {src ? <img src={src} alt="" /> : <span>{initials(name)}</span>}
+      {src && !failed ? (
+        <img src={src} alt="" onError={() => setFailed(true)} />
+      ) : (
+        <span>{initials(name)}</span>
+      )}
     </div>
   );
 }
@@ -1881,10 +2296,464 @@ function MentionSuggestions({
   );
 }
 
+function EmojiTray({
+  emojis,
+  onPick,
+}: {
+  emojis: string[];
+  onPick: (emoji: string) => void;
+}) {
+  return (
+    <div className="emoji-tray" aria-label="常用表情">
+      {emojis.map((emoji) => (
+        <button key={emoji} type="button" onClick={() => onPick(emoji)} aria-label={`插入 ${emoji}`}>
+          {emoji}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function MediaFallback({ label }: { label: string }) {
+  return (
+    <span className="message-media-fallback">
+      <ImageIcon size={20} />
+      <small>{label}</small>
+    </span>
+  );
+}
+
+function AuthenticatedImage({
+  src,
+  fallbackSrc,
+  accessToken,
+  alt,
+  className,
+}: {
+  src?: string;
+  fallbackSrc?: string;
+  accessToken?: string;
+  alt: string;
+  className?: string;
+}) {
+  const resolvedSrc = useAuthenticatedMediaUrl(src, accessToken, fallbackSrc);
+  const [failed, setFailed] = useState(false);
+  const loadedRef = useRef(false);
+
+  useEffect(() => {
+    setFailed(false);
+    loadedRef.current = false;
+    if (!resolvedSrc) return undefined;
+    const timeout = window.setTimeout(() => {
+      if (!loadedRef.current) setFailed(true);
+    }, 8000);
+    return () => window.clearTimeout(timeout);
+  }, [resolvedSrc]);
+
+  if (!resolvedSrc || failed) return <MediaFallback label="图片暂不可预览" />;
+
+  return (
+    <img
+      className={className}
+      src={resolvedSrc}
+      alt={alt}
+      onLoad={() => {
+        loadedRef.current = true;
+      }}
+      onError={() => setFailed(true)}
+    />
+  );
+}
+
+function AuthenticatedVideo({
+  src,
+  fallbackSrc,
+  accessToken,
+  className,
+  controls = false,
+}: {
+  src?: string;
+  fallbackSrc?: string;
+  accessToken?: string;
+  className?: string;
+  controls?: boolean;
+}) {
+  const resolvedSrc = useAuthenticatedMediaUrl(src, accessToken, fallbackSrc);
+  if (!resolvedSrc) return <MediaFallback label="视频暂不可预览" />;
+
+  return (
+    <video
+      className={className}
+      src={resolvedSrc}
+      controls={controls}
+      muted={!controls}
+      playsInline
+    />
+  );
+}
+
+function AttachmentLink({
+  src,
+  fallbackSrc,
+  accessToken,
+  name,
+}: {
+  src?: string;
+  fallbackSrc?: string;
+  accessToken?: string;
+  name: string;
+}) {
+  const resolvedSrc = useAuthenticatedMediaUrl(src, accessToken, fallbackSrc);
+
+  return (
+    <a
+      className="file-chip"
+      href={resolvedSrc ?? fallbackSrc ?? '#'}
+      target="_blank"
+      rel="noreferrer"
+      download={name}
+    >
+      <FileUp size={17} />
+      {name}
+    </a>
+  );
+}
+
+function AudioPlayer({
+  src,
+  fallbackSrc,
+  accessToken,
+  title,
+  onTranscribe,
+}: {
+  src?: string;
+  fallbackSrc?: string;
+  accessToken?: string;
+  title: string;
+  onTranscribe: () => void;
+}) {
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  const [playing, setPlaying] = useState(false);
+  const [duration, setDuration] = useState(0);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [audioError, setAudioError] = useState('');
+  const resolvedSrc = useAuthenticatedMediaUrl(src, accessToken, fallbackSrc);
+
+  useEffect(() => {
+    setPlaying(false);
+    setDuration(0);
+    setCurrentTime(0);
+    setAudioError('');
+    audioRef.current?.load();
+  }, [resolvedSrc]);
+
+  const handleToggle = async () => {
+    const audio = audioRef.current;
+    if (!audio || !resolvedSrc) {
+      setAudioError('音频还没有加载完成。');
+      return;
+    }
+
+    if (playing) {
+      audio.pause();
+      setPlaying(false);
+      return;
+    }
+
+    try {
+      await audio.play();
+      setAudioError('');
+      setPlaying(true);
+    } catch {
+      setPlaying(false);
+      setAudioError('音频无法播放，可能需要媒体授权或文件暂不可访问。');
+    }
+  };
+
+  const handleSeek = (evt: ChangeEvent<HTMLInputElement>) => {
+    const audio = audioRef.current;
+    const nextTime = Number(evt.target.value);
+    if (!audio || !Number.isFinite(nextTime)) return;
+    audio.currentTime = nextTime;
+    setCurrentTime(nextTime);
+  };
+
+  return (
+    <div className="audio-player">
+      <audio
+        ref={audioRef}
+        src={resolvedSrc}
+        preload="metadata"
+        onLoadedMetadata={(evt) => {
+          setAudioError('');
+          setDuration(evt.currentTarget.duration || 0);
+        }}
+        onTimeUpdate={(evt) => setCurrentTime(evt.currentTarget.currentTime || 0)}
+        onEnded={() => setPlaying(false)}
+        onError={() => setAudioError('音频加载失败，可能需要媒体授权或文件已不可访问。')}
+      />
+      <button
+        className="audio-play"
+        type="button"
+        onClick={handleToggle}
+        aria-label={playing ? '暂停音频' : '播放音频'}
+        disabled={!resolvedSrc}
+      >
+        {playing ? <Pause size={17} /> : <Play size={17} />}
+      </button>
+      <div className="audio-info">
+        <strong>{title || '音频消息'}</strong>
+        <input
+          type="range"
+          min="0"
+          max={duration || currentTime || 0}
+          step="0.1"
+          value={Math.min(currentTime, duration || currentTime)}
+          onChange={handleSeek}
+          aria-label="音频进度"
+        />
+        <span>
+          {formatDuration(currentTime)} / {formatDuration(duration)}
+        </span>
+        {audioError && <em>{audioError}</em>}
+      </div>
+      <button className="audio-transcribe" type="button" onClick={onTranscribe}>
+        <Volume2 size={15} />
+        转文字
+      </button>
+    </div>
+  );
+}
+
+function MoreNavSheet({
+  activeView,
+  unreadByView,
+  onPick,
+  onClose,
+}: {
+  activeView: PrimaryView;
+  unreadByView: Record<PrimaryView, number>;
+  onPick: (view: PrimaryView) => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="sheet-backdrop">
+      <section className="sheet compact-sheet">
+        <header className="sheet-header">
+          <div>
+            <p className="eyebrow">Navigation</p>
+            <h2>更多入口</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">
+            <X size={20} />
+          </button>
+        </header>
+
+        <div className="more-nav-grid">
+          {moreNavViews.map((view) => (
+            <button
+              key={view}
+              className={activeView === view ? 'more-nav-item active' : 'more-nav-item'}
+              onClick={() => onPick(view)}
+            >
+              {viewIcon(view)}
+              <span>
+                <strong>{viewLabels[view]}</strong>
+                <small>
+                  {unreadByView[view] > 0 ? `${unreadByView[view]} 个待处理` : '已同步'}
+                </small>
+              </span>
+            </button>
+          ))}
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function SecuritySheet({
+  status,
+  passphrase,
+  progress,
+  message,
+  onPassphraseChange,
+  onRestoreFromSecretStorage,
+  onRestoreWithPassphrase,
+  onClose,
+}: {
+  status: CryptoStatus;
+  passphrase: string;
+  progress: string;
+  message?: { type: 'success' | 'error'; text: string };
+  onPassphraseChange: (value: string) => void;
+  onRestoreFromSecretStorage: () => void | Promise<void>;
+  onRestoreWithPassphrase: () => void | Promise<void>;
+  onClose: () => void;
+}) {
+  const busy = Boolean(progress);
+  const statusLabel = (value?: boolean) => {
+    if (value === undefined) return '未知';
+    return value ? '正常' : '需要处理';
+  };
+
+  return (
+    <div className="sheet-backdrop">
+      <section className="sheet security-sheet">
+        <header className="sheet-header">
+          <div>
+            <p className="eyebrow">Encryption</p>
+            <h2>加密与密钥恢复</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">
+            <X size={20} />
+          </button>
+        </header>
+
+        <div className="security-status-grid">
+          <span>
+            <small>加密引擎</small>
+            <strong>{status.cryptoReady ? '已启用' : '未启用'}</strong>
+          </span>
+          <span>
+            <small>安全存储</small>
+            <strong>{statusLabel(status.secretStorageReady)}</strong>
+          </span>
+          <span>
+            <small>服务端备份</small>
+            <strong>{status.backupVersion ?? status.activeBackupVersion ?? '未发现'}</strong>
+          </span>
+          <span>
+            <small>备份信任</small>
+            <strong>{statusLabel(status.backupTrusted)}</strong>
+          </span>
+        </div>
+
+        <div className="security-copy">
+          <KeyRound size={22} />
+          <span>
+            <strong>无法解密时先恢复密钥</strong>
+            <small>如果旧设备或 Element 已开启密钥备份，可以从安全存储或恢复密钥导入历史会话密钥。</small>
+          </span>
+        </div>
+
+        {progress && <p className="security-progress">{progress}</p>}
+        {message && (
+          <p className={message.type === 'error' ? 'security-message error' : 'security-message success'}>
+            {message.text}
+          </p>
+        )}
+        {!status.cryptoReady && (
+          <p className="security-message error">当前客户端还没有启用端到端加密，无法恢复密钥。</p>
+        )}
+
+        <div className="security-actions">
+          <button
+            className="primary-button"
+            type="button"
+            onClick={onRestoreFromSecretStorage}
+            disabled={!status.cryptoReady || busy}
+          >
+            <Shield size={17} />
+            从安全存储恢复
+          </button>
+          <label>
+            恢复密钥或备份口令
+            <input
+              type="password"
+              value={passphrase}
+              placeholder="输入恢复密钥 / 口令"
+              autoCapitalize="none"
+              autoCorrect="off"
+              onChange={(evt) => onPassphraseChange(evt.target.value)}
+            />
+          </label>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={onRestoreWithPassphrase}
+            disabled={!status.cryptoReady || busy || !passphrase.trim()}
+          >
+            <KeyRound size={17} />
+            使用恢复密钥恢复
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ForwardSheet({
+  message,
+  rooms,
+  onForward,
+  onClose,
+}: {
+  message: ChatMessage;
+  rooms: RoomSummary[];
+  onForward: (roomId: string) => void;
+  onClose: () => void;
+}) {
+  const [query, setQuery] = useState('');
+  const visibleRooms = useMemo(() => {
+    const normalized = query.trim().toLowerCase();
+    const joinedRooms = rooms.filter((room) => room.membership === 'join');
+    if (!normalized) return joinedRooms;
+    return joinedRooms.filter((room) =>
+      `${room.name} ${room.topic ?? ''} ${room.canonicalAlias ?? ''}`.toLowerCase().includes(normalized)
+    );
+  }, [query, rooms]);
+
+  return (
+    <div className="sheet-backdrop">
+      <section className="sheet forward-sheet">
+        <header className="sheet-header">
+          <div>
+            <p className="eyebrow">Forward</p>
+            <h2>转发消息</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">
+            <X size={20} />
+          </button>
+        </header>
+
+        <div className="forward-preview">
+          <Forward size={18} />
+          <span>
+            <strong>{message.senderName ?? message.sender ?? '消息'}</strong>
+            <small>{getReadableMessageBody(message.body)}</small>
+          </span>
+        </div>
+
+        <label className="search-field">
+          <Search size={16} />
+          <input value={query} placeholder="搜索转发目标" onChange={(evt) => setQuery(evt.target.value)} />
+        </label>
+
+        <div className="forward-room-list">
+          {visibleRooms.length === 0 ? (
+            <p className="digest-empty">没有匹配的已加入会话。</p>
+          ) : (
+            visibleRooms.map((room) => (
+              <button key={room.id} onClick={() => onForward(room.id)}>
+                <Avatar name={room.name} src={room.avatarUrl} small />
+                <span>
+                  <strong>{room.name}</strong>
+                  <small>{room.direct ? '私聊' : room.space ? '空间' : '群组'} · {room.memberCount} 人</small>
+                </span>
+              </button>
+            ))
+          )}
+        </div>
+      </section>
+    </div>
+  );
+}
+
 function MessageBubble({
   message,
   favorite,
   highlighted,
+  mediaAccessToken,
   onFavorite,
   onReply,
   onOpenReply,
@@ -1894,11 +2763,15 @@ function MessageBubble({
   onCopy,
   onCopyLink,
   onTogglePin,
+  onForward,
+  onPreviewAttachment,
+  onTranscribeAudio,
   onReact,
 }: {
   message: ChatMessage;
   favorite: boolean;
   highlighted: boolean;
+  mediaAccessToken?: string;
   onFavorite: () => void;
   onReply: () => void;
   onOpenReply: (eventId: string) => void;
@@ -1908,6 +2781,9 @@ function MessageBubble({
   onCopy: () => void;
   onCopyLink: () => void;
   onTogglePin: () => void;
+  onForward: () => void;
+  onPreviewAttachment: () => void;
+  onTranscribeAudio: () => void;
   onReact: (key: string) => void;
 }) {
   const [actionsOpen, setActionsOpen] = useState(false);
@@ -1915,6 +2791,10 @@ function MessageBubble({
     action();
     setActionsOpen(false);
   };
+  const attachmentName = message.attachment?.name ?? message.body;
+  const showBody = Boolean(
+    message.body && (!message.attachment || message.body !== attachmentName)
+  );
 
   if (message.kind === 'system') {
     return (
@@ -1946,21 +2826,57 @@ function MessageBubble({
             </button>
           )}
           {message.attachment?.kind === 'image' && message.attachment.url && (
-            <img className="message-image" src={message.attachment.url} alt={message.attachment.name ?? message.body} />
+            <button
+              className="message-media-button"
+              type="button"
+              onClick={onPreviewAttachment}
+              aria-label="预览图片"
+            >
+              <AuthenticatedImage
+                className="message-image"
+                src={message.attachment.authUrl ?? message.attachment.url}
+                fallbackSrc={message.attachment.url}
+                accessToken={mediaAccessToken}
+                alt={attachmentName}
+              />
+            </button>
           )}
           {message.attachment?.kind === 'video' && message.attachment.url && (
-            <video className="message-image" src={message.attachment.url} controls />
+            <button
+              className="message-media-button"
+              type="button"
+              onClick={onPreviewAttachment}
+              aria-label="预览视频"
+            >
+              <AuthenticatedVideo
+                className="message-image"
+                src={message.attachment.authUrl ?? message.attachment.url}
+                fallbackSrc={message.attachment.url}
+                accessToken={mediaAccessToken}
+              />
+              <span className="media-play-indicator">
+                <Play size={18} />
+              </span>
+            </button>
           )}
           {message.attachment?.kind === 'audio' && message.attachment.url && (
-            <audio src={message.attachment.url} controls />
+            <AudioPlayer
+              src={message.attachment.authDownloadUrl ?? message.attachment.authUrl ?? message.attachment.url}
+              fallbackSrc={message.attachment.downloadUrl ?? message.attachment.url}
+              accessToken={mediaAccessToken}
+              title={attachmentName}
+              onTranscribe={onTranscribeAudio}
+            />
           )}
           {message.attachment?.kind === 'file' && (
-            <a className="file-chip" href={message.attachment.url} target="_blank" rel="noreferrer">
-              <FileUp size={17} />
-              {message.attachment.name ?? message.body}
-            </a>
+            <AttachmentLink
+              src={message.attachment.authDownloadUrl ?? message.attachment.authUrl ?? message.attachment.url}
+              fallbackSrc={message.attachment.downloadUrl ?? message.attachment.url}
+              accessToken={mediaAccessToken}
+              name={message.attachment.name ?? message.body}
+            />
           )}
-          {message.body && <p>{getReadableMessageBody(message.body)}</p>}
+          {showBody && <p>{getReadableMessageBody(message.body)}</p>}
         </div>
         <button
           className="message-menu-toggle"
@@ -1975,6 +2891,10 @@ function MessageBubble({
           <button onClick={() => runAndClose(onReply)}>
             <Reply size={14} />
             回复
+          </button>
+          <button onClick={() => runAndClose(onForward)}>
+            <Forward size={14} />
+            转发
           </button>
           {message.canEdit && (
             <button onClick={() => runAndClose(onEdit)}>
@@ -2006,6 +2926,18 @@ function MessageBubble({
             <Link2 size={14} />
             链接
           </button>
+          {message.attachment && message.attachment.kind !== 'audio' && message.attachment.url && (
+            <button onClick={() => runAndClose(onPreviewAttachment)}>
+              <Eye size={14} />
+              预览
+            </button>
+          )}
+          {message.attachment?.kind === 'audio' && (
+            <button onClick={() => runAndClose(onTranscribeAudio)}>
+              <Volume2 size={14} />
+              转文字
+            </button>
+          )}
           <button onClick={() => runAndClose(onInfo)}>
             <Info size={14} />
             详情
@@ -2164,6 +3096,9 @@ function MessageInfoSheet({
   onTogglePin,
   onCopy,
   onCopyLink,
+  onForward,
+  onPreviewAttachment,
+  onTranscribeAudio,
   onReact,
   onRedact,
 }: {
@@ -2177,6 +3112,9 @@ function MessageInfoSheet({
   onTogglePin: () => void;
   onCopy: () => void;
   onCopyLink: () => void;
+  onForward: () => void;
+  onPreviewAttachment: () => void;
+  onTranscribeAudio: () => void;
   onReact: (key: string) => void;
   onRedact: () => void;
 }) {
@@ -2248,6 +3186,10 @@ function MessageInfoSheet({
             <Reply size={16} />
             回复
           </button>
+          <button onClick={onForward}>
+            <Forward size={16} />
+            转发
+          </button>
           {message.canEdit && (
             <button onClick={onEdit}>
               <Edit3 size={16} />
@@ -2270,6 +3212,18 @@ function MessageInfoSheet({
             <Link2 size={16} />
             复制链接
           </button>
+          {message.attachment && message.attachment.kind !== 'audio' && message.attachment.url && (
+            <button onClick={onPreviewAttachment}>
+              <Eye size={16} />
+              预览附件
+            </button>
+          )}
+          {message.attachment?.kind === 'audio' && (
+            <button onClick={onTranscribeAudio}>
+              <Volume2 size={16} />
+              音频转文字
+            </button>
+          )}
           {message.canRedact && (
             <button className="danger" onClick={onRedact}>
               <Trash2 size={16} />
@@ -2296,6 +3250,7 @@ function RoomInfoSheet({
   members,
   profileForm,
   mediaItems,
+  mediaAccessToken,
   pinnedMessages,
   favorite,
   currentUserId,
@@ -2320,6 +3275,7 @@ function RoomInfoSheet({
   members: RoomMemberSummary[];
   profileForm: { name: string; topic: string };
   mediaItems: RoomMediaItem[];
+  mediaAccessToken?: string;
   pinnedMessages: PinnedMessageSummary[];
   favorite: boolean;
   currentUserId?: string;
@@ -2468,7 +3424,7 @@ function RoomInfoSheet({
           )}
         </section>
 
-        <MediaStrip items={mediaItems} onPreview={onPreviewMedia} />
+        <MediaStrip items={mediaItems} mediaAccessToken={mediaAccessToken} onPreview={onPreviewMedia} />
 
         <form className="invite-form" onSubmit={onInvite}>
           <input name="userId" placeholder="邀请 @user:server" autoCapitalize="none" autoCorrect="off" />
@@ -2536,9 +3492,11 @@ function RoomInfoSheet({
 
 function MediaStrip({
   items,
+  mediaAccessToken,
   onPreview,
 }: {
   items: RoomMediaItem[];
+  mediaAccessToken?: string;
   onPreview: (media: RoomMediaItem) => void;
 }) {
   return (
@@ -2554,7 +3512,12 @@ function MediaStrip({
           {items.slice(0, 24).map((item) => (
             <button key={item.messageId} className="media-tile" onClick={() => onPreview(item)}>
               {item.kind === 'image' && item.url ? (
-                <img src={item.url} alt={item.name} />
+                <AuthenticatedImage
+                  src={item.authUrl ?? item.url}
+                  fallbackSrc={item.url}
+                  accessToken={mediaAccessToken}
+                  alt={item.name}
+                />
               ) : (
                 <span>
                   {item.kind === 'image' ? <ImageIcon size={22} /> : <FileUp size={22} />}
@@ -2569,7 +3532,18 @@ function MediaStrip({
   );
 }
 
-function MediaPreview({ media, onClose }: { media: RoomMediaItem; onClose: () => void }) {
+function MediaPreview({
+  media,
+  mediaAccessToken,
+  onClose,
+}: {
+  media: RoomMediaItem;
+  mediaAccessToken?: string;
+  onClose: () => void;
+}) {
+  const previewSrc = media.authDownloadUrl ?? media.authUrl ?? media.downloadUrl ?? media.url;
+  const fallbackSrc = media.downloadUrl ?? media.url;
+
   return (
     <div className="media-preview-backdrop">
       <section className="media-preview">
@@ -2583,8 +3557,37 @@ function MediaPreview({ media, onClose }: { media: RoomMediaItem; onClose: () =>
           </button>
         </header>
         <div className="media-preview-body">
-          {media.kind === 'image' && media.url ? (
-            <img src={media.url} alt={media.name} />
+          {media.kind === 'image' && previewSrc ? (
+            <AuthenticatedImage
+              className="media-preview-image"
+              src={previewSrc}
+              fallbackSrc={fallbackSrc}
+              accessToken={mediaAccessToken}
+              alt={media.name}
+            />
+          ) : media.kind === 'video' && previewSrc ? (
+            <AuthenticatedVideo
+              className="media-preview-video"
+              src={previewSrc}
+              fallbackSrc={fallbackSrc}
+              accessToken={mediaAccessToken}
+              controls
+            />
+          ) : media.kind === 'audio' && previewSrc ? (
+            <AudioPlayer
+              src={previewSrc}
+              fallbackSrc={fallbackSrc}
+              accessToken={mediaAccessToken}
+              title={media.name}
+              onTranscribe={() => undefined}
+            />
+          ) : previewSrc ? (
+            <AttachmentLink
+              src={previewSrc}
+              fallbackSrc={fallbackSrc}
+              accessToken={mediaAccessToken}
+              name={media.name}
+            />
           ) : media.url ? (
             <a className="secondary-button" href={media.url} target="_blank" rel="noreferrer">
               <Eye size={18} />
@@ -2665,11 +3668,13 @@ function SettingsPanel({
   ownProfile,
   profileForm,
   preferences,
+  cryptoStatus,
   onLogout,
   onProfileChange,
   onProfileSubmit,
   onAvatarSelected,
   onPreferencesChange,
+  onOpenSecurity,
   onClearLocal,
 }: {
   session?: StoredMatrixSession;
@@ -2679,11 +3684,13 @@ function SettingsPanel({
   ownProfile?: OwnProfile;
   profileForm: { displayName: string };
   preferences: AppPreferences;
+  cryptoStatus: CryptoStatus;
   onLogout: () => void;
   onProfileChange: (value: { displayName: string }) => void;
   onProfileSubmit: (evt: FormEvent<HTMLFormElement>) => void;
   onAvatarSelected: (file: File) => void;
   onPreferencesChange: (value: AppPreferences) => void;
+  onOpenSecurity: () => void;
   onClearLocal: () => void;
 }) {
   return (
@@ -2757,6 +3764,15 @@ function SettingsPanel({
           <small>{deviceName} · {session?.deviceId}</small>
         </span>
       </div>
+      <button className="settings-item button-like" onClick={onOpenSecurity}>
+        <KeyRound size={19} />
+        <span>
+          <strong>加密与密钥</strong>
+          <small>
+            {cryptoStatus.cryptoReady ? '加密可用' : '加密未启用'} · {cryptoStatus.backupVersion ?? cryptoStatus.activeBackupVersion ?? '未发现备份'}
+          </small>
+        </span>
+      </button>
       <div className="settings-item">
         <MessageCircle size={19} />
         <span>
