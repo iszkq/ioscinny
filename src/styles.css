@@ -15,6 +15,7 @@ html,
 body,
 #root {
   width: 100%;
+  max-width: 100%;
   min-height: 100%;
   margin: 0;
 }
@@ -265,7 +266,8 @@ h2 {
 }
 
 .app-frame {
-  width: 100vw;
+  width: 100%;
+  max-width: 100vw;
   height: 100vh;
   height: 100dvh;
   display: grid;
@@ -339,6 +341,7 @@ h2 {
 .theme-dark .sheet-actions button,
 .theme-dark .settings-action,
 .theme-dark .load-older,
+.theme-dark .message-menu-toggle,
 .theme-dark .message-actions button,
 .theme-dark .segmented {
   color: #d6e1ec;
@@ -389,6 +392,11 @@ h2 {
 .theme-dark .mention-suggestions,
 .theme-dark .member-action,
 .theme-dark .pinned-count {
+  color: #c8f3fb;
+  background: #123744;
+}
+
+.theme-dark .message.actions-open .message-menu-toggle {
   color: #c8f3fb;
   background: #123744;
 }
@@ -734,16 +742,23 @@ h2 {
 }
 
 .room-row-sub {
+  min-width: 0;
   display: flex;
   align-items: center;
   gap: 5px;
+  overflow: hidden;
 }
 
 .room-row-sub span {
   min-width: 0;
+  display: block;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.room-row-sub svg {
+  flex: 0 0 auto;
 }
 
 .unread {
@@ -1042,7 +1057,8 @@ h2 {
   flex-direction: column;
   gap: 12px;
   padding: 18px 16px;
-  overflow: auto;
+  overflow-y: auto;
+  overflow-x: hidden;
   background:
     linear-gradient(#f8fafc 1px, transparent 1px),
     linear-gradient(90deg, #f8fafc 1px, transparent 1px),
@@ -1202,17 +1218,47 @@ h2 {
   font-weight: 800;
 }
 
+.message-menu-toggle {
+  width: 30px;
+  height: 26px;
+  justify-self: start;
+  display: grid;
+  place-items: center;
+  border: 1px solid #d9e2ec;
+  border-radius: 999px;
+  color: #667085;
+  background: rgba(255, 255, 255, 0.94);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease, background 0.15s ease;
+}
+
+.message.mine .message-menu-toggle {
+  justify-self: end;
+}
+
+.message:hover .message-menu-toggle,
+.message:focus-within .message-menu-toggle,
+.message.actions-open .message-menu-toggle {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.message.actions-open .message-menu-toggle {
+  color: #0f6b82;
+  background: #e0f1f4;
+}
+
 .message-actions {
-  display: flex;
+  display: none;
   flex-wrap: wrap;
   gap: 5px;
-  opacity: 0;
-  transition: opacity 0.15s ease;
 }
 
 .message:hover .message-actions,
-.message:focus-within .message-actions {
-  opacity: 1;
+.message:focus-within .message-actions,
+.message.actions-open .message-actions {
+  display: flex;
 }
 
 .message-actions button {
@@ -2063,13 +2109,15 @@ h2 {
   }
 
   .app-frame {
-    grid-template-columns: 100vw 100vw;
+    width: 100vw;
+    grid-template-columns: minmax(0, 1fr);
     grid-template-rows: 1fr auto;
-    transition: transform 0.22s ease;
+    transform: none;
+    transition: none;
   }
 
   .app-frame.mobile-chat {
-    transform: translateX(-100vw);
+    transform: none;
   }
 
   .rail {
@@ -2079,6 +2127,7 @@ h2 {
   .room-pane,
   .chat-pane {
     width: 100vw;
+    max-width: 100vw;
     height: calc(100vh - 64px);
     height: calc(100dvh - 64px);
   }
@@ -2091,8 +2140,13 @@ h2 {
   }
 
   .chat-pane {
-    grid-column: 2;
+    grid-column: 1;
     grid-row: 1;
+  }
+
+  .app-frame.mobile-list .chat-pane,
+  .app-frame.mobile-chat .room-pane {
+    display: none;
   }
 
   .mobile-back {
@@ -2108,15 +2162,24 @@ h2 {
     height: 64px;
     padding: 6px max(8px, env(safe-area-inset-left)) max(6px, env(safe-area-inset-bottom)) max(8px, env(safe-area-inset-right));
     display: grid;
-    grid-template-columns: repeat(8, minmax(0, 1fr));
-    gap: 2px;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(62px, 1fr);
+    grid-template-columns: none;
+    gap: 4px;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
     border-top: 1px solid #dbe3ea;
     background: rgba(255, 255, 255, 0.96);
     backdrop-filter: blur(18px);
   }
 
+  .bottom-nav::-webkit-scrollbar {
+    display: none;
+  }
+
   .bottom-button {
-    min-width: 0;
+    min-width: 62px;
     gap: 2px;
     color: #667085;
     background: transparent;
@@ -2133,8 +2196,38 @@ h2 {
     max-width: 92%;
   }
 
-  .message-actions {
+  .message-menu-toggle {
     opacity: 1;
+    pointer-events: auto;
+  }
+
+  .message-actions {
+    width: min(100%, 330px);
+    padding: 8px;
+    border: 1px solid #d9e2ec;
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.98);
+    box-shadow: 0 10px 28px rgba(15, 23, 42, 0.12);
+  }
+
+  .theme-dark .message-actions {
+    border-color: #2f3a4c;
+    background: #182231;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.32);
+  }
+
+  .message:not(.actions-open) .message-actions {
+    display: none;
+  }
+
+  .message.mine .message-actions {
+    justify-content: flex-end;
+  }
+
+  .quick-reactions {
+    flex: 1 1 100%;
+    overflow-x: auto;
+    justify-content: flex-start;
   }
 
   .sheet-backdrop {
@@ -2147,8 +2240,55 @@ h2 {
 }
 
 @media (max-width: 520px) {
+  .room-pane {
+    gap: 10px;
+    padding-left: 10px;
+    padding-right: 10px;
+  }
+
   .pane-header h1 {
     font-size: 24px;
+  }
+
+  .account-card {
+    min-height: 50px;
+    padding: 8px;
+  }
+
+  .account-card .avatar {
+    width: 36px;
+    height: 36px;
+  }
+
+  .room-list {
+    gap: 3px;
+    padding-right: 0;
+  }
+
+  .room-row {
+    min-height: 64px;
+    grid-template-columns: 40px minmax(0, 1fr) auto;
+    gap: 9px;
+    padding: 7px 6px;
+  }
+
+  .room-row .avatar {
+    width: 40px;
+    height: 40px;
+  }
+
+  .room-row-title strong {
+    font-size: 14px;
+  }
+
+  .room-row-sub {
+    font-size: 12px;
+  }
+
+  .unread {
+    min-width: 22px;
+    height: 22px;
+    padding: 0 6px;
   }
 
   .chat-header {
@@ -2181,6 +2321,37 @@ h2 {
 
   .timeline {
     padding: 12px 10px;
+    gap: 10px;
+    background: #f5f7f9;
+  }
+
+  .message {
+    max-width: 94%;
+    gap: 6px;
+  }
+
+  .message .avatar.small {
+    width: 28px;
+    height: 28px;
+  }
+
+  .message-meta {
+    min-height: 16px;
+    font-size: 11px;
+  }
+
+  .bubble {
+    padding: 9px 11px;
+    box-shadow: none;
+  }
+
+  .message-menu-toggle {
+    width: 28px;
+    height: 24px;
+  }
+
+  .message-actions button {
+    min-height: 32px;
   }
 
   .composer {
@@ -2192,6 +2363,10 @@ h2 {
 
   .message-image {
     width: min(320px, 78vw);
+  }
+
+  .composer textarea {
+    font-size: 16px;
   }
 
   .stat-grid,

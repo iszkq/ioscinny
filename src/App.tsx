@@ -25,6 +25,7 @@ import {
   MessageCircle,
   MessageSquarePlus,
   Moon,
+  MoreHorizontal,
   Pin,
   PinOff,
   Plus,
@@ -247,6 +248,13 @@ const formatDateSeparator = (ts: number): string => {
     day: 'numeric',
     weekday: 'short',
   });
+};
+
+const getReadableMessageBody = (body: string): string => {
+  if (/Unable to decrypt|DecryptionError/i.test(body)) {
+    return '无法解密 · 需要恢复密钥或完成设备验证';
+  }
+  return body;
 };
 
 const loadStringArray = (key: string): string[] => {
@@ -1476,7 +1484,7 @@ export function App() {
                 <div className="composer-context">
                   <span>
                     {composerMode.type === 'edit' ? '编辑消息' : `回复 ${composerMode.message.senderName ?? '消息'}`}
-                    <small>{composerMode.message.body}</small>
+                    <small>{getReadableMessageBody(composerMode.message.body)}</small>
                   </span>
                   <button
                     type="button"
@@ -1721,7 +1729,11 @@ function RoomList({
               {room.encrypted && <Lock size={12} />}
               {room.muted && <Bell size={12} />}
               {favoriteRoomIds.includes(room.id) && <Star size={12} />}
-              <span>{roomDrafts[room.id] ? `草稿：${roomDrafts[room.id]}` : room.lastMessage}</span>
+              <span>
+                {roomDrafts[room.id]
+                  ? `草稿：${roomDrafts[room.id]}`
+                  : getReadableMessageBody(room.lastMessage)}
+              </span>
             </span>
           </span>
           {room.membership === 'invite' ? (
@@ -1776,7 +1788,7 @@ function FavoriteMessageDigest({
               <strong>{room.name}</strong>
               <small>{message.senderName ?? message.sender} · {formatTime(message.timestamp)}</small>
             </span>
-            <p>{message.body}</p>
+            <p>{getReadableMessageBody(message.body)}</p>
           </button>
         ))
       )}
@@ -1803,7 +1815,7 @@ function LocalSearchDigest({
           <span>
             <strong>{room.name}</strong>
             <small>{message.senderName ?? message.sender} · {formatTime(message.timestamp)}</small>
-            <p>{message.body}</p>
+            <p>{getReadableMessageBody(message.body)}</p>
           </span>
         </button>
       ))}
@@ -1829,7 +1841,7 @@ function PinnedBar({
         <Pin size={16} />
         <span>
           <strong>{first.senderName ?? '置顶消息'}</strong>
-          <small>{first.body}</small>
+          <small>{getReadableMessageBody(first.body)}</small>
         </span>
       </button>
       <button className="pinned-count" onClick={onOpenAll}>
@@ -1898,17 +1910,23 @@ function MessageBubble({
   onTogglePin: () => void;
   onReact: (key: string) => void;
 }) {
+  const [actionsOpen, setActionsOpen] = useState(false);
+  const runAndClose = (action: () => void) => {
+    action();
+    setActionsOpen(false);
+  };
+
   if (message.kind === 'system') {
     return (
       <div className="system-message">
-        <span>{message.body}</span>
+        <span>{getReadableMessageBody(message.body)}</span>
       </div>
     );
   }
 
   return (
     <article
-      className={`${message.mine ? 'message mine' : 'message'}${highlighted ? ' highlighted' : ''}`}
+      className={`${message.mine ? 'message mine' : 'message'}${highlighted ? ' highlighted' : ''}${actionsOpen ? ' actions-open' : ''}`}
       data-message-id={message.id}
     >
       {!message.mine && <Avatar name={message.senderName ?? message.sender ?? '?'} src={message.senderAvatarUrl} small />}
@@ -1924,7 +1942,7 @@ function MessageBubble({
           {message.replyTo && (
             <button className="reply-preview" onClick={() => onOpenReply(message.replyTo!.eventId)}>
               <strong>{message.replyTo.senderName ?? '回复'}</strong>
-              <span>{message.replyTo.body}</span>
+              <span>{getReadableMessageBody(message.replyTo.body)}</span>
             </button>
           )}
           {message.attachment?.kind === 'image' && message.attachment.url && (
@@ -1942,15 +1960,24 @@ function MessageBubble({
               {message.attachment.name ?? message.body}
             </a>
           )}
-          {message.body && <p>{message.body}</p>}
+          {message.body && <p>{getReadableMessageBody(message.body)}</p>}
         </div>
+        <button
+          className="message-menu-toggle"
+          type="button"
+          aria-label={actionsOpen ? '收起消息操作' : '更多消息操作'}
+          aria-expanded={actionsOpen}
+          onClick={() => setActionsOpen((open) => !open)}
+        >
+          <MoreHorizontal size={17} />
+        </button>
         <div className="message-actions">
-          <button onClick={onReply}>
+          <button onClick={() => runAndClose(onReply)}>
             <Reply size={14} />
             回复
           </button>
           {message.canEdit && (
-            <button onClick={onEdit}>
+            <button onClick={() => runAndClose(onEdit)}>
               <Edit3 size={14} />
               编辑
             </button>
@@ -1958,33 +1985,33 @@ function MessageBubble({
           <div className="quick-reactions" aria-label="快速回应">
             <SmilePlus size={14} />
             {quickReactionOptions.map((reaction) => (
-              <button key={reaction} onClick={() => onReact(reaction)}>
+              <button key={reaction} onClick={() => runAndClose(() => onReact(reaction))}>
                 {reaction}
               </button>
             ))}
           </div>
-          <button className={favorite ? 'active' : ''} onClick={onFavorite}>
+          <button className={favorite ? 'active' : ''} onClick={() => runAndClose(onFavorite)}>
             <Star size={14} />
             收藏
           </button>
-          <button className={message.pinned ? 'active' : ''} onClick={onTogglePin}>
+          <button className={message.pinned ? 'active' : ''} onClick={() => runAndClose(onTogglePin)}>
             {message.pinned ? <PinOff size={14} /> : <Pin size={14} />}
             {message.pinned ? '取消置顶' : '置顶'}
           </button>
-          <button onClick={onCopy}>
+          <button onClick={() => runAndClose(onCopy)}>
             <Copy size={14} />
             复制
           </button>
-          <button onClick={onCopyLink}>
+          <button onClick={() => runAndClose(onCopyLink)}>
             <Link2 size={14} />
             链接
           </button>
-          <button onClick={onInfo}>
+          <button onClick={() => runAndClose(onInfo)}>
             <Info size={14} />
             详情
           </button>
           {message.canRedact && (
-            <button className="danger" onClick={onRedact}>
+            <button className="danger" onClick={() => runAndClose(onRedact)}>
               <Trash2 size={14} />
               撤回
             </button>
@@ -1993,7 +2020,7 @@ function MessageBubble({
             <button
               key={reaction.key}
               className={reaction.reactedByMe ? 'active' : ''}
-              onClick={() => onReact(reaction.key)}
+              onClick={() => runAndClose(() => onReact(reaction.key))}
             >
               {reaction.key} {reaction.count}
             </button>
@@ -2171,7 +2198,7 @@ function MessageInfoSheet({
             <strong>{message.senderName ?? message.sender ?? '未知成员'}</strong>
             <span>{formatFullTime(message.timestamp)}</span>
           </div>
-          <p>{message.body}</p>
+          <p>{getReadableMessageBody(message.body)}</p>
         </div>
 
         <div className="message-detail-grid">
@@ -2429,7 +2456,7 @@ function RoomInfoSheet({
                     <small>
                       {!message.available ? '未同步 · ' : ''}
                       {message.timestamp ? `${formatTime(message.timestamp)} · ` : ''}
-                      {message.body}
+                      {getReadableMessageBody(message.body)}
                     </small>
                   </span>
                 </button>
