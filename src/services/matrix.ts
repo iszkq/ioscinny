@@ -130,6 +130,11 @@ export type ChatMessage = {
   favoriteSource?: FavoriteSourceMetadata;
 };
 
+export type InlineReadReceiptState = {
+  readReceipts: MessageReadReceipt[];
+  totalCount: number;
+};
+
 export type RoomMemberSummary = {
   id: string;
   name: string;
@@ -368,6 +373,7 @@ type ReceiptWithTimestamp = {
 
 const ROOM_NAME_FALLBACK = '未命名房间';
 const DEFAULT_MESSAGE_LIMIT = 260;
+const MAX_RECEIPT_CONTEXT_MESSAGE_COUNT = 520;
 const MAX_CUSTOM_EMOJI_ITEMS = 4096;
 const secretStorageKeys = new Map<string, Uint8Array>();
 
@@ -1578,10 +1584,112 @@ const getTimelineMessages = (
   limit = DEFAULT_MESSAGE_LIMIT
 ): ChatMessage[] => {
   const events = room.getLiveTimeline().getEvents();
-  return events
-    .slice(Math.max(0, events.length - limit))
+  return getTimelineEventsForChat(client, room, events, limit)
     .map((event) => eventToChatMessage(client, room, event))
     .filter((message): message is ChatMessage => Boolean(message));
+};
+
+const isRenderableOwnChatEvent = (client: MatrixClient, event: MatrixEvent): boolean => {
+  if (event.getSender() !== client.getUserId()) return false;
+  if (!event.getId() || event.isRedacted?.()) return false;
+
+  const eventType = getEventType(event);
+  const relationType = getRelationType(getEventContent(event));
+  if (relationType === 'm.replace' || relationType === 'm.annotation') return false;
+
+  return eventType === 'm.room.message' || eventType === 'm.room.encrypted';
+};
+
+const findLatestIndexAtOrBefore = (indices: number[], target: number): number | undefined => {
+  let low = 0;
+  let high = indices.length - 1;
+  let result = -1;
+
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    const value = indices[middle];
+    if (value <= target) {
+      result = value;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+
+  return result >= 0 ? result : undefined;
+};
+
+const getReadReceiptAnchorIndices = (
+  client: MatrixClient,
+  room: Room,
+  events: MatrixEvent[]
+): number[] => {
+  const ownUserId = client.getUserId();
+  if (!ownUserId || events.length === 0) return [];
+
+  const ownMessageIndices: number[] = [];
+  const eventIndexById = new Map<string, number>();
+
+  events.forEach((event, index) => {
+    const eventId = event.getId();
+    if (eventId) eventIndexById.set(eventId, index);
+    if (isRenderableOwnChatEvent(client, event)) {
+      ownMessageIndices.push(index);
+    }
+  });
+
+  if (ownMessageIndices.length === 0) return [];
+
+  const anchorIndices = new Set<number>();
+
+  room.getMembers().forEach((member) => {
+    if (member.userId === ownUserId || member.membership !== 'join') return;
+
+    const readUpToEventId =
+      room.getEventReadUpTo(member.userId, true) ?? room.getEventReadUpTo(member.userId);
+    if (!readUpToEventId) return;
+
+    const readUpToIndex = eventIndexById.get(readUpToEventId);
+    if (typeof readUpToIndex !== 'number') return;
+
+    const anchorIndex = findLatestIndexAtOrBefore(ownMessageIndices, readUpToIndex);
+    if (typeof anchorIndex === 'number') {
+      anchorIndices.add(anchorIndex);
+    }
+  });
+
+  return Array.from(anchorIndices).sort((left, right) => left - right);
+};
+
+const getTimelineEventsForChat = (
+  client: MatrixClient,
+  room: Room,
+  events: MatrixEvent[],
+  limit: number
+): MatrixEvent[] => {
+  if (events.length <= limit) return events;
+
+  const baseStartIndex = Math.max(0, events.length - limit);
+  const anchorIndices = getReadReceiptAnchorIndices(client, room, events).filter(
+    (index) => index < baseStartIndex
+  );
+
+  if (anchorIndices.length === 0) {
+    return events.slice(baseStartIndex);
+  }
+
+  const earliestAnchorIndex = anchorIndices[0];
+  if (events.length - earliestAnchorIndex <= MAX_RECEIPT_CONTEXT_MESSAGE_COUNT) {
+    return events.slice(earliestAnchorIndex);
+  }
+
+  const selectedIndices = new Set<number>();
+  for (let index = baseStartIndex; index < events.length; index += 1) {
+    selectedIndices.add(index);
+  }
+  anchorIndices.forEach((index) => selectedIndices.add(index));
+
+  return events.filter((_event, index) => selectedIndices.has(index));
 };
 
 const getLastMessagePreview = (client: MatrixClient, room: Room): { text: string; ts: number } => {
@@ -1882,6 +1990,93 @@ export function getRoomMessages(
   return messages.filter((message) =>
     `${message.senderName ?? ''} ${message.body}`.toLowerCase().includes(normalizedQuery)
   );
+}
+
+export function getRoomInlineReadReceiptStates(
+  client: MatrixClient,
+  roomId: string,
+  messages: ChatMessage[]
+): Map<string, InlineReadReceiptState> {
+  const room = client.getRoom(roomId);
+  if (!room || messages.length === 0) return new Map();
+
+  const ownUserId = client.getUserId();
+  if (!ownUserId) return new Map();
+
+  const events = room.getLiveTimeline().getEvents();
+  if (events.length === 0) return new Map();
+
+  const eventIndexById = new Map<string, number>();
+  events.forEach((event, index) => {
+    const eventId = event.getId();
+    if (eventId) eventIndexById.set(eventId, index);
+  });
+
+  const ownVisibleMessages = messages.filter(
+    (message): message is ChatMessage & { sender: string } =>
+      message.kind === 'message' && message.mine && typeof message.sender === 'string'
+  );
+  if (ownVisibleMessages.length === 0) return new Map();
+
+  const ownVisibleIndices = ownVisibleMessages
+    .map((message) => eventIndexById.get(message.id))
+    .filter((index): index is number => typeof index === 'number')
+    .sort((left, right) => left - right);
+  if (ownVisibleIndices.length === 0) return new Map();
+
+  const messageIdByIndex = new Map<number, string>();
+  ownVisibleMessages.forEach((message) => {
+    const index = eventIndexById.get(message.id);
+    if (typeof index === 'number') {
+      messageIdByIndex.set(index, message.id);
+    }
+  });
+
+  const statesByMessageId = new Map<string, InlineReadReceiptState>();
+
+  room.getMembers().forEach((member) => {
+    if (member.userId === ownUserId || member.membership !== 'join') return;
+
+    const readUpToEventId =
+      room.getEventReadUpTo(member.userId, true) ?? room.getEventReadUpTo(member.userId);
+    if (!readUpToEventId) return;
+
+    const readUpToIndex = eventIndexById.get(readUpToEventId);
+    if (typeof readUpToIndex !== 'number') return;
+
+    const anchorIndex = findLatestIndexAtOrBefore(ownVisibleIndices, readUpToIndex);
+    if (typeof anchorIndex !== 'number') return;
+
+    const anchorMessageId = messageIdByIndex.get(anchorIndex);
+    if (!anchorMessageId) return;
+
+    const nextState = statesByMessageId.get(anchorMessageId) ?? {
+      readReceipts: [],
+      totalCount: 0,
+    };
+
+    nextState.readReceipts.push({
+      userId: member.userId,
+      name: getMemberDisplayName(room, member.userId),
+      avatarUrl: getMemberAvatarUrl(client, member, 48),
+      timestamp: getReceiptTimestamp(room, member.userId),
+    });
+    nextState.totalCount = nextState.readReceipts.length;
+    statesByMessageId.set(anchorMessageId, nextState);
+  });
+
+  statesByMessageId.forEach((state) => {
+    state.readReceipts.sort((left, right) => {
+      if (typeof left.timestamp === 'number' && typeof right.timestamp === 'number') {
+        return right.timestamp - left.timestamp;
+      }
+      if (typeof left.timestamp === 'number') return -1;
+      if (typeof right.timestamp === 'number') return 1;
+      return left.name.localeCompare(right.name, 'zh-Hans-CN');
+    });
+  });
+
+  return statesByMessageId;
 }
 
 export function searchLocalMessages(

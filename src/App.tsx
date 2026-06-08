@@ -115,11 +115,13 @@ import {
   getOwnProfile,
   getPersonalCustomEmojiPacks,
   getPinnedMessages,
+  getRoomInlineReadReceiptStates,
   getRoomMediaItems,
   getRoomMembers,
   loadRoomMembers,
   getRoomMessages,
   getRoomTypingMembers,
+  InlineReadReceiptState,
   inviteUser,
   joinRoom,
   kickMember,
@@ -398,46 +400,6 @@ const getOwnMessageReadReceiptSummary = (
     unreadCount: unreadMembers.length,
     unreadMembers,
   };
-};
-
-type InlineReadReceiptState = {
-  readReceipts: MessageReadReceipt[];
-  totalCount: number;
-};
-
-const getInlineReadReceiptStateByMessageId = (
-  messages: ChatMessage[]
-): Map<string, InlineReadReceiptState> => {
-  const states = new Map<string, InlineReadReceiptState>();
-  const ownMessages = messages.filter(
-    (message): message is ChatMessage & { sender: string } =>
-      message.kind === 'message' && message.mine && typeof message.sender === 'string'
-  );
-  if (ownMessages.length === 0) return states;
-
-  const latestMessageIdByReader = new Map<string, string>();
-
-  ownMessages.forEach((message) => {
-    message.readReceipts.forEach((receipt) => {
-      if (receipt.userId === message.sender) return;
-      latestMessageIdByReader.set(receipt.userId, message.id);
-    });
-  });
-
-  ownMessages.forEach((message) => {
-    const anchoredReadReceipts = message.readReceipts.filter(
-      (receipt) => receipt.userId !== message.sender && latestMessageIdByReader.get(receipt.userId) === message.id
-    );
-
-    if (anchoredReadReceipts.length > 0) {
-      states.set(message.id, {
-        readReceipts: anchoredReadReceipts,
-        totalCount: anchoredReadReceipts.length,
-      });
-    }
-  });
-
-  return states;
 };
 
 const formatOwnMessageReadReceiptSummary = (
@@ -2333,8 +2295,11 @@ export function App() {
   }, [client, messageQuery, selectedRoomId, snapshot.version]);
 
   const selectedRoomInlineReadReceiptStates = useMemo(
-    () => getInlineReadReceiptStateByMessageId(selectedRoomMessages),
-    [selectedRoomMessages]
+    () =>
+      client && selectedRoomId
+        ? getRoomInlineReadReceiptStates(client, selectedRoomId, selectedRoomMessages)
+        : new Map<string, InlineReadReceiptState>(),
+    [client, selectedRoomId, selectedRoomMessages]
   );
 
   const selectedForwardMessages = useMemo(
