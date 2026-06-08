@@ -89,6 +89,7 @@ export type MessageReadReceipt = {
 
 export type ChatReply = {
   eventId: string;
+  senderId?: string;
   senderName?: string;
   body: string;
 };
@@ -215,7 +216,21 @@ export type CustomEmojiItem = {
   mxcUrl: string;
   url?: string;
   authUrl?: string;
+  downloadUrl?: string;
+  authDownloadUrl?: string;
   info?: Record<string, unknown>;
+};
+
+export type CustomEmojiPack = {
+  id: string;
+  name: string;
+  usage: CustomEmojiUsage[];
+  items: CustomEmojiItem[];
+  cover?: CustomEmojiItem;
+  isDefault: boolean;
+  editable: boolean;
+  deletable: boolean;
+  orderable: boolean;
 };
 
 export type CustomEmojiDebugSummary = {
@@ -290,6 +305,8 @@ export type MatrixRuntime = {
   stop: () => void;
 };
 
+let matrixSnapshotVersion = 0;
+
 type MatrixWellKnown = {
   'm.homeserver'?: {
     base_url?: string;
@@ -350,6 +367,7 @@ type ReceiptWithTimestamp = {
 
 const ROOM_NAME_FALLBACK = '未命名房间';
 const DEFAULT_MESSAGE_LIMIT = 140;
+const MAX_CUSTOM_EMOJI_ITEMS = 4096;
 const secretStorageKeys = new Map<string, Uint8Array>();
 
 const cryptoCallbacks = {
@@ -940,6 +958,14 @@ const trimReplyFallback = (body: string): string => {
   return body.slice(match[0].length);
 };
 
+const escapeHtml = (value: string): string =>
+  value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
 const getPlainBody = (content: Record<string, unknown>): string => {
   const editedContent = content['m.new_content'];
   if (editedContent && typeof editedContent === 'object') {
@@ -957,7 +983,7 @@ const getPlainBody = (content: Record<string, unknown>): string => {
 };
 
 const getEventById = (room: Room, eventId: string): MatrixEvent | undefined =>
-  room.getLiveTimeline().getEvents().find((event) => event.getId() === eventId);
+  room.findEventById(eventId) ?? room.getLiveTimeline().getEvents().find((event) => event.getId() === eventId);
 
 const getRoomPinnedEventIds = (room: Room): string[] => {
   const event = room.currentState?.getStateEvents('m.room.pinned_events', '');
@@ -988,6 +1014,7 @@ const getReplyPreview = (
   const replyContent = getEventContent(replyEvent);
   return {
     eventId,
+    senderId: sender,
     senderName: sender ? getMemberDisplayName(room, sender) : undefined,
     body: getPlainBody(replyContent) || '附件或状态消息',
   };
@@ -1104,17 +1131,18 @@ const getAttachment = (
   const downloadUrl = mxcToHttp(client, mediaMxc);
   const authDownloadUrl = mxcToHttp(client, mediaMxc, undefined, undefined, true);
   const thumbnailUrl = previewMxc
-    ? mxcToHttp(client, previewMxc, 980, 760)
+    ? mxcToHttp(client, previewMxc, 640, 640)
     : encryptedFile
       ? downloadUrl
-      : mxcToHttp(client, mediaMxc, 980, 760);
+      : mxcToHttp(client, mediaMxc, 640, 640);
   const authThumbnailUrl = previewMxc
-    ? mxcToHttp(client, previewMxc, 980, 760, true)
+    ? mxcToHttp(client, previewMxc, 640, 640, true)
     : encryptedFile
       ? authDownloadUrl
-      : mxcToHttp(client, mediaMxc, 980, 760, true);
-  const mimeType = infoRecord.mimetype;
-  const previewMimeType = thumbnailInfo.mimetype;
+      : mxcToHttp(client, mediaMxc, 640, 640, true);
+  const mimeType = typeof infoRecord.mimetype === 'string' ? infoRecord.mimetype : undefined;
+  const previewMimeType = typeof thumbnailInfo.mimetype === 'string' ? thumbnailInfo.mimetype : undefined;
+  const previewResolvedMimeType = previewMimeType ?? (previewMxc ? (mimeType?.startsWith('image/') ? mimeType : undefined) : mimeType);
   const size = infoRecord.size;
   const duration = infoRecord.duration;
   const width = infoRecord.w;
@@ -1128,12 +1156,12 @@ const getAttachment = (
       url: thumbnailUrl ?? downloadUrl,
       authUrl: authThumbnailUrl ?? authDownloadUrl,
       previewEncryptedFile: thumbnailFile,
-      previewMimeType: typeof previewMimeType === 'string' ? previewMimeType : typeof mimeType === 'string' ? mimeType : undefined,
+      previewMimeType: previewResolvedMimeType,
       downloadUrl,
       authDownloadUrl,
       encryptedFile,
       name,
-      mimeType: typeof mimeType === 'string' ? mimeType : undefined,
+      mimeType,
       size: typeof size === 'number' ? size : undefined,
       durationMs: typeof duration === 'number' ? duration : undefined,
       width: typeof width === 'number' ? width : typeof previewWidth === 'number' ? previewWidth : undefined,
@@ -1147,12 +1175,12 @@ const getAttachment = (
       url: thumbnailUrl ?? downloadUrl,
       authUrl: authThumbnailUrl ?? authDownloadUrl,
       previewEncryptedFile: thumbnailFile,
-      previewMimeType: typeof previewMimeType === 'string' ? previewMimeType : typeof mimeType === 'string' ? mimeType : undefined,
+      previewMimeType: previewResolvedMimeType,
       downloadUrl,
       authDownloadUrl,
       encryptedFile,
       name,
-      mimeType: typeof mimeType === 'string' ? mimeType : undefined,
+      mimeType,
       size: typeof size === 'number' ? size : undefined,
       durationMs: typeof duration === 'number' ? duration : undefined,
       width: typeof width === 'number' ? width : typeof previewWidth === 'number' ? previewWidth : undefined,
@@ -1252,8 +1280,7 @@ const getReceiptTimestamp = (room: Room, userId: string): number | undefined => 
 const getEventReadReceipts = (
   client: MatrixClient,
   room: Room,
-  eventId: string,
-  sender?: string
+  eventId: string
 ): MessageReadReceipt[] => {
   if (!eventId.startsWith('$')) return [];
 
@@ -1261,11 +1288,9 @@ const getEventReadReceipts = (
     const event = room.findEventById(eventId);
     if (!event) return [];
 
-    const currentUserId = client.getUserId();
     return room
       .getUsersReadUpTo(event)
       .filter((userId, index, userIds) => userIds.indexOf(userId) === index)
-      .filter((userId) => userId !== currentUserId && userId !== sender)
       .map((userId) => {
         const member = room.getMember(userId);
         return {
@@ -1466,7 +1491,7 @@ const eventToChatMessage = (
     pinned: pinnedEventIds.includes(id),
     replyTo: getReplyPreview(client, room, content),
     reactions: getEventReactions(client, room, id),
-    readReceipts: getEventReadReceipts(client, room, id, sender),
+    readReceipts: getEventReadReceipts(client, room, id),
     favoriteSource: getFavoriteSourceMetadata(client, content),
   };
 
@@ -1609,7 +1634,7 @@ const getRoomAvatarUrl = (client: MatrixClient, room: Room, direct: boolean): st
 
 const getRoomMemberCount = (room: Room): number => {
   try {
-    return room.getJoinedMembers().length;
+    return room.getJoinedMemberCount();
   } catch {
     return 0;
   }
@@ -1712,7 +1737,7 @@ const buildSnapshot = (client: MatrixClient): MatrixSnapshot => {
     });
 
   return {
-    version: Date.now(),
+    version: ++matrixSnapshotVersion,
     rooms,
     totalUnread: rooms.reduce((count, room) => count + room.unread, 0),
     totalHighlights: rooms.reduce((count, room) => count + room.highlight, 0),
@@ -1810,6 +1835,8 @@ export async function createMatrixRuntime(
   client.on(ClientEvent.Sync, handleSync);
   client.on(ClientEvent.AccountData, refresh);
   client.on(RoomEvent.Timeline, refresh);
+  client.on(RoomEvent.TimelineReset, refresh);
+  client.on(RoomEvent.LocalEchoUpdated, refresh);
   client.on(RoomEvent.AccountData, refresh);
   client.on(RoomEvent.Receipt, refresh);
   client.on(RoomEvent.MyMembership, refresh);
@@ -1825,6 +1852,8 @@ export async function createMatrixRuntime(
       client.removeListener(ClientEvent.Sync, handleSync);
       client.removeListener(ClientEvent.AccountData, refresh);
       client.removeListener(RoomEvent.Timeline, refresh);
+      client.removeListener(RoomEvent.TimelineReset, refresh);
+      client.removeListener(RoomEvent.LocalEchoUpdated, refresh);
       client.removeListener(RoomEvent.AccountData, refresh);
       client.removeListener(RoomEvent.Receipt, refresh);
       client.removeListener(RoomEvent.MyMembership, refresh);
@@ -1936,28 +1965,80 @@ export function getPinnedMessages(client: MatrixClient, roomId: string): PinnedM
   });
 }
 
+export async function fetchRoomMessageById(
+  client: MatrixClient,
+  roomId: string,
+  eventId: string
+): Promise<ChatMessage | undefined> {
+  const room = client.getRoom(roomId);
+  if (!room) return undefined;
+
+  const localEvent = getEventById(room, eventId);
+  if (localEvent) {
+    return eventToChatMessage(client, room, localEvent);
+  }
+
+  try {
+    const remoteEvent = await client.fetchRoomEvent(roomId, eventId);
+    if (!remoteEvent) return undefined;
+    return eventToChatMessage(client, room, new MatrixEvent(remoteEvent));
+  } catch {
+    return undefined;
+  }
+}
+
+const getUserPowerLevels = (room: Room): Record<string, unknown> => {
+  const powerLevels =
+    room.currentState?.getStateEvents('m.room.power_levels', '')?.getContent() ?? {};
+  return typeof powerLevels.users === 'object' && powerLevels.users ? powerLevels.users : {};
+};
+
+const toRoomMemberSummary = (
+  client: MatrixClient,
+  member: RoomMember,
+  userPowerLevels: Record<string, unknown>
+): RoomMemberSummary => ({
+  id: member.userId,
+  name: member.rawDisplayName || member.userId,
+  avatarUrl: getMemberAvatarUrl(client, member, 96),
+  membership: member.membership,
+  powerLevel:
+    typeof (userPowerLevels as Record<string, unknown>)[member.userId] === 'number'
+      ? ((userPowerLevels as Record<string, number>)[member.userId] as number)
+      : 0,
+});
+
 export function getRoomMembers(client: MatrixClient, roomId: string): RoomMemberSummary[] {
   const room = client.getRoom(roomId);
   if (!room) return [];
 
-  const powerLevels =
-    room.currentState?.getStateEvents('m.room.power_levels', '')?.getContent() ?? {};
-  const userPowerLevels =
-    typeof powerLevels.users === 'object' && powerLevels.users ? powerLevels.users : {};
+  const userPowerLevels = getUserPowerLevels(room);
 
   return room
     .getJoinedMembers()
-    .map((member) => ({
-      id: member.userId,
-      name: member.rawDisplayName || member.userId,
-      avatarUrl: getMemberAvatarUrl(client, member, 96),
-      membership: member.membership,
-      powerLevel:
-        typeof (userPowerLevels as Record<string, unknown>)[member.userId] === 'number'
-          ? ((userPowerLevels as Record<string, number>)[member.userId] as number)
-          : 0,
-    }))
-    .sort((a, b) => b.powerLevel - a.powerLevel || a.name.localeCompare(b.name, 'zh-Hans-CN'));
+    .map((member) => toRoomMemberSummary(client, member, userPowerLevels))
+    .sort(
+      (a, b) => (b.powerLevel ?? 0) - (a.powerLevel ?? 0) || a.name.localeCompare(b.name, 'zh-Hans-CN')
+    );
+}
+
+export async function loadRoomMembers(client: MatrixClient, roomId: string): Promise<RoomMemberSummary[]> {
+  const room = client.getRoom(roomId);
+  if (!room) return [];
+
+  try {
+    await room.loadMembersIfNeeded();
+  } catch {
+    return getRoomMembers(client, roomId);
+  }
+
+  const userPowerLevels = getUserPowerLevels(room);
+  return room
+    .getJoinedMembers()
+    .map((member) => toRoomMemberSummary(client, member, userPowerLevels))
+    .sort(
+      (a, b) => (b.powerLevel ?? 0) - (a.powerLevel ?? 0) || a.name.localeCompare(b.name, 'zh-Hans-CN')
+    );
 }
 
 const normalizeEmojiUsage = (
@@ -2007,6 +2088,175 @@ const filterSyncedPersonalPackImages = (
   };
 };
 
+const normalizeEditableEmojiUsageInput = (usage: CustomEmojiUsage[] | undefined): CustomEmojiUsage[] => {
+  const normalized = Array.isArray(usage)
+    ? usage.filter((item): item is CustomEmojiUsage => item === 'emoticon' || item === 'sticker')
+    : [];
+
+  return normalized.length > 0 ? Array.from(new Set(normalized)) : ['emoticon', 'sticker'];
+};
+
+const getPackRecord = (content: Record<string, unknown> | undefined): Record<string, unknown> =>
+  content?.pack && typeof content.pack === 'object'
+    ? { ...(content.pack as Record<string, unknown>) }
+    : {};
+
+const getPackImagesRecord = (
+  content: Record<string, unknown> | undefined
+): Record<string, Record<string, unknown> | undefined> =>
+  content?.images && typeof content.images === 'object'
+    ? { ...(content.images as Record<string, Record<string, unknown> | undefined>) }
+    : {};
+
+const getPackDisplayName = (
+  content: Record<string, unknown> | undefined,
+  fallbackPackName: string
+): string => {
+  const pack = getPackRecord(content);
+  return typeof pack.display_name === 'string' && pack.display_name.trim()
+    ? pack.display_name.trim()
+    : fallbackPackName;
+};
+
+const getEditableUserPackContent = (client: MatrixClient): Record<string, unknown> =>
+  filterSyncedPersonalPackImages(getAccountDataContent(client, 'im.ponies.user_emotes')) ?? {};
+
+const getUserPackSyncedImages = (
+  client: MatrixClient
+): Record<string, Record<string, unknown> | undefined> => {
+  const rawContent = getAccountDataContent(client, 'im.ponies.user_emotes');
+  const rawImages = getPackImagesRecord(rawContent);
+
+  return Object.fromEntries(
+    Object.entries(rawImages).filter(
+      ([, image]) => Boolean(image && typeof image[CINNY_SYNC_SOURCE_PACK_ID] === 'string')
+    )
+  );
+};
+
+const buildMergedUserPackContent = (
+  client: MatrixClient,
+  editableContent: Record<string, unknown>
+): Record<string, unknown> => {
+  const rawContent = getAccountDataContent(client, 'im.ponies.user_emotes') ?? {};
+  const syncedImages = getUserPackSyncedImages(client);
+  const editableImages = getPackImagesRecord(editableContent);
+  const mergedImages = {
+    ...syncedImages,
+    ...editableImages,
+  };
+  const nextContent: Record<string, unknown> = {
+    ...rawContent,
+    ...editableContent,
+  };
+
+  if (Object.keys(mergedImages).length > 0) {
+    nextContent.images = mergedImages;
+  } else {
+    delete nextContent.images;
+  }
+
+  return nextContent;
+};
+
+const getCinnyUserEmojiPackRoot = (client: MatrixClient): Record<string, unknown> =>
+  getAccountDataContent(client, 'in.cinny.user_emoji_packs') ?? {};
+
+const getCinnyUserEmojiPackMap = (
+  client: MatrixClient
+): Record<string, Record<string, unknown> | undefined> => {
+  const root = getCinnyUserEmojiPackRoot(client);
+  return root.packs && typeof root.packs === 'object'
+    ? { ...(root.packs as Record<string, Record<string, unknown> | undefined>) }
+    : {};
+};
+
+const getCinnyUserEmojiPackOrder = (client: MatrixClient): string[] => {
+  const root = getCinnyUserEmojiPackRoot(client);
+  return Array.isArray(root.order)
+    ? (root.order as unknown[]).filter((packId): packId is string => typeof packId === 'string' && packId.length > 0)
+    : [];
+};
+
+const saveEditableUserPackContent = async (
+  client: MatrixClient,
+  editableContent: Record<string, unknown>
+): Promise<void> => {
+  await setAccountDataContent(client, 'im.ponies.user_emotes', buildMergedUserPackContent(client, editableContent));
+};
+
+const saveCinnyUserEmojiPackRoot = async (
+  client: MatrixClient,
+  packs: Record<string, Record<string, unknown> | undefined>,
+  order: string[]
+): Promise<void> => {
+  const currentRoot = getCinnyUserEmojiPackRoot(client);
+  await setAccountDataContent(client, 'in.cinny.user_emoji_packs', {
+    ...currentRoot,
+    packs,
+    order,
+  });
+};
+
+const buildCustomEmojiPack = (
+  client: MatrixClient,
+  packId: string,
+  content: Record<string, unknown> | undefined,
+  fallbackPackName: string,
+  options: {
+    isDefault: boolean;
+    editable: boolean;
+    deletable: boolean;
+    orderable: boolean;
+  }
+): CustomEmojiPack => {
+  const items = collectCustomEmojiPackItems(client, packId, content, fallbackPackName);
+
+  return {
+    id: packId,
+    name: getPackDisplayName(content, fallbackPackName),
+    usage: normalizeEmojiUsage(undefined, getPackRecord(content).usage),
+    items,
+    cover: items.find((item) => item.authUrl || item.url || item.authDownloadUrl || item.downloadUrl) ?? items[0],
+    isDefault: options.isDefault,
+    editable: options.editable,
+    deletable: options.deletable,
+    orderable: options.orderable,
+  };
+};
+
+const stripFileExtension = (name: string): string => name.replace(/\.[^.]+$/, '');
+
+const makeEmojiShortcodeBase = (value: string): string => {
+  const normalized = stripFileExtension(value)
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^\p{L}\p{N}_-]+/gu, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[-_]+|[-_]+$/g, '');
+
+  return normalized || `emoji-${Date.now().toString(36)}`;
+};
+
+const ensureUniqueEmojiShortcode = (
+  images: Record<string, Record<string, unknown> | undefined>,
+  preferred: string
+): string => {
+  const base = preferred || `emoji-${Date.now().toString(36)}`;
+  let candidate = base;
+  let suffix = 2;
+
+  while (images[candidate]) {
+    candidate = `${base}-${suffix}`;
+    suffix += 1;
+  }
+
+  return candidate;
+};
+
+const createPersonalEmojiPackId = (): string =>
+  `personal-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
 const collectCustomEmojiPackItems = (
   client: MatrixClient,
   packId: string,
@@ -2051,11 +2301,428 @@ const collectCustomEmojiPackItems = (
         mxcUrl,
         url: mxcToHttp(client, mxcUrl, 256, 256),
         authUrl: mxcToHttp(client, mxcUrl, 256, 256, true),
+        downloadUrl: mxcToHttp(client, mxcUrl),
+        authDownloadUrl: mxcToHttp(client, mxcUrl, undefined, undefined, true),
         info,
       },
     ];
   });
 };
+
+export function getPersonalCustomEmojiPacks(client: MatrixClient): CustomEmojiPack[] {
+  const packs: CustomEmojiPack[] = [];
+  const defaultContent = getEditableUserPackContent(client);
+
+  packs.push(
+    buildCustomEmojiPack(client, 'user', defaultContent, '默认', {
+      isDefault: true,
+      editable: true,
+      deletable: false,
+      orderable: false,
+    })
+  );
+
+  const customPacks = getCinnyUserEmojiPackMap(client);
+  const orderedPackIds = getCinnyUserEmojiPackOrder(client);
+  const packIds = [
+    ...orderedPackIds,
+    ...Object.keys(customPacks).filter((packId) => !orderedPackIds.includes(packId)),
+  ];
+
+  packIds.forEach((packId) => {
+    packs.push(
+      buildCustomEmojiPack(client, packId, customPacks[packId], packId, {
+        isDefault: false,
+        editable: true,
+        deletable: true,
+        orderable: true,
+      })
+    );
+  });
+
+  return packs;
+}
+
+export async function createCustomEmojiPack(
+  client: MatrixClient,
+  name: string,
+  usage: CustomEmojiUsage[] = ['emoticon', 'sticker']
+): Promise<string> {
+  const trimmedName = name.trim();
+  if (!trimmedName) throw new Error('分类名称不能为空。');
+
+  const packs = getCinnyUserEmojiPackMap(client);
+  const order = getCinnyUserEmojiPackOrder(client);
+  const packId = createPersonalEmojiPackId();
+
+  packs[packId] = {
+    pack: {
+      display_name: trimmedName,
+      usage: normalizeEditableEmojiUsageInput(usage),
+    },
+    images: {},
+  };
+  order.push(packId);
+
+  await saveCinnyUserEmojiPackRoot(client, packs, order);
+  return packId;
+}
+
+export async function updateCustomEmojiPack(
+  client: MatrixClient,
+  packId: string,
+  updates: {
+    name?: string;
+    usage?: CustomEmojiUsage[];
+  }
+): Promise<void> {
+  if (packId === 'user') {
+    const editableContent = getEditableUserPackContent(client);
+    const nextPack: Record<string, unknown> = {
+      ...getPackRecord(editableContent),
+      usage: normalizeEditableEmojiUsageInput(updates.usage),
+    };
+
+    if (typeof updates.name === 'string' && updates.name.trim()) {
+      nextPack.display_name = updates.name.trim();
+    }
+
+    await saveEditableUserPackContent(client, {
+      ...editableContent,
+      pack: nextPack,
+    });
+    return;
+  }
+
+  const packs = getCinnyUserEmojiPackMap(client);
+  const currentPack = packs[packId];
+  if (!currentPack) throw new Error('没有找到这个分类。');
+
+  const nextPackRecord: Record<string, unknown> = {
+    ...getPackRecord(currentPack),
+    usage: normalizeEditableEmojiUsageInput(updates.usage),
+  };
+
+  if (typeof updates.name === 'string') {
+    const trimmedName = updates.name.trim();
+    if (!trimmedName) throw new Error('分类名称不能为空。');
+    nextPackRecord.display_name = trimmedName;
+  }
+
+  packs[packId] = {
+    ...currentPack,
+    pack: nextPackRecord,
+  };
+
+  await saveCinnyUserEmojiPackRoot(client, packs, getCinnyUserEmojiPackOrder(client));
+}
+
+export async function updateCustomEmojiPackItem(
+  client: MatrixClient,
+  packId: string,
+  sourceShortcode: string,
+  updates: {
+    shortcode?: string;
+    body?: string;
+  }
+): Promise<string> {
+  const currentShortcode = sourceShortcode.trim();
+  if (!currentShortcode) throw new Error('短码不能为空。');
+
+  const nextShortcode =
+    typeof updates.shortcode === 'string' ? updates.shortcode.trim() : currentShortcode;
+  if (!nextShortcode) throw new Error('短码不能为空。');
+
+  const resolveNextBody = (currentImage: Record<string, unknown>): string => {
+    if (typeof updates.body === 'string') {
+      return updates.body.trim() || nextShortcode;
+    }
+
+    return typeof currentImage.body === 'string' && currentImage.body.trim()
+      ? currentImage.body.trim()
+      : nextShortcode;
+  };
+
+  if (packId === 'user') {
+    const editableContent = getEditableUserPackContent(client);
+    const nextImages = getPackImagesRecord(editableContent);
+    const currentImage = nextImages[currentShortcode];
+    if (!currentImage) throw new Error('没有找到这个表情。');
+    if (nextShortcode !== currentShortcode && nextImages[nextShortcode]) {
+      throw new Error('短码已存在，请换一个新的短码。');
+    }
+
+    const nextImage: Record<string, unknown> = {
+      ...currentImage,
+      body: resolveNextBody(currentImage),
+    };
+
+    if (nextShortcode !== currentShortcode) {
+      delete nextImages[currentShortcode];
+    }
+    nextImages[nextShortcode] = nextImage;
+
+    await saveEditableUserPackContent(client, {
+      ...editableContent,
+      images: nextImages,
+    });
+    return nextShortcode;
+  }
+
+  const packs = getCinnyUserEmojiPackMap(client);
+  const currentPack = packs[packId];
+  if (!currentPack) throw new Error('没有找到这个分类。');
+
+  const nextImages = getPackImagesRecord(currentPack);
+  const currentImage = nextImages[currentShortcode];
+  if (!currentImage) throw new Error('没有找到这个表情。');
+  if (nextShortcode !== currentShortcode && nextImages[nextShortcode]) {
+    throw new Error('短码已存在，请换一个新的短码。');
+  }
+
+  const nextImage: Record<string, unknown> = {
+    ...currentImage,
+    body: resolveNextBody(currentImage),
+  };
+
+  if (nextShortcode !== currentShortcode) {
+    delete nextImages[currentShortcode];
+  }
+  nextImages[nextShortcode] = nextImage;
+
+  packs[packId] = {
+    ...currentPack,
+    images: nextImages,
+  };
+
+  await saveCinnyUserEmojiPackRoot(client, packs, getCinnyUserEmojiPackOrder(client));
+  return nextShortcode;
+}
+
+export async function deleteCustomEmojiPack(client: MatrixClient, packId: string): Promise<void> {
+  if (packId === 'user') throw new Error('默认分类不能删除。');
+
+  const packs = getCinnyUserEmojiPackMap(client);
+  if (!packs[packId]) throw new Error('没有找到这个分类。');
+
+  delete packs[packId];
+  const nextOrder = getCinnyUserEmojiPackOrder(client).filter((id) => id !== packId);
+  await saveCinnyUserEmojiPackRoot(client, packs, nextOrder);
+}
+
+export async function reorderCustomEmojiPack(
+  client: MatrixClient,
+  packId: string,
+  direction: 'up' | 'down'
+): Promise<void> {
+  if (packId === 'user') return;
+
+  const packs = getCinnyUserEmojiPackMap(client);
+  const order = getCinnyUserEmojiPackOrder(client);
+  const normalizedOrder = [
+    ...order,
+    ...Object.keys(packs).filter((id) => !order.includes(id)),
+  ];
+  const index = normalizedOrder.indexOf(packId);
+
+  if (index === -1) return;
+
+  const targetIndex = direction === 'up' ? index - 1 : index + 1;
+  if (targetIndex < 0 || targetIndex >= normalizedOrder.length) return;
+
+  [normalizedOrder[index], normalizedOrder[targetIndex]] = [
+    normalizedOrder[targetIndex],
+    normalizedOrder[index],
+  ];
+
+  await saveCinnyUserEmojiPackRoot(client, packs, normalizedOrder);
+}
+
+export async function uploadCustomEmojiPackFiles(
+  client: MatrixClient,
+  packId: string,
+  files: File[]
+): Promise<number> {
+  const imageFiles = files.filter((file) => !file.type || file.type.startsWith('image/'));
+  if (imageFiles.length === 0) throw new Error('请选择图片文件。');
+
+  if (packId === 'user') {
+    const editableContent = getEditableUserPackContent(client);
+    const nextImages = getPackImagesRecord(editableContent);
+
+    for (const file of imageFiles) {
+      const upload = await client.uploadContent(file, {
+        name: file.name,
+        type: file.type || 'application/octet-stream',
+        includeFilename: true,
+      });
+      const shortcode = ensureUniqueEmojiShortcode(nextImages, makeEmojiShortcodeBase(file.name));
+
+      nextImages[shortcode] = {
+        url: upload.content_uri,
+        body: stripFileExtension(file.name) || shortcode,
+        info: getFileInfo(file),
+      };
+    }
+
+    await saveEditableUserPackContent(client, {
+      ...editableContent,
+      images: nextImages,
+    });
+    return imageFiles.length;
+  }
+
+  const packs = getCinnyUserEmojiPackMap(client);
+  const currentPack = packs[packId];
+  if (!currentPack) throw new Error('没有找到这个分类。');
+
+  const nextImages = getPackImagesRecord(currentPack);
+
+  for (const file of imageFiles) {
+    const upload = await client.uploadContent(file, {
+      name: file.name,
+      type: file.type || 'application/octet-stream',
+      includeFilename: true,
+    });
+    const shortcode = ensureUniqueEmojiShortcode(nextImages, makeEmojiShortcodeBase(file.name));
+
+    nextImages[shortcode] = {
+      url: upload.content_uri,
+      body: stripFileExtension(file.name) || shortcode,
+      info: getFileInfo(file),
+    };
+  }
+
+  packs[packId] = {
+    ...currentPack,
+    images: nextImages,
+  };
+
+  await saveCinnyUserEmojiPackRoot(client, packs, getCinnyUserEmojiPackOrder(client));
+  return imageFiles.length;
+}
+
+export async function deleteCustomEmojiPackItems(
+  client: MatrixClient,
+  packId: string,
+  shortcodes: string[]
+): Promise<number> {
+  const uniqueShortcodes = Array.from(new Set(shortcodes.filter((value) => value.trim())));
+  if (uniqueShortcodes.length === 0) return 0;
+
+  if (packId === 'user') {
+    const editableContent = getEditableUserPackContent(client);
+    const nextImages = getPackImagesRecord(editableContent);
+    uniqueShortcodes.forEach((shortcode) => {
+      delete nextImages[shortcode];
+    });
+
+    await saveEditableUserPackContent(client, {
+      ...editableContent,
+      images: nextImages,
+    });
+    return uniqueShortcodes.length;
+  }
+
+  const packs = getCinnyUserEmojiPackMap(client);
+  const currentPack = packs[packId];
+  if (!currentPack) throw new Error('没有找到这个分类。');
+
+  const nextImages = getPackImagesRecord(currentPack);
+  uniqueShortcodes.forEach((shortcode) => {
+    delete nextImages[shortcode];
+  });
+
+  packs[packId] = {
+    ...currentPack,
+    images: nextImages,
+  };
+
+  await saveCinnyUserEmojiPackRoot(client, packs, getCinnyUserEmojiPackOrder(client));
+  return uniqueShortcodes.length;
+}
+
+export async function moveCustomEmojiPackItems(
+  client: MatrixClient,
+  sourcePackId: string,
+  targetPackId: string,
+  shortcodes: string[]
+): Promise<number> {
+  if (sourcePackId === targetPackId) return 0;
+
+  const uniqueShortcodes = Array.from(new Set(shortcodes.filter((value) => value.trim())));
+  if (uniqueShortcodes.length === 0) return 0;
+
+  const sourcePackContent =
+    sourcePackId === 'user'
+      ? getEditableUserPackContent(client)
+      : getCinnyUserEmojiPackMap(client)[sourcePackId];
+  const targetPackContent =
+    targetPackId === 'user'
+      ? getEditableUserPackContent(client)
+      : getCinnyUserEmojiPackMap(client)[targetPackId];
+
+  if (!sourcePackContent) throw new Error('没有找到来源分类。');
+  if (!targetPackContent) throw new Error('没有找到目标分类。');
+
+  const sourceImages = getPackImagesRecord(sourcePackContent);
+  const targetImages = getPackImagesRecord(targetPackContent);
+  let movedCount = 0;
+
+  uniqueShortcodes.forEach((shortcode) => {
+    const image = sourceImages[shortcode];
+    if (!image) return;
+
+    const targetShortcode = ensureUniqueEmojiShortcode(targetImages, shortcode);
+    const nextImage = { ...image };
+    delete nextImage.usage;
+    targetImages[targetShortcode] = nextImage;
+    delete sourceImages[shortcode];
+    movedCount += 1;
+  });
+
+  if (movedCount === 0) return 0;
+
+  if (sourcePackId === 'user') {
+    await saveEditableUserPackContent(client, {
+      ...getEditableUserPackContent(client),
+      images: sourceImages,
+    });
+  }
+
+  if (targetPackId === 'user') {
+    await saveEditableUserPackContent(client, {
+      ...getEditableUserPackContent(client),
+      images: targetImages,
+    });
+  }
+
+  if (sourcePackId !== 'user' || targetPackId !== 'user') {
+    const packs = getCinnyUserEmojiPackMap(client);
+
+    if (sourcePackId !== 'user') {
+      const sourcePack = packs[sourcePackId];
+      if (!sourcePack) throw new Error('没有找到来源分类。');
+      packs[sourcePackId] = {
+        ...sourcePack,
+        images: sourceImages,
+      };
+    }
+
+    if (targetPackId !== 'user') {
+      const targetPack = packs[targetPackId];
+      if (!targetPack) throw new Error('没有找到目标分类。');
+      packs[targetPackId] = {
+        ...targetPack,
+        images: targetImages,
+      };
+    }
+
+    await saveCinnyUserEmojiPackRoot(client, packs, getCinnyUserEmojiPackOrder(client));
+  }
+
+  return movedCount;
+}
 
 export function getCustomEmojiItems(client: MatrixClient, roomId?: string): CustomEmojiItem[] {
   const items: CustomEmojiItem[] = [];
@@ -2118,7 +2785,7 @@ export function getCustomEmojiItems(client: MatrixClient, roomId?: string): Cust
       seen.add(key);
       return true;
     })
-    .slice(0, 512);
+    .slice(0, MAX_CUSTOM_EMOJI_ITEMS);
 }
 
 export function getCustomEmojiDebugSummary(
@@ -2251,7 +2918,8 @@ export async function sendTextMessage(
   client: MatrixClient,
   roomId: string,
   body: string,
-  mentions: string[] = []
+  mentions: string[] = [],
+  formattedBody?: string
 ): Promise<void> {
   const trimmed = body.trim();
   if (!trimmed) return;
@@ -2259,6 +2927,12 @@ export async function sendTextMessage(
   await client.sendMessage(roomId, {
     msgtype: MsgType.Text,
     body: trimmed,
+    ...(formattedBody
+      ? {
+          format: 'org.matrix.custom.html',
+          formatted_body: formattedBody,
+        }
+      : {}),
     ...(mentions.length > 0
       ? {
           'm.mentions': {
@@ -2440,20 +3114,57 @@ export async function sendStickerMessage(
   );
 }
 
+const buildMatrixToEventHref = (roomId: string, eventId: string): string =>
+  `https://matrix.to/#/${encodeURIComponent(roomId)}/${encodeURIComponent(eventId)}`;
+
+const buildMatrixToUserHref = (userId: string): string =>
+  `https://matrix.to/#/${encodeURIComponent(userId)}`;
+
+const buildReplyFormattedBody = (
+  roomId: string,
+  replyTo: ChatReply,
+  formattedBody: string
+): string => {
+  const senderLabel = escapeHtml(replyTo.senderName ?? replyTo.senderId ?? 'user');
+  const senderHtml = replyTo.senderId
+    ? `<a href="${escapeHtml(buildMatrixToUserHref(replyTo.senderId))}">${senderLabel}</a>`
+    : senderLabel;
+  const quotedHtml = escapeHtml(replyTo.body).replace(/\n/g, '<br>');
+
+  return (
+    `<mx-reply><blockquote><a href="${escapeHtml(
+      buildMatrixToEventHref(roomId, replyTo.eventId)
+    )}">In reply to</a> ${senderHtml}<br>${quotedHtml}</blockquote></mx-reply>` + formattedBody
+  );
+};
+
 export async function sendReplyMessage(
   client: MatrixClient,
   roomId: string,
   replyTo: ChatReply,
-  body: string
+  body: string,
+  mentions: string[] = [],
+  formattedBody?: string
 ): Promise<void> {
   const trimmed = body.trim();
   if (!trimmed) return;
 
-  const quotedBody = replyTo.body.replace(/\n/g, '\n> ');
-
   await client.sendMessage(roomId, {
     msgtype: MsgType.Text,
-    body: `> <${replyTo.senderName ?? 'user'}> ${quotedBody}\n\n${trimmed}`,
+    body: trimmed,
+    format: 'org.matrix.custom.html',
+    formatted_body: buildReplyFormattedBody(
+      roomId,
+      replyTo,
+      (formattedBody?.trim() || escapeHtml(trimmed)).replace(/\n/g, '<br>')
+    ),
+    ...(mentions.length > 0
+      ? {
+          'm.mentions': {
+            user_ids: mentions,
+          },
+        }
+      : {}),
     'm.relates_to': {
       'm.in_reply_to': {
         event_id: replyTo.eventId,
@@ -2466,7 +3177,9 @@ export async function editTextMessage(
   client: MatrixClient,
   roomId: string,
   eventId: string,
-  body: string
+  body: string,
+  mentions: string[] = [],
+  formattedBody?: string
 ): Promise<void> {
   const trimmed = body.trim();
   if (!trimmed) return;
@@ -2474,9 +3187,35 @@ export async function editTextMessage(
   await client.sendMessage(roomId, {
     msgtype: MsgType.Text,
     body: `* ${trimmed}`,
+    ...(formattedBody
+      ? {
+          format: 'org.matrix.custom.html',
+          formatted_body: `* ${formattedBody}`,
+        }
+      : {}),
+    ...(mentions.length > 0
+      ? {
+          'm.mentions': {
+            user_ids: mentions,
+          },
+        }
+      : {}),
     'm.new_content': {
       msgtype: MsgType.Text,
       body: trimmed,
+      ...(formattedBody
+        ? {
+            format: 'org.matrix.custom.html',
+            formatted_body: formattedBody,
+          }
+        : {}),
+      ...(mentions.length > 0
+        ? {
+            'm.mentions': {
+              user_ids: mentions,
+            },
+          }
+        : {}),
     },
     'm.relates_to': {
       rel_type: 'm.replace',

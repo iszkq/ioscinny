@@ -66,6 +66,7 @@ import {
   Fragment,
   FormEvent,
   KeyboardEvent,
+  MutableRefObject,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
   ReactNode,
@@ -81,15 +82,22 @@ import {
 import {
   acceptInvite,
   banMember,
+  ChatAttachment,
   ChatReply,
   ChatMessage,
   CustomEmojiItem,
+  CustomEmojiPack,
+  CustomEmojiUsage,
   CryptoStatus,
+  createCustomEmojiPack,
   createDirectRoom,
   createGroupRoom,
   createMatrixRuntime,
+  deleteCustomEmojiPack,
+  deleteCustomEmojiPackItems,
   editTextMessage,
   ExploreSource,
+  fetchRoomMessageById,
   forwardMessagesToRooms,
   getCustomEmojiDebugSummary,
   getCustomEmojiItems,
@@ -98,9 +106,11 @@ import {
   getExploreSources,
   getMatrixSnapshot,
   getOwnProfile,
+  getPersonalCustomEmojiPacks,
   getPinnedMessages,
   getRoomMediaItems,
   getRoomMembers,
+  loadRoomMembers,
   getRoomMessages,
   getRoomTypingMembers,
   inviteUser,
@@ -116,6 +126,7 @@ import {
   PublicRoomSummary,
   redactMessage,
   rejectInvite,
+  reorderCustomEmojiPack,
   RoomMediaItem,
   RoomMemberSummary,
   RoomSummary,
@@ -131,11 +142,15 @@ import {
   setRoomMuted,
   restoreKeyBackupFromSecretStorage,
   restoreKeyBackupWithPassphrase,
+  moveCustomEmojiPackItems,
+  updateCustomEmojiPack,
+  updateCustomEmojiPackItem,
   updateOwnAvatar,
   updateOwnDisplayName,
   updateRoomAvatar,
   updateRoomProfile,
   updateTypingStatus,
+  uploadCustomEmojiPackFiles,
   uploadFileMessage,
 } from './services/matrix';
 import {
@@ -144,6 +159,7 @@ import {
   saveStoredSession,
   StoredMatrixSession,
 } from './services/sessionStore';
+import { getCachedMediaUrl, peekCachedMediaUrl, storeCachedMediaBlob } from './services/mediaCache';
 
 type BootState = 'booting' | 'signedOut' | 'connecting' | 'signedIn' | 'error';
 type PrimaryView = 'home' | 'direct' | 'rooms' | 'spaces' | 'invites' | 'favorites' | 'explore' | 'settings';
@@ -155,7 +171,9 @@ type Sheet =
   | 'roomInfo'
   | 'moreNav'
   | 'security'
+  | 'emojiManager'
   | { type: 'messageInfo'; message: ChatMessage }
+  | { type: 'readReceipts'; message: ChatMessage }
   | { type: 'forward'; messages: ChatMessage[] }
   | { type: 'userProfile'; member: RoomMemberSummary }
   | undefined;
@@ -257,6 +275,57 @@ const systemEmojiGroups = [
     items: ['✨', '✅', '🌙', '☀️', '🎵', '🐾', '🎉', '🎁', '📷', '📍', '🧩', '☕'],
   },
 ];
+const customEmojiUsageOrder: CustomEmojiUsage[] = ['emoticon', 'sticker'];
+const customEmojiUsageLabels: Record<CustomEmojiUsage, string> = {
+  emoticon: '表情',
+  sticker: '贴纸',
+};
+
+const normalizeCustomEmojiUsage = (usage: CustomEmojiUsage[]): CustomEmojiUsage[] => {
+  const unique = new Set(usage);
+  const normalized = customEmojiUsageOrder.filter((item) => unique.has(item));
+  return normalized.length > 0 ? normalized : ['emoticon', 'sticker'];
+};
+
+const toggleCustomEmojiUsageValue = (
+  usage: CustomEmojiUsage[],
+  nextValue: CustomEmojiUsage
+): CustomEmojiUsage[] => {
+  const normalized = normalizeCustomEmojiUsage(usage);
+  if (normalized.includes(nextValue)) {
+    const next = normalized.filter((item) => item !== nextValue);
+    return next.length > 0 ? next : normalized;
+  }
+  return normalizeCustomEmojiUsage(normalized.concat(nextValue));
+};
+
+const formatCustomEmojiUsage = (usage: CustomEmojiUsage[]): string =>
+  normalizeCustomEmojiUsage(usage)
+    .map((item) => customEmojiUsageLabels[item])
+    .join(' / ');
+
+const reorderOrderableEmojiPacks = (
+  packs: CustomEmojiPack[],
+  packId: string,
+  direction: 'up' | 'down'
+): CustomEmojiPack[] => {
+  const orderablePacks = packs.filter((pack) => pack.orderable);
+  const currentIndex = orderablePacks.findIndex((pack) => pack.id === packId);
+  if (currentIndex === -1) return packs;
+
+  const targetIndex = direction === 'up' ? currentIndex - 1 : currentIndex + 1;
+  if (targetIndex < 0 || targetIndex >= orderablePacks.length) return packs;
+
+  const nextOrderablePacks = orderablePacks.slice();
+  [nextOrderablePacks[currentIndex], nextOrderablePacks[targetIndex]] = [
+    nextOrderablePacks[targetIndex],
+    nextOrderablePacks[currentIndex],
+  ];
+
+  let nextOrderableIndex = 0;
+  return packs.map((pack) => (pack.orderable ? nextOrderablePacks[nextOrderableIndex++] : pack));
+};
+
 const bottomPrimaryViews: PrimaryView[] = ['home', 'direct', 'rooms', 'settings'];
 const moreNavViews: PrimaryView[] = ['invites', 'favorites', 'explore'];
 const roomFilterLabels: Record<RoomFilter, string> = {
@@ -272,6 +341,53 @@ const clampReadReceiptAvatarCount = (value: number | undefined): number => {
     MIN_READ_RECEIPT_AVATAR_COUNT,
     Math.min(MAX_READ_RECEIPT_AVATAR_COUNT, Math.trunc(value ?? 7))
   );
+};
+
+const getOwnMessageReadReceiptSummary = (
+  message: ChatMessage,
+  members: RoomMemberSummary[]
+): {
+  totalCount: number;
+  readCount: number;
+  unreadCount: number;
+  unreadMembers: RoomMemberSummary[];
+} | undefined => {
+  if (!message.mine || !message.sender) return undefined;
+
+  const audience = members.filter((member) => member.id !== message.sender);
+  if (audience.length === 0) return undefined;
+
+  const readUserIds = new Set(message.readReceipts.map((receipt) => receipt.userId));
+  const unreadMembers = audience.filter((member) => !readUserIds.has(member.id));
+
+  return {
+    totalCount: audience.length,
+    readCount: audience.length - unreadMembers.length,
+    unreadCount: unreadMembers.length,
+    unreadMembers,
+  };
+};
+
+const formatOwnMessageReadReceiptSummary = (
+  summary: { totalCount: number; readCount: number; unreadCount: number }
+): string =>
+  summary.totalCount === 1
+    ? summary.readCount > 0
+      ? '对方已读'
+      : '对方未读'
+    : summary.readCount > 0
+      ? `${summary.readCount} 人已读`
+      : '暂未读';
+
+const getReadReceiptStatusText = (
+  message: ChatMessage,
+  ownReadReceiptSummary?: { totalCount: number; readCount: number; unreadCount: number }
+): string => {
+  if (ownReadReceiptSummary?.totalCount === 1) {
+    return formatOwnMessageReadReceiptSummary(ownReadReceiptSummary);
+  }
+
+  return message.readReceipts.length > 0 ? '已有已读回执' : '暂无已读回执';
 };
 
 const emptySnapshot: MatrixSnapshot = {
@@ -380,6 +496,357 @@ const getReadableMessageBody = (body: string): string => {
   return body;
 };
 
+const richTextAllowedRawTagPattern = /<\/?(?:u|b|strong|i|em|s|strike|del|code|br)\s*\/?>/gi;
+const richTextAllowedTags = new Set([
+  'a',
+  'blockquote',
+  'br',
+  'code',
+  'del',
+  'em',
+  'i',
+  'li',
+  'ol',
+  'p',
+  'pre',
+  's',
+  'strike',
+  'strong',
+  'u',
+  'ul',
+]);
+const richTextAllowedProtocols = new Set(['http:', 'https:', 'mailto:', 'matrix:']);
+const autoLinkTextPattern = /(?:https?:\/\/|mailto:|www\.)[^\s<]+/gi;
+const mentionBoundaryPattern = /[\s()[\]{}<>"'`,.!?;:]/;
+
+const escapeHtml = (value: string): string =>
+  value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+const createPlaceholderStore = (prefix: string) => {
+  const values: string[] = [];
+  return {
+    push(value: string): string {
+      const token = `[[${prefix}_${values.length}]]`;
+      values.push(value);
+      return token;
+    },
+    restore(input: string): string {
+      return input.replace(new RegExp(`\\[\\[${prefix}_(\\d+)\\]\\]`, 'g'), (_, index: string) => values[Number(index)] ?? '');
+    },
+  };
+};
+
+const getFormattedBodyFromContent = (content?: Record<string, unknown>): string | undefined => {
+  if (!content) return undefined;
+
+  const editedContent = content['m.new_content'];
+  if (editedContent && typeof editedContent === 'object') {
+    const editedFormattedBody = getFormattedBodyFromContent(editedContent as Record<string, unknown>);
+    if (editedFormattedBody) return editedFormattedBody;
+  }
+
+  const formattedBody = content.formatted_body;
+  return content.format === 'org.matrix.custom.html' && typeof formattedBody === 'string' && formattedBody.trim()
+    ? formattedBody
+    : undefined;
+};
+
+const buildMatrixUserHref = (userId: string): string => `https://matrix.to/#/${encodeURIComponent(userId)}`;
+
+const getMemberMentionLabel = (member: Pick<RoomMemberSummary, 'id' | 'name'>): string => {
+  const displayName = member.name.trim();
+  if (!displayName) return member.id;
+  return displayName.startsWith('@') ? displayName : `@${displayName}`;
+};
+
+const isMentionBoundary = (char?: string): boolean => !char || mentionBoundaryPattern.test(char);
+
+const extractMatrixUserIdFromHref = (href?: string): string | undefined => {
+  if (!href) return undefined;
+
+  try {
+    const url = new URL(href, window.location.origin);
+    if (url.protocol === 'matrix:') {
+      const target = decodeURIComponent(`${url.pathname}${url.search}`.replace(/^\/+/, ''));
+      const directMatch = target.match(/(^|\/)(@[^/?#]+:[^/?#]+)/);
+      if (directMatch) return directMatch[2];
+      const userMatch = target.match(/^u\/([^/?#]+)/);
+      if (userMatch) {
+        const decodedUser = decodeURIComponent(userMatch[1]);
+        return decodedUser.startsWith('@') ? decodedUser : `@${decodedUser}`;
+      }
+      return undefined;
+    }
+
+    if (url.hostname === 'matrix.to') {
+      const decodedHash = decodeURIComponent(url.hash.replace(/^#\/?/, ''));
+      const userMatch = decodedHash.match(/^(@[^/?#]+:[^/?#]+)/);
+      if (userMatch) return userMatch[1];
+    }
+  } catch {
+    return undefined;
+  }
+
+  return undefined;
+};
+
+const findMentionMatches = (
+  value: string,
+  members: RoomMemberSummary[]
+): Array<{ start: number; end: number; member: RoomMemberSummary }> => {
+  const candidates: Array<{ start: number; end: number; member: RoomMemberSummary }> = [];
+
+  members.forEach((member) => {
+    if (!member.id) return;
+
+    let searchFrom = 0;
+    while (searchFrom < value.length) {
+      const start = value.indexOf(member.id, searchFrom);
+      if (start < 0) break;
+
+      const end = start + member.id.length;
+      if (isMentionBoundary(value[start - 1]) && isMentionBoundary(value[end])) {
+        candidates.push({ start, end, member });
+      }
+
+      searchFrom = end;
+    }
+  });
+
+  candidates.sort((left, right) => left.start - right.start || right.end - left.end);
+
+  const matches: Array<{ start: number; end: number; member: RoomMemberSummary }> = [];
+  let lastEnd = -1;
+
+  candidates.forEach((candidate) => {
+    if (candidate.start < lastEnd) return;
+    matches.push(candidate);
+    lastEnd = candidate.end;
+  });
+
+  return matches;
+};
+
+const renderMentionAnchor = (member: Pick<RoomMemberSummary, 'id' | 'name'>): string =>
+  `<a href="${escapeHtml(buildMatrixUserHref(member.id))}" class="message-mention" data-mention-user-id="${escapeHtml(
+    member.id
+  )}">${escapeHtml(getMemberMentionLabel(member))}</a>`;
+
+const getSafeRichTextHref = (href: string): string | undefined => {
+  const trimmedHref = href.trim();
+  if (!trimmedHref || trimmedHref.startsWith('#')) return undefined;
+
+  try {
+    const url = new URL(trimmedHref, window.location.origin);
+    return richTextAllowedProtocols.has(url.protocol) ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+const splitTrailingLinkPunctuation = (value: string): { link: string; trailing: string } => {
+  let link = value;
+  let trailing = '';
+
+  const countChar = (source: string, char: string): number =>
+    Array.from(source).filter((item) => item === char).length;
+
+  while (link.length > 0) {
+    const lastChar = link.at(-1);
+    if (!lastChar) break;
+
+    if (/[.,!?;:]/.test(lastChar)) {
+      trailing = `${lastChar}${trailing}`;
+      link = link.slice(0, -1);
+      continue;
+    }
+
+    if (lastChar === ')' && countChar(link, ')') > countChar(link, '(')) {
+      trailing = `${lastChar}${trailing}`;
+      link = link.slice(0, -1);
+      continue;
+    }
+
+    if (lastChar === ']' && countChar(link, ']') > countChar(link, '[')) {
+      trailing = `${lastChar}${trailing}`;
+      link = link.slice(0, -1);
+      continue;
+    }
+
+    if (lastChar === '}' && countChar(link, '}') > countChar(link, '{')) {
+      trailing = `${lastChar}${trailing}`;
+      link = link.slice(0, -1);
+      continue;
+    }
+
+    break;
+  }
+
+  return { link, trailing };
+};
+
+const linkifyRichTextText = (value: string, members: RoomMemberSummary[] = []): string => {
+  if (!value) return '';
+
+  const decorations: Array<
+    | {
+        kind: 'link';
+        start: number;
+        end: number;
+        html: string;
+      }
+    | {
+        kind: 'mention';
+        start: number;
+        end: number;
+        html: string;
+      }
+  > = [];
+
+  findMentionMatches(value, members).forEach((match) => {
+    decorations.push({
+      kind: 'mention',
+      start: match.start,
+      end: match.end,
+      html: renderMentionAnchor(match.member),
+    });
+  });
+
+  for (const match of value.matchAll(autoLinkTextPattern)) {
+    const rawMatch = match[0];
+    const start = match.index ?? 0;
+    const { link, trailing } = splitTrailingLinkPunctuation(rawMatch);
+    const safeHref = getSafeRichTextHref(link.startsWith('www.') ? `https://${link}` : link);
+
+    if (!safeHref) continue;
+
+    decorations.push({
+      kind: 'link',
+      start,
+      end: start + rawMatch.length,
+      html: `<a href="${escapeHtml(safeHref)}" target="_blank" rel="noreferrer noopener">${escapeHtml(
+        link
+      )}</a>${escapeHtml(trailing)}`,
+    });
+  }
+
+  decorations.sort((left, right) => {
+    if (left.start !== right.start) return left.start - right.start;
+    if (left.kind !== right.kind) return left.kind === 'link' ? -1 : 1;
+    return right.end - left.end;
+  });
+
+  let html = '';
+  let cursor = 0;
+  let hasDecoration = false;
+
+  decorations.forEach((decoration) => {
+    if (decoration.start < cursor) return;
+    html += escapeHtml(value.slice(cursor, decoration.start));
+    html += decoration.html;
+    cursor = decoration.end;
+    hasDecoration = true;
+  });
+
+  if (!hasDecoration) {
+    return escapeHtml(value);
+  }
+
+  html += escapeHtml(value.slice(cursor));
+  return html;
+};
+
+const sanitizeRichTextHtml = (html: string, members: RoomMemberSummary[] = []): string => {
+  const parser = new DOMParser();
+  const document = parser.parseFromString(`<body>${html}</body>`, 'text/html');
+  const membersById = new Map(members.map((member) => [member.id, member]));
+
+  const sanitizeNode = (node: Node, allowAutoLink = true): string => {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const text = node.textContent ?? '';
+      return allowAutoLink ? linkifyRichTextText(text, members) : escapeHtml(text);
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE) return '';
+
+    const element = node as HTMLElement;
+    const tag = element.tagName.toLowerCase();
+
+    if (tag === 'mx-reply') return '';
+
+    const childAllowsAutoLink = tag !== 'a' && tag !== 'code' && tag !== 'pre';
+
+    const children = Array.from(element.childNodes)
+      .map((child) => sanitizeNode(child, childAllowsAutoLink))
+      .join('');
+
+    if (!richTextAllowedTags.has(tag)) return children;
+    if (tag === 'br') return '<br>';
+    if (tag === 'a') {
+      const href = element.getAttribute('href');
+      const safeHref = href ? getSafeRichTextHref(href) : undefined;
+      if (!safeHref) return children;
+
+      const mentionedUserId = extractMatrixUserIdFromHref(safeHref);
+      if (mentionedUserId) {
+        const member = membersById.get(mentionedUserId) ?? {
+          id: mentionedUserId,
+          name: children.replace(/<[^>]+>/g, '').trim() || mentionedUserId,
+        };
+        return renderMentionAnchor(member);
+      }
+
+      return `<a href="${escapeHtml(safeHref)}" target="_blank" rel="noreferrer noopener">${children || escapeHtml(
+        safeHref
+      )}</a>`;
+    }
+
+    return `<${tag}>${children}</${tag}>`;
+  };
+
+  return Array.from(document.body.childNodes)
+    .map((node) => sanitizeNode(node))
+    .join('');
+};
+
+const markdownishToHtml = (body: string, members: RoomMemberSummary[] = []): string => {
+  const normalizedBody = getReadableMessageBody(body).replace(/\r\n?/g, '\n');
+  const codePlaceholders = createPlaceholderStore('RT_CODE');
+  const rawTagPlaceholders = createPlaceholderStore('RT_TAG');
+
+  const bodyWithCodePlaceholders = normalizedBody.replace(/`([^`\n]+)`/g, (_, content: string) =>
+    codePlaceholders.push(`<code>${escapeHtml(content)}</code>`)
+  );
+  const bodyWithRawTagPlaceholders = bodyWithCodePlaceholders.replace(richTextAllowedRawTagPattern, (match) =>
+    rawTagPlaceholders.push(match)
+  );
+
+  let html = escapeHtml(bodyWithRawTagPlaceholders);
+  html = html.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_match, label: string, href: string) =>
+    `<a href="${escapeHtml(href)}">${label}</a>`
+  );
+  html = html.replace(/\*\*([^\s*](?:.*?[^\s*])?)\*\*/g, '<strong>$1</strong>');
+  html = html.replace(/~~([^\s~](?:.*?[^\s~])?)~~/g, '<del>$1</del>');
+  html = html.replace(/(^|[^*])\*([^\s*](?:.*?[^\s*])?)\*(?!\*)/g, '$1<em>$2</em>');
+  html = rawTagPlaceholders.restore(html);
+  html = codePlaceholders.restore(html);
+  html = html.replace(/\n/g, '<br>');
+
+  return sanitizeRichTextHtml(html, members);
+};
+
+const getMessageBodyHtml = (
+  message: Pick<ChatMessage, 'body' | 'forwardContent'>,
+  members: RoomMemberSummary[] = []
+): string => {
+  const formattedBody = getFormattedBodyFromContent(message.forwardContent);
+  return formattedBody ? sanitizeRichTextHtml(formattedBody, members) : markdownishToHtml(message.body, members);
+};
+
 const isForwardableMessage = (message: ChatMessage): boolean =>
   message.kind === 'message' && Boolean(message.forwardContent);
 
@@ -433,14 +900,58 @@ const formatDuration = (seconds: number): string => {
   return `${minutes}:${rest.toString().padStart(2, '0')}`;
 };
 
+const unsupportedAuthenticatedMediaOrigins = new Set<string>();
+
+const isAuthenticatedMediaPath = (pathname: string): boolean =>
+  pathname.startsWith('/_matrix/client/v1/media/');
+
+const isMatrixMediaUrl = (src?: string): boolean => {
+  if (!src) return false;
+
+  try {
+    const pathname = new URL(src).pathname;
+    return pathname.startsWith('/_matrix/media/') || isAuthenticatedMediaPath(pathname);
+  } catch {
+    return false;
+  }
+};
+
+const markAuthenticatedMediaUnsupported = (src: string, status: number) => {
+  if (![404, 405, 501].includes(status)) return;
+
+  try {
+    const url = new URL(src);
+    if (!isAuthenticatedMediaPath(url.pathname)) return;
+    unsupportedAuthenticatedMediaOrigins.add(url.origin);
+  } catch {
+    // Ignore malformed URLs while probing fallbacks.
+  }
+};
+
 const toAuthenticatedMediaUrl = (src?: string): string | undefined => {
   if (!src) return undefined;
   try {
     const url = new URL(src);
+    if (unsupportedAuthenticatedMediaOrigins.has(url.origin)) return undefined;
     if (url.pathname.startsWith('/_matrix/client/v1/media/')) return url.href;
     if (!url.pathname.startsWith('/_matrix/media/v3/')) return undefined;
     url.pathname = url.pathname.replace('/_matrix/media/v3/', '/_matrix/client/v1/media/');
     url.searchParams.set('allow_redirect', 'true');
+    return url.href;
+  } catch {
+    return undefined;
+  }
+};
+
+const toUnauthenticatedMediaUrl = (src?: string): string | undefined => {
+  if (!src) return undefined;
+
+  try {
+    const url = new URL(src);
+    if (url.pathname.startsWith('/_matrix/media/v3/')) return url.href;
+    if (!isAuthenticatedMediaPath(url.pathname)) return undefined;
+    url.pathname = url.pathname.replace('/_matrix/client/v1/media/', '/_matrix/media/v3/');
+    url.searchParams.delete('access_token');
     return url.href;
   } catch {
     return undefined;
@@ -456,6 +967,108 @@ const withAccessToken = (src?: string, accessToken?: string): string | undefined
   } catch {
     return undefined;
   }
+};
+
+const getImmediateMediaDisplaySrc = (
+  src?: string,
+  accessToken?: string,
+  fallbackSrc?: string
+): string | undefined => {
+  const authenticatedSrc = accessToken ? toAuthenticatedMediaUrl(src) : undefined;
+  const authenticatedFallbackSrc = accessToken ? toAuthenticatedMediaUrl(fallbackSrc) : undefined;
+  const plainSrc = toUnauthenticatedMediaUrl(src) ?? src;
+  const plainFallbackSrc = toUnauthenticatedMediaUrl(fallbackSrc) ?? fallbackSrc;
+  const authTokenSrc = withAccessToken(authenticatedSrc, accessToken);
+  const authTokenFallbackSrc = withAccessToken(authenticatedFallbackSrc, accessToken);
+  const plainTokenSrc = withAccessToken(plainSrc, accessToken);
+  const plainTokenFallbackSrc = withAccessToken(plainFallbackSrc, accessToken);
+
+  return (
+    authTokenFallbackSrc ??
+    plainTokenFallbackSrc ??
+    authTokenSrc ??
+    plainTokenSrc ??
+    plainFallbackSrc ??
+    plainSrc
+  );
+};
+
+const deriveMatrixMediaDownloadUrl = (src?: string): string | undefined => {
+  if (!src) return undefined;
+
+  try {
+    const url = new URL(src);
+    if (url.pathname.includes('/_matrix/client/v1/media/thumbnail/')) {
+      url.pathname = url.pathname.replace('/_matrix/client/v1/media/thumbnail/', '/_matrix/client/v1/media/download/');
+    } else if (url.pathname.includes('/_matrix/media/v3/thumbnail/')) {
+      url.pathname = url.pathname.replace('/_matrix/media/v3/thumbnail/', '/_matrix/media/v3/download/');
+    } else {
+      return undefined;
+    }
+
+    url.searchParams.delete('width');
+    url.searchParams.delete('height');
+    url.searchParams.delete('method');
+    return url.href;
+  } catch {
+    return undefined;
+  }
+};
+
+type MediaCandidate = {
+  src?: string;
+  fallbackSrc?: string;
+  encryptedFile?: EncryptedMediaFile;
+  mimeType?: string;
+};
+
+const createMediaCandidateKey = (candidate: MediaCandidate): string =>
+  [
+    candidate.src,
+    candidate.fallbackSrc,
+    candidate.encryptedFile?.url,
+    candidate.encryptedFile?.iv,
+    candidate.mimeType,
+  ].join('|');
+
+const dedupeMediaCandidates = (candidates: MediaCandidate[]): MediaCandidate[] => {
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    if (!candidate.src && !candidate.fallbackSrc) return false;
+    const key = createMediaCandidateKey(candidate);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+};
+
+const buildMatrixMediaRetrySrcs = (...sources: Array<string | undefined>): string[] => {
+  const retrySources: string[] = [];
+
+  sources.forEach((source) => {
+    const derived = deriveMatrixMediaDownloadUrl(source);
+    if (derived && !retrySources.includes(derived) && !sources.includes(derived)) {
+      retrySources.push(derived);
+    }
+  });
+
+  return retrySources;
+};
+
+const getPreviewEncryptedFile = (attachment?: ChatAttachment): EncryptedMediaFile | undefined => {
+  if (!attachment) return undefined;
+  if (attachment.previewEncryptedFile) return attachment.previewEncryptedFile;
+  if (!attachment.encryptedFile) return undefined;
+
+  const previewPrimarySrc = attachment.authUrl ?? attachment.url;
+  const fullPrimarySrc =
+    attachment.authDownloadUrl ?? attachment.downloadUrl ?? attachment.authUrl ?? attachment.url;
+  const previewFallbackSrc = attachment.url;
+  const fullFallbackSrc = attachment.downloadUrl ?? attachment.url;
+  const previewUsesOriginalAsset =
+    previewPrimarySrc === fullPrimarySrc || previewFallbackSrc === fullFallbackSrc;
+
+  return previewUsesOriginalAsset ? attachment.encryptedFile : undefined;
 };
 
 const decodeUnpaddedBase64 = (value: string): Uint8Array => {
@@ -528,26 +1141,51 @@ const fetchMediaBlob = async (
   mimeType?: string
 ): Promise<Blob> => {
   const authenticatedSrc = accessToken ? toAuthenticatedMediaUrl(src) : undefined;
-  const tokenSrc = withAccessToken(authenticatedSrc ?? src, accessToken);
-  const candidates = [authenticatedSrc ?? src, tokenSrc, fallbackSrc].filter(
-    (candidate, index, list): candidate is string =>
-      Boolean(candidate) && list.indexOf(candidate) === index
-  );
+  const authenticatedFallbackSrc = accessToken ? toAuthenticatedMediaUrl(fallbackSrc) : undefined;
+  const plainSrc = toUnauthenticatedMediaUrl(src) ?? src;
+  const plainFallbackSrc = toUnauthenticatedMediaUrl(fallbackSrc) ?? fallbackSrc;
+  const authTokenSrc = withAccessToken(authenticatedSrc, accessToken);
+  const authTokenFallbackSrc = withAccessToken(authenticatedFallbackSrc, accessToken);
+  const plainTokenSrc = withAccessToken(plainSrc, accessToken);
+  const plainTokenFallbackSrc = withAccessToken(plainFallbackSrc, accessToken);
+  const candidates: Array<{ url: string; headers?: HeadersInit }> = [];
+  const pushCandidate = (url?: string, headers?: HeadersInit) => {
+    if (!url || candidates.some((candidate) => candidate.url === url)) return;
+    candidates.push({ url, headers });
+  };
+
+  if (authenticatedSrc && accessToken) {
+    pushCandidate(authenticatedSrc, { Authorization: `Bearer ${accessToken}` });
+    pushCandidate(authTokenSrc);
+  }
+  pushCandidate(plainTokenSrc);
+  pushCandidate(plainSrc);
+
+  if (authenticatedFallbackSrc && accessToken) {
+    pushCandidate(authenticatedFallbackSrc, { Authorization: `Bearer ${accessToken}` });
+    pushCandidate(authTokenFallbackSrc);
+  }
+  pushCandidate(plainTokenFallbackSrc);
+  pushCandidate(plainFallbackSrc);
 
   let lastError: unknown;
   for (const candidate of candidates) {
     try {
-      const response = await fetch(candidate, {
-        headers: authenticatedSrc && candidate === authenticatedSrc && accessToken
-          ? { Authorization: `Bearer ${accessToken}` }
-          : undefined,
-      });
+      const response = await fetch(candidate.url, { headers: candidate.headers });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const blob = await response.blob();
       return encryptedFile
         ? decryptEncryptedMediaBlob(blob, encryptedFile, mimeType)
-        : blob;
+        : mimeType && blob.type !== mimeType
+          ? new Blob([blob], { type: mimeType })
+          : blob;
     } catch (error) {
+      if (error instanceof Error) {
+        const match = /HTTP\s+(\d+)/i.exec(error.message);
+        if (match) {
+          markAuthenticatedMediaUnsupported(candidate.url, Number(match[1]));
+        }
+      }
       lastError = error;
     }
   }
@@ -557,6 +1195,26 @@ const fetchMediaBlob = async (
   );
 };
 
+const pendingMediaBlobRequests = new Map<string, Promise<Blob>>();
+
+const fetchMediaBlobDeduped = async (
+  cacheKey: string | undefined,
+  load: () => Promise<Blob>
+): Promise<Blob> => {
+  if (!cacheKey) return load();
+
+  const pending = pendingMediaBlobRequests.get(cacheKey);
+  if (pending) return pending;
+
+  const nextRequest = load().finally(() => {
+    if (pendingMediaBlobRequests.get(cacheKey) === nextRequest) {
+      pendingMediaBlobRequests.delete(cacheKey);
+    }
+  });
+  pendingMediaBlobRequests.set(cacheKey, nextRequest);
+  return nextRequest;
+};
+
 const useAuthenticatedMediaState = (
   src?: string,
   accessToken?: string,
@@ -564,8 +1222,12 @@ const useAuthenticatedMediaState = (
   encryptedFile?: EncryptedMediaFile,
   mimeType?: string
 ): { resolvedSrc?: string; loading: boolean; failed: boolean } => {
+  const encryptedFileSignature = encryptedFile
+    ? `${encryptedFile.url}|${encryptedFile.iv}|${encryptedFile.hashes?.sha256 ?? ''}`
+    : '';
+  const immediateDisplaySrc = getImmediateMediaDisplaySrc(src, accessToken, fallbackSrc);
   const [state, setState] = useState<{ resolvedSrc?: string; loading: boolean; failed: boolean }>(() => ({
-    resolvedSrc: encryptedFile ? fallbackSrc : fallbackSrc ?? src,
+    resolvedSrc: encryptedFile ? immediateDisplaySrc ?? fallbackSrc : immediateDisplaySrc,
     loading: Boolean(src && encryptedFile),
     failed: false,
   }));
@@ -573,80 +1235,151 @@ const useAuthenticatedMediaState = (
   useEffect(() => {
     let objectUrl: string | undefined;
     let cancelled = false;
+    const cacheKey = encryptedFile?.url ?? src ?? fallbackSrc;
+    const plainSrc = toUnauthenticatedMediaUrl(src) ?? src;
+    const plainFallbackSrc = toUnauthenticatedMediaUrl(fallbackSrc) ?? fallbackSrc;
+    const nextImmediateDisplaySrc = getImmediateMediaDisplaySrc(src, accessToken, fallbackSrc);
 
     if (!src) {
-      setState({ resolvedSrc: fallbackSrc, loading: false, failed: !fallbackSrc });
+      setState({
+        resolvedSrc: nextImmediateDisplaySrc,
+        loading: false,
+        failed: !nextImmediateDisplaySrc,
+      });
       return undefined;
     }
 
-    if (encryptedFile) {
-      setState({ resolvedSrc: fallbackSrc, loading: true, failed: false });
-      void fetchMediaBlob(src, accessToken, fallbackSrc, encryptedFile, mimeType)
-        .then((blob) => {
-          objectUrl = URL.createObjectURL(blob);
-          if (!cancelled) {
-            setState({ resolvedSrc: objectUrl, loading: false, failed: false });
-          }
-        })
-        .catch(() => {
-          if (!cancelled) {
-            setState({
-              resolvedSrc: fallbackSrc,
-              loading: false,
-              failed: !fallbackSrc,
-            });
-          }
-        });
-
-      return () => {
-        cancelled = true;
-        if (objectUrl) URL.revokeObjectURL(objectUrl);
-      };
-    }
-
     const authenticatedSrc = accessToken ? toAuthenticatedMediaUrl(src) : undefined;
-    const requestSrc = authenticatedSrc ?? src;
-    const tokenSrc = withAccessToken(requestSrc, accessToken);
-    const needsAuth = Boolean(authenticatedSrc && accessToken);
-    if (!needsAuth) {
+    const needsProtectedFetch = Boolean(
+      encryptedFile ||
+      (accessToken && (isMatrixMediaUrl(src) || isMatrixMediaUrl(fallbackSrc) || Boolean(authenticatedSrc)))
+    );
+    const requestSrc = authenticatedSrc ?? plainSrc;
+    const tokenSrc = withAccessToken(plainSrc, accessToken);
+    const memoryCachedSrc = peekCachedMediaUrl(cacheKey);
+
+    if (!needsProtectedFetch) {
       setState({ resolvedSrc: requestSrc, loading: false, failed: false });
       return undefined;
     }
 
-    setState({ resolvedSrc: fallbackSrc ?? tokenSrc, loading: true, failed: false });
-    void fetch(requestSrc, {
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-      },
-    })
-      .then((response) => {
-        if (!response.ok) throw new Error(`Media request failed: ${response.status}`);
-        return response.blob();
-      })
-      .then((blob) => {
+    if (memoryCachedSrc) {
+      setState({ resolvedSrc: memoryCachedSrc, loading: false, failed: false });
+      return undefined;
+    }
+
+    setState({
+      resolvedSrc: nextImmediateDisplaySrc,
+      loading: true,
+      failed: false,
+    });
+
+    void (async () => {
+      try {
+        const cachedSrc = cacheKey ? await getCachedMediaUrl(cacheKey, mimeType, src) : undefined;
+        if (cachedSrc) {
+          if (!cancelled) {
+            setState({ resolvedSrc: cachedSrc, loading: false, failed: false });
+          }
+          return;
+        }
+
+        const blob = await fetchMediaBlobDeduped(cacheKey, () =>
+          fetchMediaBlob(src, accessToken, fallbackSrc, encryptedFile, mimeType)
+        );
+        const cachedUrl = cacheKey
+          ? await storeCachedMediaBlob(cacheKey, blob, mimeType ?? blob.type, src)
+          : undefined;
+
+        if (cachedUrl) {
+          if (!cancelled) {
+            setState({ resolvedSrc: cachedUrl, loading: false, failed: false });
+          }
+          return;
+        }
+
         objectUrl = URL.createObjectURL(blob);
         if (!cancelled) {
           setState({ resolvedSrc: objectUrl, loading: false, failed: false });
         }
-      })
-      .catch(() => {
+      } catch {
         if (!cancelled) {
-          const nextSrc = tokenSrc ?? fallbackSrc;
           setState({
-            resolvedSrc: nextSrc,
+            resolvedSrc: nextImmediateDisplaySrc,
             loading: false,
-            failed: !nextSrc,
+            failed: !nextImmediateDisplaySrc,
           });
         }
-      });
+      }
+    })();
 
     return () => {
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [accessToken, encryptedFile, fallbackSrc, mimeType, src]);
+  }, [accessToken, encryptedFileSignature, fallbackSrc, mimeType, src]);
 
   return state;
+};
+
+const useResolvedMediaCandidateList = (
+  candidates: MediaCandidate[],
+  accessToken?: string
+): { resolvedSrc?: string; loading: boolean; failed: boolean; onRenderedError: () => void } => {
+  const normalizedCandidates = useMemo(() => dedupeMediaCandidates(candidates), [candidates]);
+  const candidateSignature = useMemo(
+    () => normalizedCandidates.map((candidate) => createMediaCandidateKey(candidate)).join('||'),
+    [normalizedCandidates]
+  );
+  const resolutionSignature = `${candidateSignature}|${accessToken ?? ''}`;
+  const [candidateIndex, setCandidateIndex] = useState(0);
+  const [renderFailed, setRenderFailed] = useState(false);
+
+  useEffect(() => {
+    setCandidateIndex(0);
+    setRenderFailed(false);
+  }, [resolutionSignature]);
+
+  const currentCandidate = normalizedCandidates[candidateIndex];
+  const mediaState = useAuthenticatedMediaState(
+    currentCandidate?.src,
+    accessToken,
+    currentCandidate?.fallbackSrc,
+    currentCandidate?.encryptedFile,
+    currentCandidate?.mimeType
+  );
+  const hasNextCandidate = candidateIndex < normalizedCandidates.length - 1;
+
+  const advanceCandidate = useCallback(() => {
+    setRenderFailed(false);
+    setCandidateIndex((current) => Math.min(current + 1, Math.max(normalizedCandidates.length - 1, 0)));
+  }, [normalizedCandidates.length]);
+
+  useEffect(() => {
+    if (mediaState.failed && hasNextCandidate) {
+      advanceCandidate();
+    }
+  }, [advanceCandidate, hasNextCandidate, mediaState.failed]);
+
+  const onRenderedError = useCallback(() => {
+    if (hasNextCandidate) {
+      advanceCandidate();
+      return;
+    }
+
+    setRenderFailed(true);
+  }, [advanceCandidate, hasNextCandidate]);
+
+  if (!currentCandidate) {
+    return { resolvedSrc: undefined, loading: false, failed: true, onRenderedError };
+  }
+
+  return {
+    resolvedSrc: renderFailed ? undefined : mediaState.resolvedSrc,
+    loading: mediaState.loading,
+    failed: renderFailed || (mediaState.failed && !hasNextCandidate),
+    onRenderedError,
+  };
 };
 
 const useAuthenticatedMediaUrl = (
@@ -658,6 +1391,43 @@ const useAuthenticatedMediaUrl = (
 ): string | undefined => {
   const { resolvedSrc } = useAuthenticatedMediaState(src, accessToken, fallbackSrc, encryptedFile, mimeType);
   return resolvedSrc;
+};
+
+const useDeferredMediaActivation = (
+  enabled: boolean,
+  signature: string
+): { hostRef: MutableRefObject<HTMLSpanElement | null>; active: boolean } => {
+  const hostRef = useRef<HTMLSpanElement | null>(null);
+  const [active, setActive] = useState(!enabled);
+
+  useEffect(() => {
+    setActive(!enabled);
+  }, [enabled, signature]);
+
+  useEffect(() => {
+    if (!enabled || active) return undefined;
+
+    const host = hostRef.current;
+    if (!host || typeof window === 'undefined' || typeof window.IntersectionObserver === 'undefined') {
+      setActive(true);
+      return undefined;
+    }
+
+    const observer = new window.IntersectionObserver(
+      (entries) => {
+        if (entries.some((entry) => entry.isIntersecting || entry.intersectionRatio > 0)) {
+          setActive(true);
+          observer.disconnect();
+        }
+      },
+      { rootMargin: '220px' }
+    );
+
+    observer.observe(host);
+    return () => observer.disconnect();
+  }, [active, enabled, signature]);
+
+  return { hostRef, active };
 };
 
 const combineTranscript = (leftText = '', rightText = ''): string =>
@@ -999,9 +1769,7 @@ const getCinnyFavoritesRoomId = (client: MatrixClient | undefined, rooms: RoomSu
 const serverFromUserId = (userId?: string): string | undefined => userId?.split(':')[1];
 
 const extractMentionUserIds = (body: string, members: RoomMemberSummary[]): string[] =>
-  members
-    .filter((member) => body.includes(member.id) || body.includes(`@${member.name}`))
-    .map((member) => member.id);
+  Array.from(new Set(findMentionMatches(body, members).map((match) => match.member.id)));
 
 const getTrailingMentionQuery = (value: string): string | undefined => {
   const match = value.match(/(?:^|\s)@([^\s@:]{0,32})$/);
@@ -1014,7 +1782,7 @@ const buildMatrixPermalink = (room: Pick<RoomSummary, 'id' | 'canonicalAlias'>, 
   return `https://matrix.to/#/${roomPart}${eventPart}`;
 };
 
-const buildUserPermalink = (userId: string): string => `https://matrix.to/#/${encodeURIComponent(userId)}`;
+const buildUserPermalink = (userId: string): string => buildMatrixUserHref(userId);
 
 const localPartFromUserId = (userId?: string): string | undefined => {
   if (!userId) return undefined;
@@ -1023,8 +1791,8 @@ const localPartFromUserId = (userId?: string): string | undefined => {
 };
 
 const memberRoleLabel = (powerLevel = 0): string => {
-  if (powerLevel >= 100) return '绠＄悊';
-  if (powerLevel >= 50) return '鐗堜富';
+  if (powerLevel >= 100) return '管理员';
+  if (powerLevel >= 50) return '版主';
   if (powerLevel > 0) return `权限 ${powerLevel}`;
   return '成员';
 };
@@ -1076,6 +1844,7 @@ export function App() {
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingTimerRef = useRef<number | undefined>(undefined);
   const recordingCancelledRef = useRef(false);
+  const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const emojiTrayRef = useRef<HTMLDivElement | null>(null);
   const emojiToggleButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -1108,6 +1877,9 @@ export function App() {
   const [messageSearchOpen, setMessageSearchOpen] = useState(false);
   const [messageDraft, setMessageDraft] = useState('');
   const [composerMode, setComposerMode] = useState<ComposerMode>({ type: 'normal' });
+  const [editingMessageId, setEditingMessageId] = useState<string>();
+  const [editingMessageDraft, setEditingMessageDraft] = useState('');
+  const [savingInlineEdit, setSavingInlineEdit] = useState(false);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [listening, setListening] = useState(false);
   const [voiceRecording, setVoiceRecording] = useState(false);
@@ -1207,6 +1979,21 @@ export function App() {
       setSnapshot(getMatrixSnapshot(mx));
     },
     [client]
+  );
+
+  const refreshCustomEmojiState = useCallback(
+    (mx = client) => {
+      setCustomEmojiItems(mx ? getCustomEmojiItems(mx, selectedRoomId) : []);
+    },
+    [client, selectedRoomId]
+  );
+
+  const syncCustomEmojiState = useCallback(
+    (mx = client) => {
+      refreshSnapshot(mx);
+      refreshCustomEmojiState(mx);
+    },
+    [client, refreshCustomEmojiState, refreshSnapshot]
   );
 
   const refreshCryptoStatus = useCallback(
@@ -1354,6 +2141,46 @@ export function App() {
     [selectedSpaceId, snapshot.rooms]
   );
 
+  const selectedRoomMatchesActiveView = useMemo(() => {
+    if (!selectedRoom) return false;
+
+    if (activeView === 'home') {
+      return selectedRoom.membership === 'join' && !selectedRoom.space;
+    }
+
+    if (activeView === 'direct') {
+      return selectedRoom.membership === 'join' && !selectedRoom.space && selectedRoom.direct;
+    }
+
+    if (activeView === 'rooms') {
+      if (roomFilter === 'spaces') {
+        if (!selectedSpaceId) return false;
+        return (
+          selectedRoom.membership === 'join' &&
+          !selectedRoom.space &&
+          !selectedRoom.direct &&
+          selectedRoom.parentSpaceIds.includes(selectedSpaceId)
+        );
+      }
+
+      return selectedRoom.membership === 'join' && !selectedRoom.space && !selectedRoom.direct;
+    }
+
+    if (activeView === 'spaces') {
+      return selectedRoom.membership === 'join' && selectedRoom.space;
+    }
+
+    if (activeView === 'invites') {
+      return selectedRoom.membership === 'invite';
+    }
+
+    if (activeView === 'favorites') {
+      return selectedRoom.membership === 'join' && favoriteRoomIds.includes(selectedRoom.id);
+    }
+
+    return false;
+  }, [activeView, favoriteRoomIds, roomFilter, selectedRoom, selectedSpaceId]);
+
   const selectedRoomMessages = useMemo(() => {
     if (!client || !selectedRoomId) return [];
     return getRoomMessages(client, selectedRoomId, messageQuery);
@@ -1385,6 +2212,16 @@ export function App() {
         : undefined,
     [messageInfoMessage, snapshot.rooms]
   );
+  const readReceiptMessage = useMemo(() => {
+    if (!client || typeof sheet !== 'object' || !sheet || sheet.type !== 'readReceipts') {
+      return undefined;
+    }
+
+    return (
+      getRoomMessages(client, sheet.message.roomId).find((message) => message.id === sheet.message.id) ??
+      sheet.message
+    );
+  }, [client, sheet, snapshot.version]);
 
   const userProfileMember = useMemo(() => {
     if (typeof sheet !== 'object' || !sheet || sheet.type !== 'userProfile') {
@@ -1507,14 +2344,14 @@ export function App() {
     }
 
     if (activeView === 'rooms' && roomFilter === 'spaces') {
-      if (selectedRoomId && selectedSpaceId && visibleRooms.some((room) => room.id === selectedRoomId)) return;
+      if (selectedRoomId && selectedRoomMatchesActiveView) return;
       setSelectedRoomId(undefined);
       return;
     }
 
-    if (selectedRoomId && visibleRooms.some((room) => room.id === selectedRoomId)) return;
+    if (selectedRoomId && selectedRoomMatchesActiveView) return;
     setSelectedRoomId(visibleRooms[0]?.id);
-  }, [activeView, roomFilter, selectedRoomId, selectedSpaceId, visibleRooms]);
+  }, [activeView, roomFilter, selectedRoomId, selectedRoomMatchesActiveView, visibleRooms]);
 
   useEffect(() => {
     setRoomFilter('all');
@@ -1541,14 +2378,25 @@ export function App() {
       setTypingMembers([]);
       setRoomMediaItems([]);
       setPinnedMessages([]);
-      setCustomEmojiItems(client ? getCustomEmojiItems(client) : []);
+      refreshCustomEmojiState(client);
       return;
     }
+    let cancelled = false;
     setRoomMembers(getRoomMembers(client, selectedRoomId));
     setRoomMediaItems(getRoomMediaItems(client, selectedRoomId));
     setPinnedMessages(getPinnedMessages(client, selectedRoomId));
-    setCustomEmojiItems(getCustomEmojiItems(client, selectedRoomId));
-  }, [client, selectedRoomId, snapshot.version]);
+    refreshCustomEmojiState(client);
+
+    void loadRoomMembers(client, selectedRoomId).then((members) => {
+      if (cancelled) return;
+      setRoomMembers(members);
+      refreshSnapshot(client);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [client, refreshCustomEmojiState, selectedRoomId, snapshot.version]);
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -1736,6 +2584,14 @@ export function App() {
   }, [pendingScrollEventId, selectedRoomMessages.length]);
 
   useEffect(() => {
+    if (!editingMessageId) return;
+    if (selectedRoomMessages.some((message) => message.id === editingMessageId)) return;
+    setEditingMessageId(undefined);
+    setEditingMessageDraft('');
+    setSavingInlineEdit(false);
+  }, [editingMessageId, selectedRoomMessages]);
+
+  useEffect(() => {
     saveStringArray(favoriteRoomsKey, favoriteRoomIds);
   }, [favoriteRoomIds]);
 
@@ -1805,6 +2661,9 @@ export function App() {
     setMessageQuery('');
     setMessageSearchOpen(false);
     setComposerMode({ type: 'normal' });
+    setEditingMessageId(undefined);
+    setEditingMessageDraft('');
+    setSavingInlineEdit(false);
   };
 
   const executeSlashCommand = async (body: string): Promise<boolean> => {
@@ -1862,16 +2721,40 @@ export function App() {
       if (await executeSlashCommand(body)) {
         // Command handled.
       } else if (composerMode.type === 'edit') {
-        await editTextMessage(client, selectedRoom.id, composerMode.message.id, body);
+        const mentions = extractMentionUserIds(body, roomMembers);
+        await editTextMessage(
+          client,
+          selectedRoom.id,
+          composerMode.message.id,
+          body,
+          mentions,
+          mentions.length > 0 ? markdownishToHtml(body, roomMembers) : undefined
+        );
       } else if (composerMode.type === 'reply') {
+        const mentions = extractMentionUserIds(body, roomMembers);
         const replyTo: ChatReply = {
           eventId: composerMode.message.id,
+          senderId: composerMode.message.sender,
           senderName: composerMode.message.senderName ?? composerMode.message.sender,
           body: composerMode.message.body,
         };
-        await sendReplyMessage(client, selectedRoom.id, replyTo, body);
+        await sendReplyMessage(
+          client,
+          selectedRoom.id,
+          replyTo,
+          body,
+          mentions,
+          markdownishToHtml(body, roomMembers)
+        );
       } else {
-        await sendTextMessage(client, selectedRoom.id, body, extractMentionUserIds(body, roomMembers));
+        const mentions = extractMentionUserIds(body, roomMembers);
+        await sendTextMessage(
+          client,
+          selectedRoom.id,
+          body,
+          mentions,
+          mentions.length > 0 ? markdownishToHtml(body, roomMembers) : undefined
+        );
       }
 
       setComposerMode({ type: 'normal' });
@@ -1898,6 +2781,18 @@ export function App() {
       void handleSendMessage();
     }
   };
+
+  const focusComposerInput = useCallback(() => {
+    window.requestAnimationFrame(() => {
+      window.requestAnimationFrame(() => {
+        const input = composerInputRef.current;
+        if (!input) return;
+        input.focus();
+        const length = input.value.length;
+        input.setSelectionRange(length, length);
+      });
+    });
+  }, []);
 
   const handleDraftChange = (value: string) => {
     setMessageDraft(value);
@@ -2004,14 +2899,85 @@ export function App() {
     );
   };
 
+  const handleOpenPinnedMessage = useCallback(
+    async (roomId: string, eventId: string) => {
+      if (!client) return;
+
+      const localMessage =
+        getRoomMessages(client, roomId).find((message) => message.id === eventId) ??
+        (roomId === selectedRoomId ? selectedRoomMessages.find((message) => message.id === eventId) : undefined);
+
+      if (localMessage) {
+        if (roomId !== selectedRoomId) {
+          handleSelectRoom(roomId);
+        }
+        setPendingScrollEventId(eventId);
+        return;
+      }
+
+      setError(undefined);
+      const remoteMessage = await fetchRoomMessageById(client, roomId, eventId);
+      if (!remoteMessage) {
+        setError('暂时还没有拿到这条置顶消息，稍后再试。');
+        return;
+      }
+
+      setSheet({ type: 'messageInfo', message: remoteMessage });
+    },
+    [client, handleSelectRoom, selectedRoomId, selectedRoomMessages]
+  );
+
   const handleOpenMessageInfo = (message: ChatMessage) => {
     setSheet({ type: 'messageInfo', message });
   };
 
+  const handleOpenReadReceipts = (message: ChatMessage) => {
+    setSheet({ type: 'readReceipts', message });
+  };
+
   const handleEditMessage = (message: ChatMessage) => {
-    setComposerMode({ type: 'edit', message });
-    setMessageDraft(message.body);
+    setComposerMode({ type: 'normal' });
+    setEditingMessageId(message.id);
+    setEditingMessageDraft(message.body);
+    setSavingInlineEdit(false);
     setSheet(undefined);
+  };
+
+  const handleCancelInlineEdit = () => {
+    if (savingInlineEdit) return;
+    setEditingMessageId(undefined);
+    setEditingMessageDraft('');
+  };
+
+  const handleSaveInlineEdit = async (message: ChatMessage) => {
+    if (!client || savingInlineEdit) return;
+
+    const body = editingMessageDraft;
+    if (!body.trim()) return;
+
+    setError(undefined);
+    setSavingInlineEdit(true);
+
+    try {
+      const mentions = extractMentionUserIds(body, roomMembers);
+      await editTextMessage(
+        client,
+        message.roomId,
+        message.id,
+        body,
+        mentions,
+        mentions.length > 0 ? markdownishToHtml(body, roomMembers) : undefined
+      );
+      await Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
+      refreshSnapshot();
+      setEditingMessageId(undefined);
+      setEditingMessageDraft('');
+      setNotice('消息已编辑');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSavingInlineEdit(false);
+    }
   };
 
   const handleRedactMessage = async (message: ChatMessage) => {
@@ -2462,13 +3428,19 @@ export function App() {
       messageDraft.endsWith(' ') || messageDraft.length === 0
         ? `${messageDraft}${mention}`
         : `${messageDraft} ${mention}`;
-    setMessageDraft(nextDraft);
-    if (selectedRoom && composerMode.type === 'normal') {
-      setRoomDrafts((drafts) => ({ ...drafts, [selectedRoom.id]: nextDraft }));
-    }
+    handleDraftChange(nextDraft);
     setSheet(undefined);
     setMobilePane('chat');
+    focusComposerInput();
   };
+
+  const handleMentionMessageSender = useCallback(
+    (message: ChatMessage) => {
+      const member = getMessageSenderMember(message);
+      if (member) handleMentionMember(member);
+    },
+    [getMessageSenderMember, handleMentionMember]
+  );
 
   const handlePickMentionSuggestion = (member: RoomMemberSummary) => {
     const nextDraft = messageDraft.match(/(?:^|\s)@[^\s@:]{0,32}$/)
@@ -2513,7 +3485,7 @@ export function App() {
 
   const handleKickMember = async (member: RoomMemberSummary) => {
     if (!client || !selectedRoom) return;
-    if (!window.confirm(`纭畾瑕佹妸 ${member.name} 移出这个房间吗？`)) return;
+    if (!window.confirm(`确定要把 ${member.name} 移出这个房间吗？`)) return;
 
     await runAction(
       () => kickMember(client, selectedRoom.id, member.id, 'Removed by room moderator'),
@@ -2698,7 +3670,11 @@ export function App() {
   }
 
   const showPaneSearch = activeView !== 'explore' && activeView !== 'settings' && activeView !== 'favorites';
-  const showPaneCreate = activeView !== 'favorites' && activeView !== 'invites' && activeView !== 'explore';
+  const showPaneCreate =
+    activeView !== 'favorites' &&
+    activeView !== 'invites' &&
+    activeView !== 'explore' &&
+    activeView !== 'settings';
   const showPaneActions = showPaneSearch || showPaneCreate;
 
   return (
@@ -2861,7 +3837,6 @@ export function App() {
         {activeView === 'settings' && (
           <SettingsPanel
             session={session}
-            deviceName={deviceName}
             snapshot={snapshot}
             favoriteMessageCount={favoriteMessageCount}
             customEmojiCount={customEmojiItems.length}
@@ -2876,6 +3851,7 @@ export function App() {
             onAvatarSelected={handleProfileAvatarSelected}
             onPreferencesChange={setPreferences}
             onOpenSecurity={() => setSheet('security')}
+            onOpenEmojiManager={() => setSheet('emojiManager')}
             onClearLocal={() => {
               window.localStorage.removeItem(favoriteRoomsKey);
               window.localStorage.removeItem(favoriteMessagesKey);
@@ -2972,12 +3948,11 @@ export function App() {
               {pinnedMessages.length > 0 && (
                 <PinnedBar
                   items={pinnedMessages}
-                  onOpen={(eventId) => setPendingScrollEventId(eventId)}
+                  onOpen={(eventId) => void handleOpenPinnedMessage(selectedRoom.id, eventId)}
                   onOpenAll={() => setSheet('roomInfo')}
                 />
               )}
               {error && <button className="message-box danger inline" type="button" onClick={() => setError(undefined)}>{error}</button>}
-              {notice && <button className="message-box success inline" type="button" onClick={() => setNotice(undefined)}>{notice}</button>}
             </div>
 
             {selectionMode && (
@@ -3031,6 +4006,7 @@ export function App() {
                         selected={selectedMessageIds.includes(message.id)}
                         forwardable={isForwardableMessage(message)}
                         mediaAccessToken={session?.accessToken}
+                        members={roomMembers}
                         currentUserProfile={ownProfile}
                         readReceiptAvatarCount={preferences.readReceiptAvatarCount}
                         audioTranscription={audioTranscriptions[message.id]}
@@ -3051,6 +4027,15 @@ export function App() {
                         onPreviewAttachment={() => handlePreviewAttachment(message)}
                         onTranscribeAudio={() => handleTranscribeAudio(message)}
                         onOpenUserProfile={() => handleOpenMessageSenderProfile(message)}
+                        onOpenMentionMember={openUserProfile}
+                        onMentionSender={() => handleMentionMessageSender(message)}
+                        onOpenReadReceipts={() => handleOpenReadReceipts(message)}
+                        editing={editingMessageId === message.id}
+                        editingDraft={editingMessageId === message.id ? editingMessageDraft : ''}
+                        savingEdit={savingInlineEdit && editingMessageId === message.id}
+                        onEditingDraftChange={setEditingMessageDraft}
+                        onCancelEdit={handleCancelInlineEdit}
+                        onSaveEdit={() => handleSaveInlineEdit(message)}
                         onReact={(key) =>
                           client &&
                           runAction(() => sendReaction(client, message.roomId, message.id, key), '已更新回应')
@@ -3168,6 +4153,7 @@ export function App() {
                 </button>
               </div>
               <textarea
+                ref={composerInputRef}
                 value={messageDraft}
                 rows={1}
                 placeholder={selectedRoom.membership === 'join' ? '输入消息' : '需要先加入房间'}
@@ -3238,6 +4224,17 @@ export function App() {
         />
       )}
 
+      {sheet === 'emojiManager' && client && (
+        <EmojiManagerSheet
+          client={client}
+          mediaAccessToken={session?.accessToken}
+          onClose={() => setSheet(undefined)}
+          onRefresh={() => syncCustomEmojiState(client)}
+          onSuccess={setNotice}
+          onError={setError}
+        />
+      )}
+
       {sheet === 'new' && (
         <NewConversationSheet
           createForm={createForm}
@@ -3282,7 +4279,7 @@ export function App() {
           onPreviewMedia={setPreviewMedia}
           onOpenPinned={(eventId) => {
             setSheet(undefined);
-            setPendingScrollEventId(eventId);
+            void handleOpenPinnedMessage(selectedRoom.id, eventId);
           }}
           onUnpinMessage={(eventId) =>
             client &&
@@ -3324,7 +4321,6 @@ export function App() {
           currentUserId={session?.userId}
           mediaAccessToken={session?.accessToken}
           onClose={() => setSheet(undefined)}
-          onMentionMember={handleMentionMember}
           onCopyMember={handleCopyMember}
           onCopyMemberLink={handleCopyMemberLink}
           onDirectMember={handleDirectMember}
@@ -3348,8 +4344,11 @@ export function App() {
         <MessageInfoSheet
           message={messageInfoMessage}
           room={messageInfoRoom}
+          members={roomMembers}
+          mediaAccessToken={session?.accessToken}
           favorite={favoriteMessageIds[messageInfoMessage.roomId]?.includes(messageInfoMessage.id) ?? false}
           onClose={() => setSheet(undefined)}
+          onOpenMemberProfile={openUserProfile}
           onReply={() => {
             setComposerMode({ type: 'reply', message: messageInfoMessage });
             setMessageDraft('');
@@ -3368,6 +4367,16 @@ export function App() {
             runAction(() => sendReaction(client, messageInfoMessage.roomId, messageInfoMessage.id, key), '已更新回应')
           }
           onRedact={() => handleRedactMessage(messageInfoMessage)}
+        />
+      )}
+
+      {readReceiptMessage && (
+        <ReadReceiptSheet
+          message={readReceiptMessage}
+          members={roomMembers}
+          mediaAccessToken={session?.accessToken}
+          onClose={() => setSheet(undefined)}
+          onOpenMemberProfile={openUserProfile}
         />
       )}
 
@@ -3399,6 +4408,7 @@ function Avatar({
   accessToken,
   small = false,
   onClick,
+  onLongPress,
   ariaLabel,
 }: {
   name: string;
@@ -3406,21 +4416,55 @@ function Avatar({
   accessToken?: string;
   small?: boolean;
   onClick?: () => void;
+  onLongPress?: () => void;
   ariaLabel?: string;
 }) {
-  const [failed, setFailed] = useState(false);
-  const resolvedSrc = useAuthenticatedMediaUrl(src, accessToken, src);
+  const mediaCandidates = useMemo(
+    () =>
+      dedupeMediaCandidates([
+        { src, fallbackSrc: src },
+        ...buildMatrixMediaRetrySrcs(src).map((retrySrc) => ({ src: retrySrc })),
+      ]),
+    [src]
+  );
+  const mediaState = useResolvedMediaCandidateList(mediaCandidates, accessToken);
+  const resolvedSrc = mediaState.resolvedSrc;
   const className = small ? 'avatar small' : 'avatar';
-  const showImage = Boolean(resolvedSrc && !failed);
+  const showImage = Boolean(resolvedSrc && !mediaState.failed);
+  const longPressTimerRef = useRef<number>();
+  const longPressStateRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    triggered: boolean;
+  }>();
+  const skipClickRef = useRef(false);
 
-  useEffect(() => {
-    setFailed(false);
-  }, [resolvedSrc]);
+  useEffect(
+    () => () => {
+      if (longPressTimerRef.current !== undefined) {
+        window.clearTimeout(longPressTimerRef.current);
+      }
+    },
+    []
+  );
+
+  const clearLongPressTimer = () => {
+    if (longPressTimerRef.current !== undefined) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = undefined;
+    }
+  };
+
+  const resetLongPress = () => {
+    clearLongPressTimer();
+    longPressStateRef.current = undefined;
+  };
 
   const content = (
     <>
       {showImage ? (
-        <img src={resolvedSrc} alt="" onError={() => setFailed(true)} />
+        <img src={resolvedSrc} alt="" onError={mediaState.onRenderedError} />
       ) : (
         <span>{initials(name)}</span>
       )}
@@ -3432,7 +4476,41 @@ function Avatar({
       <button
         className={`${className} avatar-button`}
         type="button"
+        onPointerDown={(evt) => {
+          if (!onLongPress || evt.button !== 0) return;
+          longPressStateRef.current = {
+            pointerId: evt.pointerId,
+            startX: evt.clientX,
+            startY: evt.clientY,
+            triggered: false,
+          };
+          clearLongPressTimer();
+          longPressTimerRef.current = window.setTimeout(() => {
+            const state = longPressStateRef.current;
+            if (!state || state.pointerId !== evt.pointerId) return;
+            state.triggered = true;
+            skipClickRef.current = true;
+            void Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
+            onLongPress();
+          }, 420);
+        }}
+        onPointerMove={(evt) => {
+          const state = longPressStateRef.current;
+          if (!state || state.pointerId !== evt.pointerId || state.triggered) return;
+          if (Math.abs(evt.clientX - state.startX) > 10 || Math.abs(evt.clientY - state.startY) > 10) {
+            resetLongPress();
+          }
+        }}
+        onPointerUp={resetLongPress}
+        onPointerCancel={resetLongPress}
         onClick={(evt) => {
+          if (skipClickRef.current) {
+            skipClickRef.current = false;
+            evt.preventDefault();
+            evt.stopPropagation();
+            return;
+          }
+          resetLongPress();
           evt.stopPropagation();
           onClick();
         }}
@@ -3563,24 +4641,22 @@ function RoomList({
   );
 }
 
-type FavoritePanelFilter = 'all' | 'rooms' | 'messages' | 'images' | 'videos' | 'audio' | 'files';
+type FavoritePanelFilter = 'messages' | 'images' | 'videos' | 'audio';
 type FavoriteDateFilter = 'all' | 'today' | 'week' | 'month';
 
 const favoriteFilterLabels: Record<FavoritePanelFilter, string> = {
-  all: '全部',
-  rooms: '房间',
   messages: '文字',
   images: '图片',
   videos: '视频',
   audio: '音频',
-  files: '文件',
 };
+const favoritePanelFilters: FavoritePanelFilter[] = ['messages', 'images', 'videos', 'audio'];
 
 const favoriteDateLabels: Record<FavoriteDateFilter, string> = {
   all: '全部时间',
   today: '今天',
-  week: '7 ',
-  month: '30 ',
+  week: '7天',
+  month: '30天',
 };
 
 const getFavoriteMessageKind = (message: ChatMessage): FavoritePanelFilter => {
@@ -3588,15 +4664,15 @@ const getFavoriteMessageKind = (message: ChatMessage): FavoritePanelFilter => {
   if (message.attachment.kind === 'image') return 'images';
   if (message.attachment.kind === 'video') return 'videos';
   if (message.attachment.kind === 'audio') return 'audio';
-  return 'files';
+  return 'messages';
 };
 
 const getFavoriteMessageKindLabel = (message: ChatMessage): string => {
-  if (!message.attachment) return '文本';
+  if (!message.attachment) return '文字';
   if (message.attachment.kind === 'image') return '图片';
   if (message.attachment.kind === 'video') return '视频';
   if (message.attachment.kind === 'audio') return '音频';
-  return '文件';
+  return '附件';
 };
 
 const matchesFavoriteDate = (timestamp: number, filter: FavoriteDateFilter): boolean => {
@@ -3611,16 +4687,12 @@ const matchesFavoriteDate = (timestamp: number, filter: FavoriteDateFilter): boo
 
 const getFavoriteFilterIcon = (filter: FavoritePanelFilter): ReactNode => {
   switch (filter) {
-    case 'rooms':
-      return <FolderOpen size={14} />;
     case 'images':
       return <ImageIcon size={14} />;
     case 'videos':
       return <Play size={14} />;
     case 'audio':
       return <Volume2 size={14} />;
-    case 'files':
-      return <FileUp size={14} />;
     case 'messages':
       return <MessageCircle size={14} />;
     default:
@@ -3657,19 +4729,23 @@ function FavoriteAttachmentThumb({
           src={previewSrc}
           fallbackSrc={fallbackSrc}
           accessToken={accessToken}
-          encryptedFile={attachment.previewEncryptedFile ?? attachment.encryptedFile}
+          encryptedFile={getPreviewEncryptedFile(attachment)}
           mimeType={attachment.previewMimeType ?? attachment.mimeType}
           alt={attachment.name ?? message.body}
         />
       ) : attachment.kind === 'video' && previewSrc ? (
         <>
-          <AuthenticatedImage
-            src={previewSrc}
-            fallbackSrc={fallbackSrc}
+          <CompactVideoPreview
+            previewSrc={previewSrc}
+            previewFallbackSrc={fallbackSrc}
             accessToken={accessToken}
-            encryptedFile={attachment.previewEncryptedFile ?? attachment.encryptedFile}
-            mimeType={attachment.previewMimeType ?? attachment.mimeType}
-            alt={attachment.name ?? message.body}
+            previewEncryptedFile={getPreviewEncryptedFile(attachment)}
+            previewMimeType={attachment.previewMimeType ?? attachment.mimeType}
+            src={attachment.authDownloadUrl ?? attachment.downloadUrl ?? attachment.authUrl ?? attachment.url}
+            fallbackSrc={attachment.downloadUrl ?? attachment.url}
+            encryptedFile={attachment.encryptedFile}
+            mimeType={attachment.mimeType}
+            label="视频封面暂不可预览"
           />
           <span>
             <Play size={16} />
@@ -3712,19 +4788,14 @@ function FavoritesPanel({
   onCreate: () => void;
   onExplore: () => void;
 }) {
-  const [filter, setFilter] = useState<FavoritePanelFilter>('all');
+  const [filter, setFilter] = useState<FavoritePanelFilter>('messages');
   const [dateFilter, setDateFilter] = useState<FavoriteDateFilter>('all');
   const [query, setQuery] = useState('');
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const normalizedQuery = query.trim().toLowerCase();
-  const imageMessages = messages.filter(({ message }) => getFavoriteMessageKind(message) === 'images');
-  const videoMessages = messages.filter(({ message }) => getFavoriteMessageKind(message) === 'videos');
-  const audioMessages = messages.filter(({ message }) => getFavoriteMessageKind(message) === 'audio');
-  const fileMessages = messages.filter(({ message }) => getFavoriteMessageKind(message) === 'files');
+  const attachmentCount = messages.filter(({ message }) => Boolean(message.attachment)).length;
   const totalUnread = rooms.reduce((count, room) => count + room.unread, 0);
   const favoriteCount = messages.length;
-  const showRooms = filter === 'all' || filter === 'rooms';
-  const showMessages = filter !== 'rooms';
   const isLocalFavoriteMessage = (message: ChatMessage): boolean =>
     favoriteMessageIds[message.roomId]?.includes(message.id) ?? false;
   const visibleRooms = rooms.filter((room) => {
@@ -3733,7 +4804,7 @@ function FavoritesPanel({
     return `${room.name} ${room.topic ?? ''} ${room.canonicalAlias ?? ''}`.toLowerCase().includes(normalizedQuery);
   });
   const visibleMessages = messages.filter(({ room, message }) => {
-    if (filter !== 'all' && filter !== getFavoriteMessageKind(message)) return false;
+    if (filter !== getFavoriteMessageKind(message)) return false;
     if (!matchesFavoriteDate(message.timestamp, dateFilter)) return false;
     if (!normalizedQuery) return true;
     return `${room.name} ${message.senderName ?? message.sender ?? ''} ${message.body} ${message.attachment?.name ?? ''}`
@@ -3769,7 +4840,7 @@ function FavoritesPanel({
         <div>
           <p className="eyebrow">Favorites</p>
           <h2>收藏</h2>
-          <span>房间、消息和附件集中在这</span>
+          <span>房间、文字、图片、视频和音频集中在这里</span>
         </div>
         <div className="favorites-stats">
           <span>
@@ -3785,8 +4856,8 @@ function FavoritesPanel({
             <small>未读</small>
           </span>
           <span>
-            <strong>{imageMessages.length + videoMessages.length + audioMessages.length + fileMessages.length}</strong>
-            <small>闄勪欢</small>
+            <strong>{attachmentCount}</strong>
+            <small>附件</small>
           </span>
         </div>
       </header>
@@ -3816,7 +4887,7 @@ function FavoritesPanel({
       </section>
 
       <div className="favorite-tabs">
-        {(['all', 'rooms', 'messages', 'images', 'videos', 'audio', 'files'] as FavoritePanelFilter[]).map((item) => (
+        {favoritePanelFilters.map((item) => (
           <button
             key={item}
             type="button"
@@ -3831,7 +4902,7 @@ function FavoritesPanel({
 
       {selectedIds.length > 0 && (
         <div className="favorites-selection-bar">
-          <span>{selectedIds.length} 条已</span>
+          <span>{selectedIds.length} 条已选择</span>
           <button type="button" onClick={clearSelected}>取消</button>
           <button className="danger" type="button" onClick={removeSelected}>移出收藏</button>
         </div>
@@ -3842,7 +4913,7 @@ function FavoritesPanel({
           <section className="favorites-empty-state">
             <Star size={24} />
             <strong>还没有收藏</strong>
-            <span>你收藏的房间、消息、图片、语音和文件会按类型归档</span>
+            <span>你收藏的房间、文字、图片、视频和音频会按类型归档</span>
             <div>
               <button type="button" onClick={onCreate}>
                 <Plus size={16} />
@@ -3856,7 +4927,7 @@ function FavoritesPanel({
           </section>
         )}
 
-        {hasFavorites && showRooms && (visibleRooms.length > 0 || filter === 'rooms') && (
+        {rooms.length > 0 && (
           <section className="favorite-section">
             <div className="section-title">
               <span>收藏房间</span>
@@ -3895,7 +4966,7 @@ function FavoritesPanel({
           </section>
         )}
 
-        {hasFavorites && showMessages && (visibleMessages.length > 0 || filter !== 'all') && (
+        {messages.length > 0 && (
           <section className="favorite-section">
             <div className="section-title">
               <span>收藏消息</span>
@@ -4121,8 +5192,13 @@ function EmojiTray({
                     >
                       <AuthenticatedImage
                         src={item.authUrl ?? item.url}
-                        fallbackSrc={item.url}
+                        fallbackSrc={item.downloadUrl ?? item.url}
                         accessToken={accessToken}
+                        deferLoading
+                        retrySrcs={[
+                          item.authDownloadUrl ?? item.downloadUrl,
+                          ...buildMatrixMediaRetrySrcs(item.authUrl, item.url),
+                        ]}
                         alt={item.body || item.shortcode}
                       />
                     </button>
@@ -4192,7 +5268,7 @@ function EnhancedEmojiTray({
         id: packId,
         name: items[0]?.packName ?? packId,
         kind: 'pack' as const,
-        cover: items[0],
+        cover: items.find((item) => item.authUrl || item.url || item.authDownloadUrl || item.downloadUrl) ?? items[0],
         items: items.slice(0, usage === 'emoji' ? 180 : 120),
       }));
     },
@@ -4313,8 +5389,13 @@ function EnhancedEmojiTray({
           >
             <AuthenticatedImage
               src={item.authUrl ?? item.url}
-              fallbackSrc={item.url}
+              fallbackSrc={item.downloadUrl ?? item.url}
               accessToken={accessToken}
+              deferLoading
+              retrySrcs={[
+                item.authDownloadUrl ?? item.downloadUrl,
+                ...buildMatrixMediaRetrySrcs(item.authUrl, item.url),
+              ]}
               alt={item.body || item.shortcode}
             />
           </button>
@@ -4385,17 +5466,23 @@ function EnhancedEmojiTray({
                 className={active ? 'emoji-collection-button active' : 'emoji-collection-button'}
                 onClick={() => handlePickCollection(collection.id)}
               >
-                {collection.kind === 'pack' && collection.cover ? (
-                  <AuthenticatedImage
-                    className="emoji-collection-thumb"
-                    src={collection.cover.authUrl ?? collection.cover.url}
-                    fallbackSrc={collection.cover.url}
-                    accessToken={accessToken}
-                    alt={collection.name}
-                  />
-                ) : (
-                  <span className="emoji-collection-label">{collection.name.slice(0, 1)}</span>
-                )}
+                <span className="emoji-collection-thumb-shell" aria-hidden="true">
+                  {collection.kind === 'pack' && collection.cover ? (
+                    <AuthenticatedImage
+                      className="emoji-collection-thumb"
+                      src={collection.cover.authUrl ?? collection.cover.url}
+                      fallbackSrc={collection.cover.downloadUrl ?? collection.cover.url}
+                      accessToken={accessToken}
+                      retrySrcs={[
+                        collection.cover.authDownloadUrl ?? collection.cover.downloadUrl,
+                        ...buildMatrixMediaRetrySrcs(collection.cover.authUrl, collection.cover.url),
+                      ]}
+                      alt={collection.name}
+                    />
+                  ) : (
+                    <span className="emoji-collection-label">{collection.name.slice(0, 1)}</span>
+                  )}
+                </span>
                 <span>{collection.name}</span>
               </button>
             );
@@ -4423,9 +5510,9 @@ function EnhancedEmojiTray({
   );
 }
 
-function MediaFallback({ label }: { label: string }) {
+function MediaFallback({ label, className }: { label: string; className?: string }) {
   return (
-    <span className="message-media-fallback">
+    <span className={className ? `message-media-fallback ${className}` : 'message-media-fallback'}>
       <ImageIcon size={20} />
       <small>{label}</small>
     </span>
@@ -4440,6 +5527,8 @@ function AuthenticatedImage({
   mimeType,
   alt,
   className,
+  retrySrcs = [],
+  deferLoading = false,
 }: {
   src?: string;
   fallbackSrc?: string;
@@ -4448,29 +5537,59 @@ function AuthenticatedImage({
   mimeType?: string;
   alt: string;
   className?: string;
+  retrySrcs?: Array<string | MediaCandidate | undefined>;
+  deferLoading?: boolean;
 }) {
-  const mediaState = useAuthenticatedMediaState(src, accessToken, fallbackSrc, encryptedFile, mimeType);
+  const mediaCandidates = useMemo(
+    () =>
+      dedupeMediaCandidates([
+        { src, fallbackSrc, encryptedFile, mimeType },
+        ...retrySrcs.flatMap((retrySrc) => {
+          if (!retrySrc) return [];
+          if (typeof retrySrc === 'string') {
+            return [{ src: retrySrc, mimeType }];
+          }
+          return [
+            {
+              ...retrySrc,
+              mimeType: retrySrc.mimeType ?? mimeType,
+            },
+          ];
+        }),
+      ]),
+    [encryptedFile, fallbackSrc, mimeType, retrySrcs, src]
+  );
+  const mediaSignature = useMemo(
+    () => mediaCandidates.map((candidate) => createMediaCandidateKey(candidate)).join('||'),
+    [mediaCandidates]
+  );
+  const deferredMedia = useDeferredMediaActivation(deferLoading, mediaSignature);
+  const mediaState = useResolvedMediaCandidateList(
+    deferredMedia.active ? mediaCandidates : [],
+    accessToken
+  );
   const resolvedSrc = mediaState.resolvedSrc;
-  const [failed, setFailed] = useState(false);
+  const loading = deferLoading && !deferredMedia.active ? true : mediaState.loading;
 
-  useEffect(() => {
-    setFailed(false);
-  }, [resolvedSrc]);
-
-  if (!resolvedSrc) {
-    return <MediaFallback label={mediaState.loading ? '图片加载中...' : '图片暂不可预览'} />;
-  }
-
-  if (failed) return <MediaFallback label="图片暂不可预览" />;
-
-  return (
+  const content = !resolvedSrc ? (
+    <MediaFallback className={className} label={loading ? '图片加载中...' : '图片暂不可预览'} />
+  ) : (
     <img
       className={className}
       src={resolvedSrc}
       alt={alt}
-      onLoad={() => setFailed(false)}
-      onError={() => setFailed(true)}
+      onError={mediaState.onRenderedError}
     />
+  );
+
+  if (!deferLoading) {
+    return content;
+  }
+
+  return (
+    <span ref={deferredMedia.hostRef} className="authenticated-media-shell">
+      {content}
+    </span>
   );
 }
 
@@ -4552,9 +5671,29 @@ function ProgressiveImagePreview({
     previewMimeType
   );
   const fullState = useAuthenticatedMediaState(src, accessToken, fallbackSrc, encryptedFile, mimeType);
+  const previewEncryptedSignature = previewEncryptedFile
+    ? `${previewEncryptedFile.url}|${previewEncryptedFile.iv}|${previewEncryptedFile.hashes?.sha256 ?? ''}`
+    : '';
+  const fullEncryptedSignature = encryptedFile
+    ? `${encryptedFile.url}|${encryptedFile.iv}|${encryptedFile.hashes?.sha256 ?? ''}`
+    : '';
+  const previewAndFullSameAsset =
+    (previewSrc ?? '') === (src ?? '') &&
+    (previewFallbackSrc ?? '') === (fallbackSrc ?? '') &&
+    previewEncryptedSignature === fullEncryptedSignature &&
+    (previewMimeType ?? '') === (mimeType ?? '');
   const [fullLoaded, setFullLoaded] = useState(false);
   const [fullFailed, setFullFailed] = useState(false);
   const [previewFailed, setPreviewFailed] = useState(false);
+
+  useEffect(() => {
+    setPreviewFailed(false);
+  }, [previewState.resolvedSrc]);
+
+  useEffect(() => {
+    setFullLoaded(false);
+    setFullFailed(false);
+  }, [fullState.resolvedSrc]);
 
   useEffect(() => {
     setFullLoaded(false);
@@ -4563,7 +5702,7 @@ function ProgressiveImagePreview({
   }, [previewSrc, src]);
 
   const canShowPreview = Boolean(previewState.resolvedSrc) && !previewFailed;
-  const canShowFull = Boolean(fullState.resolvedSrc) && !fullFailed;
+  const canShowFull = !previewAndFullSameAsset && Boolean(fullState.resolvedSrc) && !fullFailed;
   const visibleSrc = canShowFull ? fullState.resolvedSrc : canShowPreview ? previewState.resolvedSrc : undefined;
   if (!visibleSrc) {
     return (
@@ -4573,10 +5712,12 @@ function ProgressiveImagePreview({
     );
   }
 
-  const overlayLabel = fullFailed
+  const overlayLabel = previewAndFullSameAsset
+    ? undefined
+    : fullFailed
     ? '原图加载失败，已显示预览'
     : fullState.loading || !fullLoaded
-      ? '正在加载原图'
+      ? '原图正在加载中'
       : undefined;
 
   return (
@@ -4645,6 +5786,15 @@ function ProgressiveVideoPreview({
   const [videoFailed, setVideoFailed] = useState(false);
 
   useEffect(() => {
+    setVideoFailed(false);
+  }, [posterState.resolvedSrc]);
+
+  useEffect(() => {
+    setVideoReady(false);
+    setVideoFailed(false);
+  }, [videoState.resolvedSrc]);
+
+  useEffect(() => {
     setVideoReady(false);
     setVideoFailed(false);
   }, [previewSrc, src]);
@@ -4687,6 +5837,115 @@ function ProgressiveVideoPreview({
         </div>
       )}
     </div>
+  );
+}
+
+function CompactVideoPreview({
+  previewSrc,
+  previewFallbackSrc,
+  previewEncryptedFile,
+  previewMimeType,
+  src,
+  fallbackSrc,
+  accessToken,
+  encryptedFile,
+  mimeType,
+  className,
+  label = '视频暂不可预览',
+}: {
+  previewSrc?: string;
+  previewFallbackSrc?: string;
+  previewEncryptedFile?: EncryptedMediaFile;
+  previewMimeType?: string;
+  src?: string;
+  fallbackSrc?: string;
+  accessToken?: string;
+  encryptedFile?: EncryptedMediaFile;
+  mimeType?: string;
+  className?: string;
+  label?: string;
+}) {
+  const previewEncryptedSignature = previewEncryptedFile
+    ? `${previewEncryptedFile.url}|${previewEncryptedFile.iv}|${previewEncryptedFile.hashes?.sha256 ?? ''}`
+    : '';
+  const videoEncryptedSignature = encryptedFile
+    ? `${encryptedFile.url}|${encryptedFile.iv}|${encryptedFile.hashes?.sha256 ?? ''}`
+    : '';
+  const previewUsesVideoAsset =
+    (previewSrc ?? '') === (src ?? '') &&
+    (previewFallbackSrc ?? '') === (fallbackSrc ?? '') &&
+    previewEncryptedSignature === videoEncryptedSignature;
+  const hasPosterImageSource = Boolean(previewSrc) && (!previewMimeType || previewMimeType.startsWith('image/')) && !previewUsesVideoAsset;
+  const posterState = useAuthenticatedMediaState(
+    hasPosterImageSource ? previewSrc : undefined,
+    accessToken,
+    hasPosterImageSource ? previewFallbackSrc : undefined,
+    hasPosterImageSource ? previewEncryptedFile : undefined,
+    hasPosterImageSource ? previewMimeType : undefined
+  );
+  const videoState = useAuthenticatedMediaState(
+    hasPosterImageSource ? undefined : src ?? previewSrc,
+    accessToken,
+    hasPosterImageSource ? undefined : fallbackSrc ?? previewFallbackSrc,
+    hasPosterImageSource ? undefined : encryptedFile ?? previewEncryptedFile,
+    hasPosterImageSource ? undefined : mimeType ?? previewMimeType
+  );
+  const [videoReady, setVideoReady] = useState(false);
+  const [videoFailed, setVideoFailed] = useState(false);
+  const [posterRenderFailed, setPosterRenderFailed] = useState(false);
+  const shouldUsePoster = hasPosterImageSource && !posterRenderFailed;
+  const videoFallbackState = useAuthenticatedMediaState(
+    shouldUsePoster ? undefined : src ?? previewSrc,
+    accessToken,
+    shouldUsePoster ? undefined : fallbackSrc ?? previewFallbackSrc,
+    shouldUsePoster ? undefined : encryptedFile ?? previewEncryptedFile,
+    shouldUsePoster ? undefined : mimeType ?? previewMimeType
+  );
+
+  useEffect(() => {
+    setVideoReady(false);
+    setVideoFailed(false);
+    setPosterRenderFailed(false);
+  }, [videoState.resolvedSrc, posterState.resolvedSrc]);
+
+  if (shouldUsePoster && posterState.resolvedSrc) {
+    return (
+      <img
+        className={className}
+        src={posterState.resolvedSrc}
+        alt=""
+        onError={() => setPosterRenderFailed(true)}
+      />
+    );
+  }
+
+  if (!videoFallbackState.resolvedSrc || videoFailed) {
+    return (
+      <MediaFallback
+        className={className}
+        label={videoFallbackState.loading ? '视频加载中...' : label}
+      />
+    );
+  }
+
+  return (
+    <video
+      className={className}
+      src={videoFallbackState.resolvedSrc}
+      muted
+      playsInline
+      preload="metadata"
+      onLoadedData={() => {
+        setVideoReady(true);
+        setVideoFailed(false);
+      }}
+      onCanPlay={() => {
+        setVideoReady(true);
+        setVideoFailed(false);
+      }}
+      onError={() => setVideoFailed(true)}
+      style={{ opacity: videoReady ? 1 : 0.08 }}
+    />
   );
 }
 
@@ -4854,7 +6113,7 @@ function AudioPlayer({
           <label className="audio-volume-control">
             <button
               type="button"
-              aria-label={muted ? '取消静音' : '闈欓煶'}
+              aria-label={muted ? '取消静音' : '静音'}
               onClick={() => setMuted((value) => !value)}
             >
               {muted || volume === 0 ? <VolumeX size={14} /> : <Volume2 size={14} />}
@@ -4968,7 +6227,7 @@ function SecuritySheet({
   const busy = Boolean(progress);
   const statusLabel = (value?: boolean) => {
     if (value === undefined) return '未知';
-    return value ? '正常' : '需要处';
+    return value ? '正常' : '需要处理';
   };
 
   return (
@@ -4986,16 +6245,16 @@ function SecuritySheet({
 
         <div className="security-status-grid">
           <span>
-            <small>鍔犲瘑寮曟搸</small>
+            <small>加密引擎</small>
             <strong>{status.cryptoReady ? '可用' : '未启用'}</strong>
           </span>
           <span>
-            <small>瀹夊叏瀛樺偍</small>
+            <small>安全存储</small>
             <strong>{statusLabel(status.secretStorageReady)}</strong>
           </span>
           <span>
-            <small>服务端备</small>
-            <strong>{status.backupVersion ?? status.activeBackupVersion ?? '未发'}</strong>
+            <small>服务端备份</small>
+            <strong>{status.backupVersion ?? status.activeBackupVersion ?? '未配置'}</strong>
           </span>
           <span>
             <small>备份信任</small>
@@ -5029,9 +6288,11 @@ function SecuritySheet({
             disabled={!status.cryptoReady || busy}
           >
             <Shield size={17} />
-            从安全存储恢复          </button>
+            从安全存储恢复
+          </button>
           <label>
-            恢复密钥或备份口令            <input
+            恢复密钥或备份口令
+            <input
               type="password"
               value={passphrase}
               placeholder="输入恢复密钥 / 口令"
@@ -5049,6 +6310,781 @@ function SecuritySheet({
             <KeyRound size={17} />
             使用恢复密钥恢复
           </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function EmojiUsageToggleGroup({
+  value,
+  disabled = false,
+  onChange,
+}: {
+  value: CustomEmojiUsage[];
+  disabled?: boolean;
+  onChange: (nextValue: CustomEmojiUsage[]) => void;
+}) {
+  const normalizedValue = normalizeCustomEmojiUsage(value);
+
+  return (
+    <div className="emoji-usage-toggle" aria-label="分类用途">
+      {customEmojiUsageOrder.map((usage) => {
+        const active = normalizedValue.includes(usage);
+        return (
+          <button
+            key={usage}
+            type="button"
+            className={active ? 'active' : ''}
+            disabled={disabled}
+            onClick={() => onChange(toggleCustomEmojiUsageValue(normalizedValue, usage))}
+          >
+            {customEmojiUsageLabels[usage]}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+function EmojiManagerSheet({
+  client,
+  mediaAccessToken,
+  onClose,
+  onRefresh,
+  onSuccess,
+  onError,
+}: {
+  client: MatrixClient;
+  mediaAccessToken?: string;
+  onClose: () => void;
+  onRefresh: () => void;
+  onSuccess: (message: string) => void;
+  onError: (message?: string) => void;
+}) {
+  const [packs, setPacks] = useState<CustomEmojiPack[]>(() => getPersonalCustomEmojiPacks(client));
+  const [selectedPackId, setSelectedPackId] = useState<string>(
+    () => getPersonalCustomEmojiPacks(client)[0]?.id ?? 'user'
+  );
+  const [detailPackId, setDetailPackId] = useState<string>();
+  const [createName, setCreateName] = useState('');
+  const [createUsage, setCreateUsage] = useState<CustomEmojiUsage[]>(['emoticon', 'sticker']);
+  const [packNameDraft, setPackNameDraft] = useState('');
+  const [packUsageDraft, setPackUsageDraft] = useState<CustomEmojiUsage[]>(['emoticon', 'sticker']);
+  const [query, setQuery] = useState('');
+  const [selectedShortcodes, setSelectedShortcodes] = useState<string[]>([]);
+  const [editingItemShortcode, setEditingItemShortcode] = useState<string>();
+  const [itemShortcodeDraft, setItemShortcodeDraft] = useState('');
+  const [itemBodyDraft, setItemBodyDraft] = useState('');
+  const [moveTargetId, setMoveTargetId] = useState<string>();
+  const [submitting, setSubmitting] = useState(false);
+  const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string }>();
+  const singleUploadInputRef = useRef<HTMLInputElement | null>(null);
+  const batchUploadInputRef = useRef<HTMLInputElement | null>(null);
+  const itemShortcodeInputRef = useRef<HTMLInputElement | null>(null);
+
+  const reloadPacks = useCallback(() => {
+    const nextPacks = getPersonalCustomEmojiPacks(client);
+    setPacks(nextPacks);
+    setSelectedPackId((current) =>
+      nextPacks.some((pack) => pack.id === current) ? current : (nextPacks[0]?.id ?? 'user')
+    );
+    setDetailPackId((current) => (current && nextPacks.some((pack) => pack.id === current) ? current : undefined));
+    return nextPacks;
+  }, [client]);
+
+  useEffect(() => {
+    reloadPacks();
+  }, [reloadPacks]);
+
+  const selectedPack = useMemo(
+    () => packs.find((pack) => pack.id === selectedPackId) ?? packs[0],
+    [packs, selectedPackId]
+  );
+  const detailPack = useMemo(
+    () => (detailPackId ? packs.find((pack) => pack.id === detailPackId) : undefined),
+    [detailPackId, packs]
+  );
+
+  useEffect(() => {
+    if (!selectedPack) return;
+    setPackNameDraft(selectedPack.name);
+    setPackUsageDraft(normalizeCustomEmojiUsage(selectedPack.usage));
+    setQuery('');
+    setSelectedShortcodes([]);
+    setEditingItemShortcode(undefined);
+    setItemShortcodeDraft('');
+    setItemBodyDraft('');
+  }, [selectedPack?.id]);
+
+  const filteredItems = useMemo(() => {
+    if (!selectedPack) return [];
+    const normalizedQuery = query.trim().toLowerCase();
+    if (!normalizedQuery) return selectedPack.items;
+    return selectedPack.items.filter((item) =>
+      `${item.shortcode} ${item.body} ${item.packName}`.toLowerCase().includes(normalizedQuery)
+    );
+  }, [query, selectedPack]);
+
+  const availableMoveTargets = useMemo(
+    () => packs.filter((pack) => pack.id !== selectedPack?.id),
+    [packs, selectedPack?.id]
+  );
+  const editingItem = useMemo(
+    () => selectedPack?.items.find((item) => item.shortcode === editingItemShortcode),
+    [editingItemShortcode, selectedPack]
+  );
+
+  useEffect(() => {
+    setMoveTargetId((current) =>
+      current && availableMoveTargets.some((pack) => pack.id === current)
+        ? current
+        : availableMoveTargets[0]?.id
+    );
+  }, [availableMoveTargets]);
+
+  const packMetaDirty = Boolean(
+    selectedPack &&
+      (packNameDraft.trim() !== selectedPack.name ||
+        normalizeCustomEmojiUsage(packUsageDraft).join('|') !==
+          normalizeCustomEmojiUsage(selectedPack.usage).join('|'))
+  );
+
+  const orderedCustomPackIds = packs.filter((pack) => pack.orderable).map((pack) => pack.id);
+  const itemMetaDirty = Boolean(
+    editingItem &&
+      (itemShortcodeDraft.trim() !== editingItem.shortcode ||
+        itemBodyDraft.trim() !== (editingItem.body || editingItem.shortcode))
+  );
+
+  useEffect(() => {
+    if (!editingItemShortcode) return;
+    window.requestAnimationFrame(() => {
+      itemShortcodeInputRef.current?.focus();
+      itemShortcodeInputRef.current?.select();
+    });
+  }, [editingItemShortcode]);
+
+  async function runMutation<T>(
+    action: () => Promise<T>,
+    getSuccessText: (result: T) => string
+  ): Promise<T | undefined> {
+    if (submitting) return undefined;
+    setSubmitting(true);
+    setMessage(undefined);
+    onError(undefined);
+
+    try {
+      const result = await action();
+      await Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
+      onRefresh();
+      reloadPacks();
+      const successText = getSuccessText(result);
+      setMessage({ type: 'success', text: successText });
+      onSuccess(successText);
+      return result;
+    } catch (err) {
+      const errorText = err instanceof Error ? err.message : String(err);
+      setMessage({ type: 'error', text: errorText });
+      onError(errorText);
+      return undefined;
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const handleCreatePack = async (evt: FormEvent<HTMLFormElement>) => {
+    evt.preventDefault();
+    const nextPackId = await runMutation(
+      () => createCustomEmojiPack(client, createName, createUsage),
+      () => '分类已创建'
+    );
+    if (!nextPackId) return;
+    setCreateName('');
+    setCreateUsage(['emoticon', 'sticker']);
+    setSelectedPackId(nextPackId);
+    setDetailPackId(nextPackId);
+  };
+
+  const handleSavePackMeta = async () => {
+    if (!selectedPack || !packMetaDirty) return;
+    await runMutation(
+      () =>
+        updateCustomEmojiPack(client, selectedPack.id, {
+          name: packNameDraft,
+          usage: packUsageDraft,
+        }),
+      () => '分类设置已保存'
+    );
+  };
+
+  const handleReorderPack = async (packId: string, direction: 'up' | 'down') => {
+    if (submitting) return;
+
+    const previousPacks = packs;
+    const nextPacks = reorderOrderableEmojiPacks(packs, packId, direction);
+    if (nextPacks === packs) return;
+
+    setSubmitting(true);
+    setMessage(undefined);
+    onError(undefined);
+    setPacks(nextPacks);
+
+    try {
+      await reorderCustomEmojiPack(client, packId, direction);
+      await Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
+      onRefresh();
+      reloadPacks();
+      const successText = direction === 'up' ? '分类已上移' : '分类已下移';
+      setMessage({ type: 'success', text: successText });
+      onSuccess(successText);
+    } catch (err) {
+      setPacks(previousPacks);
+      const errorText = err instanceof Error ? err.message : String(err);
+      setMessage({ type: 'error', text: errorText });
+      onError(errorText);
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleDeletePack = async (pack: CustomEmojiPack) => {
+    if (!pack.deletable) return;
+    if (!window.confirm(`确定删除分类“${pack.name}”吗？里面的内容会一起删除。`)) return;
+    await runMutation(() => deleteCustomEmojiPack(client, pack.id), () => '分类已删除');
+  };
+
+  const handleUploadFiles = async (files: File[]) => {
+    if (!selectedPack || files.length === 0) return;
+    await runMutation(
+      () => uploadCustomEmojiPackFiles(client, selectedPack.id, files),
+      (count) => `已上传 ${count} 张图片`
+    );
+  };
+
+  const handleUploadInputChange = (evt: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(evt.target.files ?? []);
+    evt.target.value = '';
+    if (files.length === 0) return;
+    void handleUploadFiles(files);
+  };
+
+  const handleDeleteItems = async (shortcodes: string[]) => {
+    if (!selectedPack || shortcodes.length === 0) return;
+    const deletingSingle = shortcodes.length === 1;
+    const confirmText = deletingSingle
+      ? `确定删除“${shortcodes[0]}”吗？`
+      : `确定删除已选择的 ${shortcodes.length} 个表情/贴纸吗？`;
+    if (!window.confirm(confirmText)) return;
+
+    const deletedCount = await runMutation(
+      () => deleteCustomEmojiPackItems(client, selectedPack.id, shortcodes),
+      (count) => `已删除 ${count} 个内容`
+    );
+    if (!deletedCount) return;
+
+    setSelectedShortcodes((current) => current.filter((shortcode) => !shortcodes.includes(shortcode)));
+    if (editingItemShortcode && shortcodes.includes(editingItemShortcode)) {
+      setEditingItemShortcode(undefined);
+      setItemShortcodeDraft('');
+      setItemBodyDraft('');
+    }
+  };
+
+  const handleMoveSelection = async () => {
+    if (!selectedPack || !moveTargetId || selectedShortcodes.length === 0) return;
+    const movedCount = await runMutation(
+      () => moveCustomEmojiPackItems(client, selectedPack.id, moveTargetId, selectedShortcodes),
+      (count) => `已移动 ${count} 个内容`
+    );
+    if (!movedCount) return;
+    setSelectedShortcodes([]);
+  };
+
+  const startEditingItem = (item: CustomEmojiItem) => {
+    setEditingItemShortcode(item.shortcode);
+    setItemShortcodeDraft(item.shortcode);
+    setItemBodyDraft(item.body || item.shortcode);
+  };
+
+  const cancelEditingItem = () => {
+    setEditingItemShortcode(undefined);
+    setItemShortcodeDraft('');
+    setItemBodyDraft('');
+  };
+
+  const handleSaveItemMeta = async () => {
+    if (!selectedPack || !editingItem || !itemMetaDirty) return;
+
+    const originalShortcode = editingItem.shortcode;
+    const nextShortcode = await runMutation(
+      () =>
+        updateCustomEmojiPackItem(client, selectedPack.id, originalShortcode, {
+          shortcode: itemShortcodeDraft,
+          body: itemBodyDraft,
+        }),
+      () => '表情设置已保存'
+    );
+    if (!nextShortcode) return;
+
+    setEditingItemShortcode(nextShortcode);
+    setItemShortcodeDraft(nextShortcode);
+    setItemBodyDraft((current) => current.trim() || nextShortcode);
+    setSelectedShortcodes((current) =>
+      current.map((shortcode) => (shortcode === originalShortcode ? nextShortcode : shortcode))
+    );
+  };
+
+  const toggleSelectedShortcode = (shortcode: string) => {
+    setSelectedShortcodes((current) =>
+      current.includes(shortcode)
+        ? current.filter((item) => item !== shortcode)
+        : current.concat(shortcode)
+    );
+  };
+
+  return (
+    <div className="sheet-backdrop">
+      <section className="sheet emoji-manager-sheet">
+        <header className="sheet-header">
+          <div>
+            <p className="eyebrow">Emoji</p>
+            <h2>表情与贴纸管理</h2>
+            <small>这里管理个人分类；房间共享表情仍会继续显示，但暂不在这里编辑。</small>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">
+            <X size={20} />
+          </button>
+        </header>
+
+        <section className="emoji-manager-summary">
+          <span>
+            <SmilePlus size={18} />
+            <strong>{packs.length}</strong>
+            <small>个人分类</small>
+          </span>
+          <span>
+            <ImageIcon size={18} />
+            <strong>{packs.reduce((count, pack) => count + pack.items.length, 0)}</strong>
+            <small>可管理内容</small>
+          </span>
+        </section>
+
+        <div className="emoji-manager-scroll">
+          {!detailPack ? (
+            <>
+              {message && (
+                <p className={message.type === 'error' ? 'security-message error' : 'security-message success'}>
+                  {message.text}
+                </p>
+              )}
+
+              <form className="emoji-manager-create" onSubmit={handleCreatePack}>
+                <div className="section-title">
+                  <span>新建分类</span>
+                  <strong>支持表情 / 贴纸</strong>
+                </div>
+                <label className="create-field">
+                  <span>分类名称</span>
+                  <input
+                    value={createName}
+                    placeholder="例如：猫猫、收藏、动态贴纸"
+                    onChange={(evt) => setCreateName(evt.target.value)}
+                  />
+                </label>
+                <label className="create-field">
+                  <span>分类用途</span>
+                  <EmojiUsageToggleGroup value={createUsage} disabled={submitting} onChange={setCreateUsage} />
+                </label>
+                <div className="create-submit-row split">
+                  <button type="button" className="secondary-button" onClick={onClose}>
+                    关闭
+                  </button>
+                  <button type="submit" className="primary-button" disabled={submitting || !createName.trim()}>
+                    <Plus size={17} />
+                    新建分类
+                  </button>
+                </div>
+              </form>
+
+              <section className="emoji-manager-section">
+                <div className="section-title">
+                  <span>分类列表</span>
+                  <strong>点“管理分类”进入详情</strong>
+                </div>
+                <div className="emoji-pack-list">
+                  {packs.map((pack) => {
+                    const customIndex = orderedCustomPackIds.indexOf(pack.id);
+                    const canMoveUp = pack.orderable && customIndex > 0;
+                    const canMoveDown =
+                      pack.orderable && customIndex > -1 && customIndex < orderedCustomPackIds.length - 1;
+
+                    return (
+                      <div key={pack.id} className="emoji-pack-row">
+                        <div className="emoji-pack-main">
+                          <span className="emoji-pack-cover-shell" aria-hidden="true">
+                            {pack.cover ? (
+                              <AuthenticatedImage
+                                className="emoji-pack-cover"
+                                src={pack.cover.authUrl ?? pack.cover.url}
+                                fallbackSrc={pack.cover.downloadUrl ?? pack.cover.url}
+                                accessToken={mediaAccessToken}
+                                retrySrcs={[
+                                  pack.cover.authDownloadUrl ?? pack.cover.downloadUrl,
+                                  ...buildMatrixMediaRetrySrcs(pack.cover.authUrl, pack.cover.url),
+                                ]}
+                                alt={pack.name}
+                              />
+                            ) : (
+                              <span className="emoji-pack-cover fallback">{pack.name.slice(0, 1)}</span>
+                            )}
+                          </span>
+                          <span className="emoji-pack-meta">
+                            <strong>{pack.name}</strong>
+                            <small>
+                              {pack.items.length} 项 · {formatCustomEmojiUsage(pack.usage)}
+                              {pack.isDefault ? ' · 默认' : ''}
+                            </small>
+                          </span>
+                        </div>
+                        <div className="emoji-pack-actions">
+                          <button
+                            type="button"
+                            className="member-action"
+                            disabled={submitting}
+                            onClick={() => {
+                              setSelectedPackId(pack.id);
+                              setDetailPackId(pack.id);
+                            }}
+                          >
+                            管理分类
+                          </button>
+                          {pack.orderable && (
+                            <>
+                              <button
+                                type="button"
+                                className="member-action subtle"
+                                disabled={submitting || !canMoveUp}
+                                onClick={() => void handleReorderPack(pack.id, 'up')}
+                              >
+                                上移
+                              </button>
+                              <button
+                                type="button"
+                                className="member-action subtle"
+                                disabled={submitting || !canMoveDown}
+                                onClick={() => void handleReorderPack(pack.id, 'down')}
+                              >
+                                下移
+                              </button>
+                            </>
+                          )}
+                          {pack.deletable && (
+                            <button
+                              type="button"
+                              className="member-action danger"
+                              disabled={submitting}
+                              onClick={() => void handleDeletePack(pack)}
+                            >
+                              删除
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </section>
+            </>
+          ) : selectedPack ? (
+            <section className="emoji-manager-section emoji-manager-editor">
+              <div className="emoji-manager-detail-header">
+                <button
+                  type="button"
+                  className="member-action subtle emoji-manager-back"
+                  onClick={() => setDetailPackId(undefined)}
+                >
+                  <ChevronLeft size={16} />
+                  返回分类列表
+                </button>
+                <div className="emoji-pack-main">
+                  <span className="emoji-pack-cover-shell" aria-hidden="true">
+                    {selectedPack.cover ? (
+                      <AuthenticatedImage
+                        className="emoji-pack-cover"
+                        src={selectedPack.cover.authUrl ?? selectedPack.cover.url}
+                        fallbackSrc={selectedPack.cover.downloadUrl ?? selectedPack.cover.url}
+                        accessToken={mediaAccessToken}
+                        retrySrcs={[
+                          selectedPack.cover.authDownloadUrl ?? selectedPack.cover.downloadUrl,
+                          ...buildMatrixMediaRetrySrcs(selectedPack.cover.authUrl, selectedPack.cover.url),
+                        ]}
+                        alt={selectedPack.name}
+                      />
+                    ) : (
+                      <span className="emoji-pack-cover fallback">{selectedPack.name.slice(0, 1)}</span>
+                    )}
+                  </span>
+                  <span className="emoji-pack-meta">
+                    <strong>{selectedPack.name}</strong>
+                    <small>{selectedPack.items.length} 项，可在这里改名、上传和转移分类</small>
+                  </span>
+                </div>
+              </div>
+
+              {message && (
+                <p className={message.type === 'error' ? 'security-message error' : 'security-message success'}>
+                  {message.text}
+                </p>
+              )}
+
+              <label className="create-field">
+                <span>分类名称</span>
+                <input value={packNameDraft} onChange={(evt) => setPackNameDraft(evt.target.value)} />
+              </label>
+
+              <label className="create-field">
+                <span>分类用途</span>
+                <EmojiUsageToggleGroup value={packUsageDraft} disabled={submitting} onChange={setPackUsageDraft} />
+              </label>
+
+              <div className="emoji-manager-inline-actions">
+                <button
+                  type="button"
+                  className="primary-button compact"
+                  disabled={submitting || !packMetaDirty}
+                  onClick={() => void handleSavePackMeta()}
+                >
+                  <Check size={16} />
+                  保存分类设置
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button compact"
+                  disabled={submitting}
+                  onClick={() => singleUploadInputRef.current?.click()}
+                >
+                  <FileUp size={16} />
+                  单次上传
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button compact"
+                  disabled={submitting}
+                  onClick={() => batchUploadInputRef.current?.click()}
+                >
+                  <FolderOpen size={16} />
+                  批量上传
+                </button>
+              </div>
+
+              <input
+                ref={singleUploadInputRef}
+                type="file"
+                accept="image/*"
+                hidden
+                onChange={handleUploadInputChange}
+              />
+              <input
+                ref={batchUploadInputRef}
+                type="file"
+                accept="image/*"
+                multiple
+                hidden
+                onChange={handleUploadInputChange}
+              />
+
+              <label className="search-field">
+                <Search size={15} />
+                <input
+                  value={query}
+                  placeholder="搜索短码、名称"
+                  onChange={(evt) => setQuery(evt.target.value)}
+                />
+              </label>
+
+              <div className="emoji-manager-selection-bar">
+                <span>
+                  {selectedShortcodes.length > 0
+                    ? `已选择 ${selectedShortcodes.length} 项`
+                    : '点图片可单选或多选，再移动到其他分类'}
+                </span>
+                <button
+                  type="button"
+                  className="member-action subtle"
+                  disabled={selectedShortcodes.length === 0}
+                  onClick={() => setSelectedShortcodes([])}
+                >
+                  清空选择
+                </button>
+              </div>
+
+              <div className="emoji-manager-move">
+                <select
+                  value={moveTargetId ?? ''}
+                  disabled={submitting || selectedShortcodes.length === 0 || availableMoveTargets.length === 0}
+                  onChange={(evt) => setMoveTargetId(evt.target.value || undefined)}
+                >
+                  {availableMoveTargets.length === 0 ? (
+                    <option value="">没有其他分类可移动</option>
+                  ) : (
+                    availableMoveTargets.map((pack) => (
+                      <option key={pack.id} value={pack.id}>
+                        移动到：{pack.name}
+                      </option>
+                    ))
+                  )}
+                </select>
+                <button
+                  type="button"
+                  className="secondary-button compact"
+                  disabled={submitting || selectedShortcodes.length === 0 || !moveTargetId}
+                  onClick={() => void handleMoveSelection()}
+                >
+                  移动到其他分类
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button compact danger"
+                  disabled={submitting || selectedShortcodes.length === 0}
+                  onClick={() => void handleDeleteItems(selectedShortcodes)}
+                >
+                  <Trash2 size={16} />
+                  删除所选
+                </button>
+              </div>
+
+              {filteredItems.length === 0 ? (
+                <div className="empty-state compact">
+                  <ImageIcon size={24} />
+                  <h3>{selectedPack.items.length === 0 ? '这个分类还没有内容' : '没有匹配到内容'}</h3>
+                  <span>
+                    {selectedPack.items.length === 0
+                      ? '先上传一张图片，就能在输入框里作为表情或贴纸使用。'
+                      : '换个关键词试试，或者清空搜索条件。'}
+                  </span>
+                </div>
+              ) : (
+                <div className="emoji-manager-grid">
+                  {filteredItems.map((item) => {
+                    const selected = selectedShortcodes.includes(item.shortcode);
+                    if (editingItemShortcode === item.shortcode) {
+                      return (
+                        <article key={item.id} className="emoji-manager-item-editor emoji-manager-item-editor-inline">
+                          <div className="section-title">
+                            <span>编辑单个表情</span>
+                            <strong>{item.shortcode}</strong>
+                          </div>
+                          <div className="emoji-manager-item-editor-preview">
+                            <span className="emoji-manager-item-media" aria-hidden="true">
+                              <AuthenticatedImage
+                                src={item.authUrl ?? item.url}
+                                fallbackSrc={item.downloadUrl ?? item.url}
+                                accessToken={mediaAccessToken}
+                                retrySrcs={[
+                                  item.authDownloadUrl ?? item.downloadUrl,
+                                  ...buildMatrixMediaRetrySrcs(item.authUrl, item.url),
+                                ]}
+                                alt={item.body || item.shortcode}
+                              />
+                            </span>
+                            <span>
+                              <strong>{item.body || item.shortcode}</strong>
+                              <small>就在这里直接改，不用再滚到上面</small>
+                            </span>
+                          </div>
+                          <div className="emoji-manager-item-editor-grid">
+                            <label className="create-field">
+                              <span>短码</span>
+                              <input
+                                ref={itemShortcodeInputRef}
+                                value={itemShortcodeDraft}
+                                placeholder="例如：cat-wave"
+                                onChange={(evt) => setItemShortcodeDraft(evt.target.value)}
+                              />
+                            </label>
+                            <label className="create-field">
+                              <span>显示名称</span>
+                              <input
+                                value={itemBodyDraft}
+                                placeholder="例如：招手猫猫"
+                                onChange={(evt) => setItemBodyDraft(evt.target.value)}
+                              />
+                            </label>
+                          </div>
+                          <div className="emoji-manager-inline-actions">
+                            <button
+                              type="button"
+                              className="primary-button compact"
+                              disabled={submitting || !itemMetaDirty || !itemShortcodeDraft.trim()}
+                              onClick={() => void handleSaveItemMeta()}
+                            >
+                              <Check size={16} />
+                              保存单项设置
+                            </button>
+                            <button
+                              type="button"
+                              className="secondary-button compact"
+                              disabled={submitting}
+                              onClick={cancelEditingItem}
+                            >
+                              取消编辑
+                            </button>
+                          </div>
+                        </article>
+                      );
+                    }
+
+                    return (
+                      <article
+                        key={item.id}
+                        className={selected ? 'emoji-manager-item selected' : 'emoji-manager-item'}
+                      >
+                        <button
+                          type="button"
+                          className="emoji-manager-item-select"
+                          onClick={() => toggleSelectedShortcode(item.shortcode)}
+                        >
+                          <span className="emoji-manager-item-media" aria-hidden="true">
+                            <AuthenticatedImage
+                              src={item.authUrl ?? item.url}
+                              fallbackSrc={item.downloadUrl ?? item.url}
+                              accessToken={mediaAccessToken}
+                              retrySrcs={[
+                                item.authDownloadUrl ?? item.downloadUrl,
+                                ...buildMatrixMediaRetrySrcs(item.authUrl, item.url),
+                              ]}
+                              alt={item.body || item.shortcode}
+                            />
+                          </span>
+                          <strong>{item.shortcode}</strong>
+                          <small>{item.body || item.shortcode}</small>
+                        </button>
+                        <button
+                          type="button"
+                          className="emoji-manager-item-edit"
+                          aria-label={`编辑 ${item.shortcode}`}
+                          disabled={submitting}
+                          onClick={() => startEditingItem(item)}
+                        >
+                          <Edit3 size={14} />
+                        </button>
+                        <button
+                          type="button"
+                          className="emoji-manager-item-delete"
+                          aria-label={`删除 ${item.shortcode}`}
+                          disabled={submitting}
+                          onClick={() => void handleDeleteItems([item.shortcode])}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </article>
+                    );
+                  })}
+                </div>
+              )}
+            </section>
+          ) : null}
         </div>
       </section>
     </div>
@@ -5187,7 +7223,11 @@ const messageGestureStopSelector = [
   '.message-select-toggle',
   '.avatar-button',
   '.message-sender-button',
+  '.message-inline-editor',
+  '.message-inline-editor textarea',
+  '.message-inline-editor button',
   '.reply-preview',
+  '.message-rich-text a',
   '.file-chip',
   '.audio-player button',
   '.audio-player input',
@@ -5195,6 +7235,45 @@ const messageGestureStopSelector = [
 
 const shouldIgnoreMessageGesture = (target: EventTarget | null): boolean =>
   target instanceof HTMLElement && Boolean(target.closest(messageGestureStopSelector));
+
+function MessageRichText({
+  body,
+  forwardContent,
+  className = 'message-rich-text',
+  members = [],
+  onOpenMember,
+}: {
+  body: string;
+  forwardContent?: Record<string, unknown>;
+  className?: string;
+  members?: RoomMemberSummary[];
+  onOpenMember?: (member: RoomMemberSummary) => void;
+}) {
+  const html = useMemo(() => getMessageBodyHtml({ body, forwardContent }, members), [body, forwardContent, members]);
+  const handleClick = useCallback(
+    (event: ReactMouseEvent<HTMLDivElement>) => {
+      if (!onOpenMember) return;
+
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+
+      const mentionLink = target.closest('a[data-mention-user-id]');
+      if (!(mentionLink instanceof HTMLAnchorElement)) return;
+
+      const userId = mentionLink.dataset.mentionUserId?.trim();
+      if (!userId) return;
+
+      event.preventDefault();
+      event.stopPropagation();
+
+      const fallbackName = mentionLink.textContent?.trim().replace(/^@/, '') || userId;
+      onOpenMember(members.find((member) => member.id === userId) ?? { id: userId, name: fallbackName });
+    },
+    [members, onOpenMember]
+  );
+
+  return <div className={className} onClick={handleClick} dangerouslySetInnerHTML={{ __html: html }} />;
+}
 
 function MessageBubble({
   message,
@@ -5204,15 +7283,22 @@ function MessageBubble({
   selected,
   forwardable,
   mediaAccessToken,
+  members,
   currentUserProfile,
   readReceiptAvatarCount,
   audioTranscription,
+  editing,
+  editingDraft,
+  savingEdit,
   onToggleSelection,
   onFavorite,
   onReply,
   onOpenReply,
   onInfo,
   onEdit,
+  onEditingDraftChange,
+  onCancelEdit,
+  onSaveEdit,
   onRedact,
   onCopy,
   onCopyLink,
@@ -5221,6 +7307,9 @@ function MessageBubble({
   onPreviewAttachment,
   onTranscribeAudio,
   onOpenUserProfile,
+  onOpenMentionMember,
+  onMentionSender,
+  onOpenReadReceipts,
   onReact,
 }: {
   message: ChatMessage;
@@ -5230,15 +7319,22 @@ function MessageBubble({
   selected: boolean;
   forwardable: boolean;
   mediaAccessToken?: string;
+  members: RoomMemberSummary[];
   currentUserProfile?: OwnProfile;
   readReceiptAvatarCount: number;
   audioTranscription?: AudioTranscriptionState;
+  editing: boolean;
+  editingDraft: string;
+  savingEdit: boolean;
   onToggleSelection: () => void;
   onFavorite: () => void;
   onReply: () => void;
   onOpenReply: (eventId: string) => void;
   onInfo: () => void;
   onEdit: () => void;
+  onEditingDraftChange: (value: string) => void;
+  onCancelEdit: () => void;
+  onSaveEdit: () => void;
   onRedact: () => void;
   onCopy: () => void;
   onCopyLink: () => void;
@@ -5247,6 +7343,9 @@ function MessageBubble({
   onPreviewAttachment: () => void;
   onTranscribeAudio: () => void;
   onOpenUserProfile?: () => void;
+  onOpenMentionMember?: (member: RoomMemberSummary) => void;
+  onMentionSender?: () => void;
+  onOpenReadReceipts: () => void;
   onReact: (key: string) => void;
 }) {
   const [actionsOpen, setActionsOpen] = useState(false);
@@ -5286,23 +7385,51 @@ function MessageBubble({
     ? attachment.authUrl ?? attachment.url ?? attachment.authDownloadUrl ?? attachment.downloadUrl
     : undefined;
   const attachmentPreviewFallbackSrc = attachment
-    ? attachment.url ?? attachment.downloadUrl
+    ? attachment.downloadUrl ?? attachment.url
     : undefined;
+  const attachmentPreviewEncryptedFile = getPreviewEncryptedFile(attachment);
   const attachmentFullSrc = attachment
     ? attachment.authDownloadUrl ?? attachment.downloadUrl ?? attachment.authUrl ?? attachment.url
     : undefined;
   const attachmentFullFallbackSrc = attachment
     ? attachment.downloadUrl ?? attachment.url
     : undefined;
+  const ownReadReceiptSummary = getOwnMessageReadReceiptSummary(message, members);
   const visibleReadReceiptCount = clampReadReceiptAvatarCount(readReceiptAvatarCount);
-  const visibleReadReceipts = message.mine ? message.readReceipts.slice(0, visibleReadReceiptCount) : [];
-  const readReceiptOverflow = Math.max(message.readReceipts.length - visibleReadReceipts.length, 0);
+  const bubbleReadReceipts = message.mine
+    ? message.readReceipts.filter((receipt) => receipt.userId !== message.sender)
+    : message.readReceipts;
+  const visibleReadReceipts = bubbleReadReceipts.slice(0, visibleReadReceiptCount);
+  const readReceiptOverflow = Math.max(bubbleReadReceipts.length - visibleReadReceipts.length, 0);
+  const readReceiptLabel = getReadReceiptStatusText(message, ownReadReceiptSummary);
+  const showInlineReadReceiptText = ownReadReceiptSummary?.totalCount === 1;
+  const showReadReceiptIndicator = bubbleReadReceipts.length > 0 || Boolean(message.mine && ownReadReceiptSummary);
+  const inlineEditTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     if (selectionMode) {
       setActionsOpen(false);
     }
   }, [selectionMode]);
+
+  useEffect(() => {
+    if (!editing) return;
+    setActionsOpen(false);
+    window.requestAnimationFrame(() => {
+      const textarea = inlineEditTextareaRef.current;
+      if (!textarea) return;
+      textarea.focus();
+      const length = textarea.value.length;
+      textarea.setSelectionRange(length, length);
+    });
+  }, [editing]);
+
+  useLayoutEffect(() => {
+    const textarea = inlineEditTextareaRef.current;
+    if (!editing || !textarea) return;
+    textarea.style.height = 'auto';
+    textarea.style.height = `${Math.max(textarea.scrollHeight, 148)}px`;
+  }, [editing, editingDraft]);
 
   useEffect(() => {
     if (!actionsOpen) return;
@@ -5401,6 +7528,19 @@ function MessageBubble({
     setActionsOpen((open) => !open);
   };
 
+  const handleInlineEditorKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') {
+      event.preventDefault();
+      onSaveEdit();
+      return;
+    }
+
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      onCancelEdit();
+    }
+  };
+
   if (message.kind === 'system') {
     return (
       <div className="system-message">
@@ -5412,7 +7552,7 @@ function MessageBubble({
   return (
     <article
       ref={articleRef}
-      className={`${message.mine ? 'message mine' : 'message'}${highlighted ? ' highlighted' : ''}${actionsOpen ? ' actions-open' : ''}${selectionMode ? ' selecting' : ''}${selected ? ' selected' : ''}${!forwardable ? ' not-forwardable' : ''}`}
+      className={`${message.mine ? 'message mine' : 'message'}${highlighted ? ' highlighted' : ''}${actionsOpen ? ' actions-open' : ''}${selectionMode ? ' selecting' : ''}${selected ? ' selected' : ''}${!forwardable ? ' not-forwardable' : ''}${editing ? ' editing' : ''}`}
       data-message-id={message.id}
       data-swipe-ready={swipeOffset > 56}
       onPointerDown={handlePointerDown}
@@ -5442,7 +7582,8 @@ function MessageBubble({
           src={message.senderAvatarUrl}
           accessToken={mediaAccessToken}
           onClick={selectionMode ? undefined : onOpenUserProfile}
-          ariaLabel={`查看 ${message.senderName ?? message.sender ?? '成员'} 的资料`}
+          onLongPress={selectionMode ? undefined : onMentionSender}
+          ariaLabel={`查看 ${message.senderName ?? message.sender ?? '成员'} 的资料，长按提及`}
           small
         />
       )}
@@ -5476,17 +7617,27 @@ function MessageBubble({
               onClick={selectionMode ? onToggleSelection : onPreviewAttachment}
               aria-label="预览图片"
             >
-              <ProgressiveImagePreview
+              <AuthenticatedImage
                 className={stickerLikeImage ? 'message-image sticker' : 'message-image'}
-                previewSrc={attachmentPreviewSrc}
-                previewFallbackSrc={attachmentPreviewFallbackSrc}
-                previewEncryptedFile={attachment.previewEncryptedFile ?? attachment.encryptedFile}
-                previewMimeType={attachment.previewMimeType ?? attachment.mimeType}
-                src={attachmentFullSrc}
-                fallbackSrc={attachmentFullFallbackSrc}
+                src={attachmentPreviewSrc}
+                fallbackSrc={attachmentPreviewFallbackSrc}
                 accessToken={mediaAccessToken}
-                encryptedFile={attachment.encryptedFile}
-                mimeType={attachment.mimeType}
+                encryptedFile={attachmentPreviewEncryptedFile}
+                mimeType={attachment.previewMimeType ?? attachment.mimeType}
+                retrySrcs={[
+                  {
+                    src: attachment.authDownloadUrl ?? attachment.downloadUrl,
+                    fallbackSrc: attachment.downloadUrl ?? attachment.url,
+                    encryptedFile: attachment.encryptedFile,
+                    mimeType: attachment.mimeType,
+                  },
+                  ...buildMatrixMediaRetrySrcs(attachment.authUrl, attachment.url).map((retrySrc) => ({
+                    src: retrySrc,
+                    fallbackSrc: attachment.downloadUrl ?? attachment.url,
+                    encryptedFile: attachment.encryptedFile,
+                    mimeType: attachment.mimeType,
+                  })),
+                ]}
                 alt={attachmentName}
               />
             </button>
@@ -5498,14 +7649,17 @@ function MessageBubble({
               onClick={selectionMode ? onToggleSelection : onPreviewAttachment}
               aria-label="预览视频"
             >
-              <AuthenticatedImage
+              <CompactVideoPreview
                 className="message-image"
-                src={attachmentPreviewSrc}
-                fallbackSrc={attachmentPreviewFallbackSrc}
+                previewSrc={attachmentPreviewSrc}
+                previewFallbackSrc={attachmentPreviewFallbackSrc}
                 accessToken={mediaAccessToken}
-                encryptedFile={attachment.previewEncryptedFile ?? attachment.encryptedFile}
-                mimeType={attachment.previewMimeType ?? attachment.mimeType}
-                alt={attachmentName}
+                previewEncryptedFile={getPreviewEncryptedFile(attachment)}
+                previewMimeType={attachment.previewMimeType ?? attachment.mimeType}
+                src={attachmentFullSrc}
+                fallbackSrc={attachmentFullFallbackSrc}
+                encryptedFile={attachment.encryptedFile}
+                mimeType={attachment.mimeType}
               />
               <span className="media-play-indicator">
                 <Play size={18} />
@@ -5535,108 +7689,157 @@ function MessageBubble({
               name={attachment.name ?? message.body}
             />
           )}
-          {showBody && <p>{getReadableMessageBody(message.body)}</p>}
-        </div>
-        {message.mine && visibleReadReceipts.length > 0 && (
-          <div className="message-read-receipts" aria-label={`已读 ${message.readReceipts.length} 人`}>
-            <Check size={12} />
-            <div className="message-read-receipt-stack">
-              {visibleReadReceipts.map((reader) => (
-                <span key={reader.userId} className="message-read-receipt-avatar" title={reader.name}>
-                  <Avatar
-                    name={reader.name}
-                    src={reader.avatarUrl}
-                    accessToken={mediaAccessToken}
-                    small
-                  />
-                </span>
-              ))}
-              {readReceiptOverflow > 0 && (
-                <span className="message-read-receipt-more">+{readReceiptOverflow}</span>
-              )}
+          {editing ? (
+            <div className="message-inline-editor">
+              <textarea
+                ref={inlineEditTextareaRef}
+                value={editingDraft}
+                rows={6}
+                onChange={(event) => onEditingDraftChange(event.target.value)}
+                onKeyDown={handleInlineEditorKeyDown}
+                placeholder="编辑消息"
+                disabled={savingEdit}
+              />
+              <div className="message-inline-editor-actions">
+                <button
+                  type="button"
+                  className="primary-button compact"
+                  onClick={onSaveEdit}
+                  disabled={savingEdit || !editingDraft.trim()}
+                >
+                  {savingEdit ? '保存中...' : '保存'}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button compact"
+                  onClick={onCancelEdit}
+                  disabled={savingEdit}
+                >
+                  取消
+                </button>
+              </div>
             </div>
-            <span>{message.readReceipts.length} 人已读</span>
-          </div>
-        )}
-        <button
-          className="message-menu-toggle"
-          type="button"
-          aria-label={actionsOpen ? '收起消息操作' : '更多消息操作'}
-          aria-expanded={actionsOpen}
-          onClick={() => setActionsOpen((open) => !open)}
-        >
-          <MoreHorizontal size={17} />
-        </button>
-        <div className="message-actions">
-          <button onClick={() => runAndClose(onReply)}>
-            <Reply size={14} />
-            回复
-          </button>
-          <button onClick={() => runAndClose(onForward)}>
-            <Forward size={14} />
-            转发
-          </button>
-          {message.canEdit && (
-            <button onClick={() => runAndClose(onEdit)}>
-              <Edit3 size={14} />
-              编辑
-            </button>
-          )}
-          <div className="quick-reactions" aria-label="快速回">
-            <SmilePlus size={14} />
-            {quickReactionOptions.map((reaction) => (
-              <button key={reaction} onClick={() => runAndClose(() => onReact(reaction))}>
-                {reaction}
-              </button>
-            ))}
-          </div>
-          <button className={favorite ? 'active' : ''} onClick={() => runAndClose(onFavorite)}>
-            <Star size={14} />
-            收藏
-          </button>
-          <button className={message.pinned ? 'active' : ''} onClick={() => runAndClose(onTogglePin)}>
-            {message.pinned ? <PinOff size={14} /> : <Pin size={14} />}
-            {message.pinned ? '取消置顶' : '置顶'}
-          </button>
-          <button onClick={() => runAndClose(onCopy)}>
-            <Copy size={14} />
-            复制
-          </button>
-          <button onClick={() => runAndClose(onCopyLink)}>
-            <Link2 size={14} />
-            链接
-          </button>
-          {message.attachment && message.attachment.kind !== 'audio' && message.attachment.url && (
-            <button onClick={() => runAndClose(onPreviewAttachment)}>
-              <Eye size={14} />
-              预览
-            </button>
-          )}
-          {message.attachment?.kind === 'audio' && (
-            <button onClick={() => runAndClose(onTranscribeAudio)}>
-              <Volume2 size={14} />
-              转文字            </button>
-          )}
-          <button onClick={() => runAndClose(onInfo)}>
-            <Info size={14} />
-            详情
-          </button>
-          {message.canRedact && (
-            <button className="danger" onClick={() => runAndClose(onRedact)}>
-              <Trash2 size={14} />
-              撤回
-            </button>
-          )}
-          {message.reactions.map((reaction) => (
-            <button
-              key={reaction.key}
-              className={reaction.reactedByMe ? 'active' : ''}
-              onClick={() => runAndClose(() => onReact(reaction.key))}
-            >
-              {reaction.key} {reaction.count}
-            </button>
-          ))}
+          ) : showBody ? (
+            <MessageRichText
+              body={message.body}
+              forwardContent={message.forwardContent}
+              members={members}
+              onOpenMember={onOpenMentionMember}
+            />
+          ) : null}
         </div>
+        {showReadReceiptIndicator && (
+          <button
+            type="button"
+            className="message-read-receipts message-read-receipts-button"
+            aria-label={showInlineReadReceiptText ? `查看消息已读详情：${readReceiptLabel}` : '查看消息已读详情'}
+            onClick={onOpenReadReceipts}
+          >
+            <Check size={12} />
+            {visibleReadReceipts.length > 0 && (
+              <div className="message-read-receipt-stack">
+                {visibleReadReceipts.map((reader) => (
+                  <span key={reader.userId} className="message-read-receipt-avatar" title={reader.name}>
+                    <Avatar
+                      name={reader.name}
+                      src={reader.avatarUrl}
+                      accessToken={mediaAccessToken}
+                      small
+                    />
+                  </span>
+                ))}
+                {readReceiptOverflow > 0 && (
+                  <span className="message-read-receipt-more">+{readReceiptOverflow}</span>
+                )}
+              </div>
+            )}
+            {showInlineReadReceiptText && <span>{readReceiptLabel}</span>}
+          </button>
+        )}
+        {!editing && (
+          <>
+            <button
+              className="message-menu-toggle"
+              type="button"
+              aria-label={actionsOpen ? '收起消息操作' : '更多消息操作'}
+              aria-expanded={actionsOpen}
+              onClick={() => setActionsOpen((open) => !open)}
+            >
+              <MoreHorizontal size={17} />
+            </button>
+            <div className="message-actions">
+              <button onClick={() => runAndClose(onReply)}>
+                <Reply size={14} />
+                回复
+              </button>
+              <button onClick={() => runAndClose(onForward)}>
+                <Forward size={14} />
+                转发
+              </button>
+              {message.canEdit && (
+                <button onClick={() => runAndClose(onEdit)}>
+                  <Edit3 size={14} />
+                  编辑
+                </button>
+              )}
+              <div className="quick-reactions" aria-label="快速回">
+                <SmilePlus size={14} />
+                {quickReactionOptions.map((reaction) => (
+                  <button key={reaction} onClick={() => runAndClose(() => onReact(reaction))}>
+                    {reaction}
+                  </button>
+                ))}
+              </div>
+              <button className={favorite ? 'active' : ''} onClick={() => runAndClose(onFavorite)}>
+                <Star size={14} />
+                收藏
+              </button>
+              <button className={message.pinned ? 'active' : ''} onClick={() => runAndClose(onTogglePin)}>
+                {message.pinned ? <PinOff size={14} /> : <Pin size={14} />}
+                {message.pinned ? '取消置顶' : '置顶'}
+              </button>
+              <button onClick={() => runAndClose(onCopy)}>
+                <Copy size={14} />
+                复制
+              </button>
+              <button onClick={() => runAndClose(onCopyLink)}>
+                <Link2 size={14} />
+                链接
+              </button>
+              {message.attachment && message.attachment.kind !== 'audio' && message.attachment.url && (
+                <button onClick={() => runAndClose(onPreviewAttachment)}>
+                  <Eye size={14} />
+                  预览
+                </button>
+              )}
+              {message.attachment?.kind === 'audio' && (
+                <button onClick={() => runAndClose(onTranscribeAudio)}>
+                  <Volume2 size={14} />
+                  转文字
+                </button>
+              )}
+              <button onClick={() => runAndClose(onInfo)}>
+                <Info size={14} />
+                详情
+              </button>
+              {message.canRedact && (
+                <button className="danger" onClick={() => runAndClose(onRedact)}>
+                  <Trash2 size={14} />
+                  撤回
+                </button>
+              )}
+              {message.reactions.map((reaction) => (
+                <button
+                  key={reaction.key}
+                  className={reaction.reactedByMe ? 'active' : ''}
+                  onClick={() => runAndClose(() => onReact(reaction.key))}
+                >
+                  {reaction.key} {reaction.count}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
       </div>
       {message.mine && (
         <Avatar
@@ -5861,8 +8064,11 @@ function NewConversationSheet({
 function MessageInfoSheet({
   message,
   room,
+  members,
+  mediaAccessToken,
   favorite,
   onClose,
+  onOpenMemberProfile,
   onReply,
   onEdit,
   onFavorite,
@@ -5877,8 +8083,11 @@ function MessageInfoSheet({
 }: {
   message: ChatMessage;
   room?: RoomSummary;
+  members: RoomMemberSummary[];
+  mediaAccessToken?: string;
   favorite: boolean;
   onClose: () => void;
+  onOpenMemberProfile: (member: RoomMemberSummary) => void;
   onReply: () => void;
   onEdit: () => void;
   onFavorite: () => void;
@@ -5891,6 +8100,9 @@ function MessageInfoSheet({
   onReact: (key: string) => void;
   onRedact: () => void;
 }) {
+  const ownReadReceiptSummary = getOwnMessageReadReceiptSummary(message, members);
+  const readReceiptStatusText = getReadReceiptStatusText(message, ownReadReceiptSummary);
+
   return (
     <div className="sheet-backdrop">
       <section className="sheet message-sheet">
@@ -5909,19 +8121,28 @@ function MessageInfoSheet({
             <strong>{message.senderName ?? message.sender ?? '未知成员'}</strong>
             <span>{formatFullTime(message.timestamp)}</span>
           </div>
-          <p>{getReadableMessageBody(message.body)}</p>
+          <MessageRichText
+            body={message.body}
+            forwardContent={message.forwardContent}
+            members={members}
+            onOpenMember={onOpenMemberProfile}
+          />
         </div>
 
         <div className="message-detail-grid">
           <DetailRow label="房间" value={room?.name ?? message.roomId} />
-          <DetailRow label="???" value={message.sender ?? '??'} />
-          <DetailRow label="浜嬩欢 ID" value={message.id} />
+          <DetailRow label="发送者" value={message.sender ?? '未知'} />
+          <DetailRow label="事件 ID" value={message.id} />
           <DetailRow label="房间 ID" value={message.roomId} />
-          <DetailRow label="绫诲瀷" value={message.eventType} />
+          <DetailRow label="类型" value={message.eventType} />
           <DetailRow label="状态" value={`${message.encrypted ? '已加密' : '未加密'} · ${message.edited ? '已编辑' : '原始消息'}`} />
+          <DetailRow
+            label="回执"
+            value={readReceiptStatusText}
+          />
           {message.attachment && (
             <DetailRow
-              label="闄勪欢"
+              label="附件"
               value={`${message.attachment.kind} · ${message.attachment.name ?? message.attachment.mimeType ?? '未命名'}`}
             />
           )}
@@ -5948,6 +8169,62 @@ function MessageInfoSheet({
                   onClick={() => onReact(reaction.key)}
                 >
                   {reaction.key} {reaction.count}
+                </button>
+              ))}
+            </div>
+          )}
+        </section>
+
+        <section className="reaction-panel">
+          <div className="section-title">
+            <span>已读情况</span>
+            <strong>{message.readReceipts.length > 0 ? '成员明细' : '暂无回执'}</strong>
+          </div>
+          {ownReadReceiptSummary?.totalCount === 1 && (
+            <p className="digest-empty">
+              {readReceiptStatusText}
+            </p>
+          )}
+          {message.readReceipts.length === 0 ? (
+            <p className="digest-empty">暂时还没有已读回执。</p>
+          ) : (
+            <div className="message-receipt-list">
+              {message.readReceipts.map((reader) => (
+                <button
+                  key={reader.userId}
+                  className="message-receipt-row"
+                  onClick={() =>
+                    onOpenMemberProfile(
+                      members.find((member) => member.id === reader.userId) ?? {
+                        id: reader.userId,
+                        name: reader.name,
+                        avatarUrl: reader.avatarUrl,
+                      }
+                    )
+                  }
+                >
+                  <Avatar name={reader.name} src={reader.avatarUrl} accessToken={mediaAccessToken} small />
+                  <span>
+                    <strong>{reader.name}</strong>
+                    <small>{reader.timestamp ? formatFullTime(reader.timestamp) : reader.userId}</small>
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
+          {ownReadReceiptSummary && ownReadReceiptSummary.unreadMembers.length > 0 && (
+            <div className="message-receipt-list">
+              {ownReadReceiptSummary.unreadMembers.map((member) => (
+                <button
+                  key={member.id}
+                  className="message-receipt-row"
+                  onClick={() => onOpenMemberProfile(member)}
+                >
+                  <Avatar name={member.name} src={member.avatarUrl} accessToken={mediaAccessToken} small />
+                  <span>
+                    <strong>{member.name}</strong>
+                    <small>暂未读到这条消息</small>
+                  </span>
                 </button>
               ))}
             </div>
@@ -6008,6 +8285,69 @@ function MessageInfoSheet({
   );
 }
 
+function ReadReceiptSheet({
+  message,
+  members,
+  mediaAccessToken,
+  onClose,
+  onOpenMemberProfile,
+}: {
+  message: ChatMessage;
+  members: RoomMemberSummary[];
+  mediaAccessToken?: string;
+  onClose: () => void;
+  onOpenMemberProfile: (member: RoomMemberSummary) => void;
+}) {
+  const ownReadReceiptSummary = getOwnMessageReadReceiptSummary(message, members);
+  const title =
+    ownReadReceiptSummary?.totalCount === 1
+      ? formatOwnMessageReadReceiptSummary(ownReadReceiptSummary)
+      : '已读详情';
+
+  return (
+    <div className="receipt-sheet-backdrop" onClick={onClose}>
+      <section className="receipt-sheet" onClick={(event) => event.stopPropagation()}>
+        <header className="receipt-sheet-header">
+          <h2>{title}</h2>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">
+            <X size={20} />
+          </button>
+        </header>
+
+        {message.readReceipts.length === 0 ? (
+          <p className="digest-empty">
+            {ownReadReceiptSummary?.totalCount === 1 ? '对方暂未读到这条消息。' : '暂时还没有已读回执。'}
+          </p>
+        ) : (
+          <div className="receipt-sheet-list">
+            {message.readReceipts.map((reader) => (
+              <button
+                key={reader.userId}
+                className="receipt-sheet-row"
+                onClick={() =>
+                  onOpenMemberProfile(
+                    members.find((member) => member.id === reader.userId) ?? {
+                      id: reader.userId,
+                      name: reader.name,
+                      avatarUrl: reader.avatarUrl,
+                    }
+                  )
+                }
+              >
+                <Avatar name={reader.name} src={reader.avatarUrl} accessToken={mediaAccessToken} small />
+                <span className="receipt-sheet-meta">
+                  <strong>{reader.name}</strong>
+                  <small>{reader.timestamp ? formatTime(reader.timestamp) : reader.userId}</small>
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 function DetailRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="detail-row">
@@ -6024,7 +8364,6 @@ function UserProfileSheet({
   currentUserId,
   mediaAccessToken,
   onClose,
-  onMentionMember,
   onCopyMember,
   onCopyMemberLink,
   onDirectMember,
@@ -6038,7 +8377,6 @@ function UserProfileSheet({
   currentUserId?: string;
   mediaAccessToken?: string;
   onClose: () => void;
-  onMentionMember: (member: RoomMemberSummary) => void;
   onCopyMember: (member: RoomMemberSummary) => void;
   onCopyMemberLink: (member: RoomMemberSummary) => void;
   onDirectMember: (member: RoomMemberSummary) => void;
@@ -6046,8 +8384,10 @@ function UserProfileSheet({
   onBanMember: (member: RoomMemberSummary) => void;
   onPreviewAvatar: (member: RoomMemberSummary) => void;
 }) {
-  const coverUrl = useAuthenticatedMediaUrl(member.avatarUrl, mediaAccessToken, member.avatarUrl);
   const currentMember = members.find((item) => item.id === member.id) ?? member;
+  const displayName = currentMember.name || member.name || member.id;
+  const avatarUrl = currentMember.avatarUrl ?? member.avatarUrl;
+  const coverAccentUrl = useAuthenticatedMediaUrl(avatarUrl, mediaAccessToken, avatarUrl);
   const localPart = localPartFromUserId(member.id);
   const server = serverFromUserId(member.id);
   const isSelf = member.id === currentUserId;
@@ -6061,7 +8401,7 @@ function UserProfileSheet({
         <header className="sheet-header">
           <div>
             <p className="eyebrow">Profile</p>
-            <h2>鐢ㄦ埛璧勬枡</h2>
+            <h2>用户资料</h2>
           </div>
           <button className="icon-button" onClick={onClose} aria-label="关闭">
             <X size={20} />
@@ -6069,22 +8409,27 @@ function UserProfileSheet({
         </header>
 
         <section className="user-profile-hero">
-          <div
-            className={coverUrl ? 'user-profile-cover has-image' : 'user-profile-cover'}
-            style={coverUrl ? { backgroundImage: `url("${coverUrl}")` } : undefined}
-          />
+          <div className="user-profile-cover">
+            {coverAccentUrl && (
+              <div
+                className="user-profile-cover-art"
+                style={{ backgroundImage: `url("${coverAccentUrl}")` }}
+                aria-hidden="true"
+              />
+            )}
+          </div>
           <div className="user-profile-identity">
             <div className="user-profile-avatar">
               <Avatar
-                name={member.name}
-                src={member.avatarUrl}
+                name={displayName}
+                src={avatarUrl}
                 accessToken={mediaAccessToken}
-                onClick={member.avatarUrl ? () => onPreviewAvatar(member) : undefined}
-                ariaLabel={`查看 ${member.name} 的头像`}
+                onClick={avatarUrl ? () => onPreviewAvatar(currentMember) : undefined}
+                ariaLabel={`查看 ${displayName} 的头像`}
               />
             </div>
             <div>
-              <h3>{member.name}</h3>
+              <h3>{displayName}</h3>
               <small>{member.id}</small>
             </div>
           </div>
@@ -6107,10 +8452,6 @@ function UserProfileSheet({
         </section>
 
         <div className="user-profile-actions">
-          <button onClick={() => onMentionMember(member)}>
-            <AtSign size={16} />
-            提及
-          </button>
           {!isSelf && (
             <button className="primary" onClick={() => onDirectMember(member)}>
               <MessageCircle size={16} />
@@ -6125,8 +8466,8 @@ function UserProfileSheet({
             <Link2 size={16} />
             复制链接
           </button>
-          {member.avatarUrl && (
-            <button onClick={() => onPreviewAvatar(member)}>
+          {avatarUrl && (
+            <button onClick={() => onPreviewAvatar(currentMember)}>
               <Eye size={16} />
               查看头像
             </button>
@@ -6139,7 +8480,7 @@ function UserProfileSheet({
             <strong>{room.name}</strong>
           </div>
           <div className="message-detail-grid user-profile-detail-grid">
-            <DetailRow label="昵称" value={member.name} />
+            <DetailRow label="昵称" value={displayName} />
             <DetailRow label="本地名" value={localPart ? `@${localPart}` : member.id} />
             <DetailRow label="服务器" value={server ?? '未知'} />
             <DetailRow label="成员状态" value={memberMembershipLabel(currentMember.membership)} />
@@ -6151,7 +8492,7 @@ function UserProfileSheet({
         {canModerate && (
           <section className="user-profile-card danger">
             <div className="section-title">
-              <span>绠＄悊鎿嶄綔</span>
+              <span>管理操作</span>
               <strong>你的权限 {myPowerLevel}</strong>
             </div>
             <p>这些操作会影响对方在当前房间的成员状态。</p>
@@ -6162,7 +8503,7 @@ function UserProfileSheet({
               </button>
               <button className="danger" onClick={() => onBanMember(member)}>
                 <Ban size={16} />
-                灏佺鐢ㄦ埛
+                封禁用户
               </button>
             </div>
           </section>
@@ -6228,6 +8569,7 @@ function RoomInfoSheet({
   const [memberQuery, setMemberQuery] = useState('');
   const myPowerLevel = members.find((member) => member.id === currentUserId)?.powerLevel ?? 0;
   const canModerate = myPowerLevel >= 50;
+  const totalMemberCount = Math.max(room.memberCount, members.length);
   const visibleMembers = useMemo(() => {
     const query = memberQuery.trim().toLowerCase();
     if (!query) return members;
@@ -6293,7 +8635,7 @@ function RoomInfoSheet({
         <div className="stat-grid">
           <span>
             <Users size={17} />
-            {room.memberCount} · 
+            {room.memberCount} 成员
           </span>
           <span>
             <Bell size={17} />
@@ -6301,7 +8643,7 @@ function RoomInfoSheet({
           </span>
           <span>
             <Shield size={17} />
-            {room.encrypted ? '???' : '???'}
+            {room.encrypted ? '已加密' : '未加密'}
           </span>
         </div>
 
@@ -6312,7 +8654,7 @@ function RoomInfoSheet({
           </button>
           <button onClick={onToggleMute}>
             <Bell size={17} />
-            {room.muted ? '取消静音' : '闈欓煶'}
+            {room.muted ? '取消静音' : '静音'}
           </button>
           <button onClick={() => navigator.clipboard?.writeText(buildMatrixPermalink(room))}>
             <Copy size={17} />
@@ -6320,7 +8662,7 @@ function RoomInfoSheet({
           </button>
           <button className="danger" onClick={onLeave}>
             <DoorOpen size={17} />
-            绂诲紑
+            离开房间
           </button>
         </div>
 
@@ -6365,7 +8707,11 @@ function RoomInfoSheet({
         <div className="member-list">
           <div className="section-title">
             <span>成员</span>
-            <strong>{visibleMembers.length}/{members.length}</strong>
+            <strong>
+              {visibleMembers.length === totalMemberCount
+                ? totalMemberCount
+                : `${visibleMembers.length}/${totalMemberCount}`}
+            </strong>
           </div>
           <label className="search-field member-search">
             <Search size={15} />
@@ -6377,7 +8723,7 @@ function RoomInfoSheet({
               onChange={(evt) => setMemberQuery(evt.target.value)}
             />
           </label>
-          {visibleMembers.slice(0, 120).map((member) => (
+          {visibleMembers.map((member) => (
             <div className="member-row" key={member.id}>
               <Avatar
                 name={member.name}
@@ -6412,7 +8758,7 @@ function RoomInfoSheet({
                     </button>
                     <button className="member-action danger" onClick={() => onBanMember(member)}>
                       <Ban size={13} />
-                      灏佺
+                      封禁
                     </button>
                   </>
                 )}
@@ -6449,7 +8795,7 @@ function MediaStrip({
         <div className="media-grid">
           {items.slice(0, 24).map((item) => (
             <button key={item.messageId} className="media-tile" onClick={() => onPreview(item)}>
-              {(item.kind === 'image' || item.kind === 'video') && item.url ? (
+              {item.kind === 'image' && item.url ? (
                 <AuthenticatedImage
                   src={item.authUrl ?? item.url}
                   fallbackSrc={item.url}
@@ -6457,6 +8803,19 @@ function MediaStrip({
                   encryptedFile={item.previewEncryptedFile ?? item.encryptedFile}
                   mimeType={item.previewMimeType ?? item.mimeType}
                   alt={item.name}
+                />
+              ) : item.kind === 'video' && item.url ? (
+                <CompactVideoPreview
+                  previewSrc={item.authUrl ?? item.url}
+                  previewFallbackSrc={item.url}
+                  accessToken={mediaAccessToken}
+                  previewEncryptedFile={item.previewEncryptedFile ?? item.encryptedFile}
+                  previewMimeType={item.previewMimeType ?? item.mimeType}
+                  src={item.authDownloadUrl ?? item.downloadUrl ?? item.authUrl ?? item.url}
+                  fallbackSrc={item.downloadUrl ?? item.url}
+                  encryptedFile={item.encryptedFile}
+                  mimeType={item.mimeType}
+                  label="视频封面暂不可预览"
                 />
               ) : (
                 <span>
@@ -6491,7 +8850,7 @@ function MediaPreview({
       : media.downloadUrl ?? media.url;
   const previewEncryptedFile =
     media.kind === 'image' || media.kind === 'video'
-      ? media.previewEncryptedFile ?? media.encryptedFile
+      ? getPreviewEncryptedFile(media)
       : media.encryptedFile;
   const previewMimeType =
     media.kind === 'image' || media.kind === 'video'
@@ -6595,7 +8954,7 @@ function EnhancedMediaPreview({
       : media.downloadUrl ?? media.url;
   const previewEncryptedFile =
     media.kind === 'image' || media.kind === 'video'
-      ? media.previewEncryptedFile ?? media.encryptedFile
+      ? getPreviewEncryptedFile(media)
       : media.encryptedFile;
   const previewMimeType =
     media.kind === 'image' || media.kind === 'video'
@@ -6606,9 +8965,24 @@ function EnhancedMediaPreview({
   const [zoom, setZoom] = useState(1);
   const [rotation, setRotation] = useState(0);
   const [fitMode, setFitMode] = useState<'fit' | 'actual'>('fit');
+  const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
+  const [draggingPreview, setDraggingPreview] = useState(false);
+  const stageRef = useRef<HTMLDivElement | null>(null);
+  const previewDragRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+    startPanX: number;
+    startPanY: number;
+  }>();
   const previewableItems = useMemo(
-    () => items.filter((item) => Boolean(item.authDownloadUrl ?? item.authUrl ?? item.downloadUrl ?? item.url)),
-    [items]
+    () =>
+      items.filter(
+        (item) =>
+          item.kind === media.kind &&
+          Boolean(item.authDownloadUrl ?? item.authUrl ?? item.downloadUrl ?? item.url)
+      ),
+    [items, media.kind]
   );
   const activeIndex = useMemo(
     () => previewableItems.findIndex((item) => item.messageId === media.messageId),
@@ -6633,19 +9007,66 @@ function EnhancedMediaPreview({
         media.downloadUrl ??
         media.authUrl ??
         media.url;
-  const previewStageStyle =
-    fitMode === 'actual'
-      ? ({
-          ['--preview-zoom' as string]: String(zoom),
-          ['--preview-rotate' as string]: `${rotation}deg`,
-        } as CSSProperties)
-      : undefined;
+  const draggableImage = media.kind === 'image' && fitMode === 'actual' && zoom > 1;
+  const getPanBounds = useCallback(() => {
+    if (!draggableImage) return { maxX: 0, maxY: 0 };
+
+    const stage = stageRef.current;
+    if (!stage) return { maxX: 0, maxY: 0 };
+
+    const visibleImage = stage.querySelector('.progressive-media-layer.full.ready, .progressive-media-layer.preview') as
+      | HTMLImageElement
+      | null;
+    const baseWidth = visibleImage?.clientWidth ?? 0;
+    const baseHeight = visibleImage?.clientHeight ?? 0;
+    if (!baseWidth || !baseHeight) return { maxX: 0, maxY: 0 };
+
+    const quarterTurns = ((Math.round(rotation / 90) % 4) + 4) % 4;
+    const rotated = quarterTurns % 2 === 1;
+    const scaledWidth = (rotated ? baseHeight : baseWidth) * zoom;
+    const scaledHeight = (rotated ? baseWidth : baseHeight) * zoom;
+    const maxX = Math.max(0, (scaledWidth - stage.clientWidth) / 2);
+    const maxY = Math.max(0, (scaledHeight - stage.clientHeight) / 2);
+    return { maxX, maxY };
+  }, [draggableImage, rotation, zoom]);
+  const clampPanOffset = useCallback(
+    (nextOffset: { x: number; y: number }) => {
+      const { maxX, maxY } = getPanBounds();
+      return {
+        x: Math.max(-maxX, Math.min(maxX, nextOffset.x)),
+        y: Math.max(-maxY, Math.min(maxY, nextOffset.y)),
+      };
+    },
+    [getPanBounds]
+  );
+  const previewStageStyle = {
+    ['--preview-zoom' as string]: String(fitMode === 'actual' ? zoom : 1),
+    ['--preview-rotate' as string]: `${rotation}deg`,
+    ['--preview-pan-x' as string]: `${fitMode === 'actual' ? panOffset.x : 0}px`,
+    ['--preview-pan-y' as string]: `${fitMode === 'actual' ? panOffset.y : 0}px`,
+  } as CSSProperties;
 
   useEffect(() => {
     setZoom(1);
     setRotation(0);
     setFitMode('fit');
+    setPanOffset({ x: 0, y: 0 });
+    setDraggingPreview(false);
+    previewDragRef.current = undefined;
   }, [media.messageId]);
+
+  useLayoutEffect(() => {
+    setPanOffset((current) => {
+      if (!draggableImage) {
+        if (current.x === 0 && current.y === 0) return current;
+        return { x: 0, y: 0 };
+      }
+
+      const clamped = clampPanOffset(current);
+      if (clamped.x === current.x && clamped.y === current.y) return current;
+      return clamped;
+    });
+  }, [clampPanOffset, draggableImage, fitMode, rotation, zoom]);
 
   useEffect(() => {
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -6667,13 +9088,62 @@ function EnhancedMediaPreview({
 
   const handleZoom = (delta: number) => {
     setFitMode('actual');
-    setZoom((current) => Math.max(1, Math.min(4, Number((current + delta).toFixed(2)))));
+    setZoom((current) => {
+      const nextZoom = Math.max(1, Math.min(4, Number((current + delta).toFixed(2))));
+      if (nextZoom <= 1) {
+        setPanOffset({ x: 0, y: 0 });
+      }
+      return nextZoom;
+    });
   };
 
   const handleWheelZoom = (event: ReactWheelEvent<HTMLDivElement>) => {
     if (media.kind !== 'image') return;
     event.preventDefault();
     handleZoom(event.deltaY < 0 ? 0.2 : -0.2);
+  };
+
+  const stopPreviewDrag = useCallback((pointerId?: number, target?: EventTarget | null) => {
+    const gesture = previewDragRef.current;
+    if (!gesture || (pointerId !== undefined && gesture.pointerId !== pointerId)) return;
+
+    if (target && 'releasePointerCapture' in target) {
+      try {
+        (target as HTMLDivElement).releasePointerCapture(gesture.pointerId);
+      } catch {
+        // Pointer capture can already be released by the browser.
+      }
+    }
+
+    previewDragRef.current = undefined;
+    setDraggingPreview(false);
+  }, []);
+
+  const handlePreviewPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!draggableImage || event.button !== 0) return;
+
+    previewDragRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startPanX: panOffset.x,
+      startPanY: panOffset.y,
+    };
+    event.currentTarget.setPointerCapture(event.pointerId);
+    setDraggingPreview(true);
+    event.preventDefault();
+  };
+
+  const handlePreviewPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = previewDragRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId || !draggableImage) return;
+
+    const nextOffset = clampPanOffset({
+      x: gesture.startPanX + (event.clientX - gesture.startX),
+      y: gesture.startPanY + (event.clientY - gesture.startY),
+    });
+    setPanOffset(nextOffset);
+    event.preventDefault();
   };
 
   return (
@@ -6713,7 +9183,6 @@ function EnhancedMediaPreview({
               <button
                 type="button"
                 onClick={() => {
-                  setFitMode('actual');
                   setRotation((current) => current - 90);
                 }}
                 aria-label="向左旋转"
@@ -6723,7 +9192,6 @@ function EnhancedMediaPreview({
               <button
                 type="button"
                 onClick={() => {
-                  setFitMode('actual');
                   setRotation((current) => current + 90);
                 }}
                 aria-label="向右旋转"
@@ -6747,8 +9215,19 @@ function EnhancedMediaPreview({
           )}
           {media.kind === 'image' && (previewSrc || fullSrc) ? (
             <div
-              className={fitMode === 'fit' ? 'media-preview-stage fit' : 'media-preview-stage actual'}
+              ref={stageRef}
+              className={
+                fitMode === 'fit'
+                  ? 'media-preview-stage fit'
+                  : draggingPreview
+                    ? 'media-preview-stage actual dragging'
+                    : 'media-preview-stage actual'
+              }
               style={previewStageStyle}
+              onPointerDown={handlePreviewPointerDown}
+              onPointerMove={handlePreviewPointerMove}
+              onPointerUp={(event) => stopPreviewDrag(event.pointerId, event.currentTarget)}
+              onPointerCancel={(event) => stopPreviewDrag(event.pointerId, event.currentTarget)}
             >
               <ProgressiveImagePreview
                 className={fitMode === 'fit' ? 'media-preview-image' : 'media-preview-image zoomed'}
@@ -6815,44 +9294,6 @@ function EnhancedMediaPreview({
             </button>
           )}
         </div>
-        {previewableItems.length > 1 && (
-          <div className="media-preview-strip">
-            {previewableItems.map((item) => {
-              const selected = item.messageId === media.messageId;
-              const itemPreviewSrc = item.authUrl ?? item.url;
-              return (
-                <button
-                  key={`${item.messageId}-${item.timestamp}`}
-                  type="button"
-                  className={selected ? 'media-preview-thumb active' : 'media-preview-thumb'}
-                  onClick={() => onSelect(item)}
-                >
-                  {item.kind === 'image' && itemPreviewSrc ? (
-                    <AuthenticatedImage
-                      src={itemPreviewSrc}
-                      fallbackSrc={item.url}
-                      accessToken={mediaAccessToken}
-                      encryptedFile={item.previewEncryptedFile ?? item.encryptedFile}
-                      mimeType={item.previewMimeType ?? item.mimeType}
-                      alt={item.name}
-                    />
-                  ) : item.kind === 'video' && itemPreviewSrc ? (
-                    <AuthenticatedImage
-                      src={itemPreviewSrc}
-                      fallbackSrc={item.url}
-                      accessToken={mediaAccessToken}
-                      encryptedFile={item.previewEncryptedFile ?? item.encryptedFile}
-                      mimeType={item.previewMimeType ?? item.mimeType}
-                      alt={item.name}
-                    />
-                  ) : (
-                    <span>{item.kind === 'audio' ? <Volume2 size={18} /> : <FileUp size={18} />}</span>
-                  )}
-                </button>
-              );
-            })}
-          </div>
-        )}
       </section>
     </div>
   );
@@ -7186,7 +9627,6 @@ function ExplorePanel({
 
 function SettingsPanel({
   session,
-  deviceName,
   snapshot,
   favoriteMessageCount,
   customEmojiCount,
@@ -7201,10 +9641,10 @@ function SettingsPanel({
   onAvatarSelected,
   onPreferencesChange,
   onOpenSecurity,
+  onOpenEmojiManager,
   onClearLocal,
 }: {
   session?: StoredMatrixSession;
-  deviceName: string;
   snapshot: MatrixSnapshot;
   favoriteMessageCount: number;
   customEmojiCount: number;
@@ -7219,13 +9659,12 @@ function SettingsPanel({
   onAvatarSelected: (file: File) => void;
   onPreferencesChange: (value: AppPreferences) => void;
   onOpenSecurity: () => void;
+  onOpenEmojiManager: () => void;
   onClearLocal: () => void;
 }) {
   const notificationPermission =
-    typeof Notification === 'undefined' ? '???' : Notification.permission;
+    typeof Notification === 'undefined' ? '未知' : Notification.permission;
   const joinedRooms = snapshot.rooms.filter((room) => room.membership === 'join');
-  const encryptedRooms = joinedRooms.filter((room) => room.encrypted).length;
-  const directRooms = joinedRooms.filter((room) => room.direct).length;
   const spaceRooms = joinedRooms.filter((room) => room.space).length;
   const mutedRooms = joinedRooms.filter((room) => room.muted).length;
   const inviteRooms = snapshot.rooms.filter((room) => room.membership === 'invite').length;
@@ -7346,56 +9785,6 @@ function SettingsPanel({
         </label>
       </section>
 
-      <section className="settings-summary-grid">
-        <span>
-          <MessageCircle size={17} />
-          <strong>{joinedRooms.length}</strong>
-          <small>已加入</small>
-        </span>
-        <span>
-          <AtSign size={17} />
-          <strong>{directRooms}</strong>
-          <small>私聊</small>
-        </span>
-        <span>
-          <Shield size={17} />
-          <strong>{encryptedRooms}</strong>
-          <small>加密房间</small>
-        </span>
-        <span>
-          <SmilePlus size={17} />
-          <strong>{customEmojiCount}</strong>
-          <small>表情贴纸</small>
-        </span>
-      </section>
-
-      <section className="settings-section">
-        <div className="section-title">
-          <span>账号与设置</span>
-        </div>
-        <div className="settings-item">
-          <Shield size={19} />
-          <span>
-            <strong>Matrix ID</strong>
-            <small>{session?.userId}</small>
-          </span>
-        </div>
-        <div className="settings-item">
-          <Compass size={19} />
-          <span>
-            <strong>Homeserver</strong>
-            <small>{session?.baseUrl}</small>
-          </span>
-        </div>
-        <div className="settings-item">
-          <Moon size={19} />
-          <span>
-            <strong>当前设备</strong>
-            <small>{deviceName} · {session?.deviceId}</small>
-          </span>
-        </div>
-      </section>
-
       <section className="settings-section">
         <div className="section-title">
           <span>安全与同步</span>
@@ -7436,13 +9825,13 @@ function SettingsPanel({
             <small>{notificationLabel}</small>
           </span>
         </div>
-        <div className="settings-item">
+        <button className="settings-item button-like" type="button" onClick={onOpenEmojiManager}>
           <SmilePlus size={19} />
           <span>
             <strong>表情与贴纸</strong>
             <small>{customEmojiCount} 个可用 · 来自个人表情包和房间</small>
           </span>
-        </div>
+        </button>
         <div className="settings-item">
           <Star size={19} />
           <span>
@@ -7531,7 +9920,3 @@ function EmptyState({
     </div>
   );
 }
-
-
-
-
