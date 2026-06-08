@@ -39,13 +39,42 @@ const responseHeadersFromNative = (nativeHeaders?: Record<string, unknown>): Hea
   return headers;
 };
 
-export const matrixFetch: typeof fetch = async (input, init) => {
-  const request = new Request(input, init);
-
-  if (!Capacitor.isNativePlatform()) {
-    return fetch(request);
+const decodeBase64Data = (value: string): Uint8Array => {
+  const normalized = value.includes(',') ? value.slice(value.indexOf(',') + 1) : value;
+  const binary = window.atob(normalized);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
   }
+  return bytes;
+};
 
+const createNativeResponse = (
+  request: Request,
+  nativeResponse: Awaited<ReturnType<typeof CapacitorHttp.request>>,
+  responseType: 'blob' | 'text'
+): Response => {
+  const body =
+    responseType === 'blob'
+      ? request.method === 'HEAD' || emptyBodyStatuses.has(nativeResponse.status)
+        ? null
+        : typeof nativeResponse.data === 'string'
+          ? decodeBase64Data(nativeResponse.data)
+          : nativeResponse.data == null
+            ? new Uint8Array()
+            : nativeResponse.data
+      : responseBodyFromNativeData(nativeResponse.data, nativeResponse.status, request.method);
+
+  return new Response(body, {
+    status: nativeResponse.status,
+    headers: responseHeadersFromNative(nativeResponse.headers),
+  });
+};
+
+const runNativeHttpRequest = async (
+  request: Request,
+  responseType: 'blob' | 'text'
+): Promise<Response> => {
   if (request.signal.aborted) {
     throw createAbortError();
   }
@@ -60,18 +89,32 @@ export const matrixFetch: typeof fetch = async (input, init) => {
     url: request.url,
     headers,
     data: await readRequestBody(request),
-    responseType: 'text',
+    responseType,
     connectTimeout: 15000,
     readTimeout: 45000,
   });
 
-  return new Response(
-    responseBodyFromNativeData(nativeResponse.data, nativeResponse.status, request.method),
-    {
-      status: nativeResponse.status,
-      headers: responseHeadersFromNative(nativeResponse.headers),
-    }
-  );
+  return createNativeResponse(request, nativeResponse, responseType);
+};
+
+export const matrixFetch: typeof fetch = async (input, init) => {
+  const request = new Request(input, init);
+
+  if (!Capacitor.isNativePlatform()) {
+    return fetch(request);
+  }
+
+  return runNativeHttpRequest(request, 'text');
+};
+
+export const mediaFetch: typeof fetch = async (input, init) => {
+  const request = new Request(input, init);
+
+  if (!Capacitor.isNativePlatform()) {
+    return fetch(request);
+  }
+
+  return runNativeHttpRequest(request, 'blob');
 };
 
 export const isLikelyNetworkError = (error: unknown): boolean => {

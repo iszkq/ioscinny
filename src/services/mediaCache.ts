@@ -49,11 +49,49 @@ const blobToBase64 = async (blob: Blob): Promise<string> =>
     reader.readAsDataURL(blob);
   });
 
-const buildCachePath = async (cacheKey: string, mimeType?: string, src?: string): Promise<string> => {
+const buildCacheId = async (cacheKey: string): Promise<string> => {
   const digest = await window.crypto.subtle.digest('SHA-256', new TextEncoder().encode(cacheKey));
-  const extension = getExtensionFromMimeType(mimeType) ?? getExtensionFromUrl(src) ?? 'bin';
-  return `${MEDIA_CACHE_DIR}/${toHex(digest)}.${extension}`;
+  return toHex(digest);
 };
+
+const buildCachePath = async (cacheKey: string, mimeType?: string, src?: string): Promise<string> => {
+  const digest = await buildCacheId(cacheKey);
+  const extension = getExtensionFromMimeType(mimeType) ?? getExtensionFromUrl(src) ?? 'bin';
+  return `${MEDIA_CACHE_DIR}/${digest}.${extension}`;
+};
+
+const findExistingFilesystemCachePath = async (
+  cacheKey: string,
+  mimeType?: string,
+  src?: string
+): Promise<{ directory: Directory; path: string } | undefined> => {
+  const preferredPath = await buildCachePath(cacheKey, mimeType, src);
+  const cacheId = await buildCacheId(cacheKey);
+
+  for (const directory of [Directory.Data, Directory.Cache]) {
+    try {
+      await Filesystem.stat({ path: preferredPath, directory });
+      return { directory, path: preferredPath };
+    } catch {
+      try {
+        const result = await Filesystem.readdir({ path: MEDIA_CACHE_DIR, directory });
+        const entry = result.files.find(
+          (file) => file.type === 'file' && (file.name === cacheId || file.name.startsWith(`${cacheId}.`))
+        );
+        if (entry) {
+          return { directory, path: `${MEDIA_CACHE_DIR}/${entry.name}` };
+        }
+      } catch {
+        // Ignore missing cache directories.
+      }
+    }
+  }
+
+  return undefined;
+};
+
+const getFilesystemWriteDirectory = (mimeType?: string): Directory =>
+  mimeType?.startsWith('image/') ? Directory.Data : Directory.Cache;
 
 const toDisplayUrl = (uri: string): string => Capacitor.convertFileSrc(uri);
 
@@ -69,9 +107,9 @@ const getCachedFilesystemMediaUrl = async (
   src?: string
 ): Promise<string | undefined> => {
   try {
-    const path = await buildCachePath(cacheKey, mimeType, src);
-    await Filesystem.stat({ path, directory: Directory.Cache });
-    const { uri } = await Filesystem.getUri({ path, directory: Directory.Cache });
+    const cachedEntry = await findExistingFilesystemCachePath(cacheKey, mimeType, src);
+    if (!cachedEntry) return undefined;
+    const { uri } = await Filesystem.getUri({ path: cachedEntry.path, directory: cachedEntry.directory });
     const resolvedUrl = toDisplayUrl(uri);
     mediaUrlCache.set(cacheKey, resolvedUrl);
     return resolvedUrl;
@@ -88,14 +126,15 @@ const storeCachedFilesystemMediaBlob = async (
 ): Promise<string | undefined> => {
   try {
     const path = await buildCachePath(cacheKey, mimeType ?? blob.type, src);
+    const directory = getFilesystemWriteDirectory(mimeType ?? blob.type);
     const data = await blobToBase64(blob);
     await Filesystem.writeFile({
       path,
-      directory: Directory.Cache,
+      directory,
       data,
       recursive: true,
     });
-    const { uri } = await Filesystem.getUri({ path, directory: Directory.Cache });
+    const { uri } = await Filesystem.getUri({ path, directory });
     const resolvedUrl = toDisplayUrl(uri);
     mediaUrlCache.set(cacheKey, resolvedUrl);
     return resolvedUrl;
@@ -112,7 +151,7 @@ const buildWebCacheRequest = async (
   mimeType?: string,
   src?: string
 ): Promise<Request> => {
-  const path = await buildCachePath(cacheKey, mimeType, src);
+  const path = await buildCacheId(cacheKey);
   return new Request(`https://ioscinny.local/__media_cache__/${path}`);
 };
 

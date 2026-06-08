@@ -167,6 +167,7 @@ export type ExploreSource = {
   id: string;
   kind: ExploreSourceKind;
   title: string;
+  description?: string;
   value: string;
   createdAt: number;
   updatedAt: number;
@@ -366,7 +367,7 @@ type ReceiptWithTimestamp = {
 };
 
 const ROOM_NAME_FALLBACK = '未命名房间';
-const DEFAULT_MESSAGE_LIMIT = 140;
+const DEFAULT_MESSAGE_LIMIT = 260;
 const MAX_CUSTOM_EMOJI_ITEMS = 4096;
 const secretStorageKeys = new Map<string, Uint8Array>();
 
@@ -3322,6 +3323,7 @@ export function getExploreSources(client: MatrixClient): ExploreSource[] {
         id,
         kind: source.kind,
         title,
+        description: trimOptionalText(source.description),
         value: normalizedValue,
         createdAt: toTimestamp(source.createdAt, fallbackTimestamp),
         updatedAt: toTimestamp(source.updatedAt, fallbackTimestamp),
@@ -3348,6 +3350,38 @@ export function getExploreSources(client: MatrixClient): ExploreSource[] {
 
     return sources;
   }, []);
+}
+
+export async function saveExploreSources(
+  client: MatrixClient,
+  sources: ExploreSource[]
+): Promise<ExploreSource[]> {
+  const serializedSources = sources.map((source) => ({
+    id: source.id,
+    kind: source.kind,
+    title: source.title,
+    ...(source.description ? { description: source.description } : {}),
+    value: source.value,
+    createdAt: source.createdAt,
+    updatedAt: source.updatedAt,
+    ...(source.kind === 'web'
+      ? {
+          webOpenMode: source.webOpenMode ?? 'auto',
+          webEmbedStatus: source.webEmbedStatus ?? 'unknown',
+        }
+      : {}),
+    ...(source.kind === 'nav'
+      ? {
+          navSections: source.navSections ?? [],
+        }
+      : {}),
+  }));
+
+  await setAccountDataContent(client, 'in.cinny.explore_sources', {
+    sources: serializedSources,
+  });
+
+  return getExploreSources(client);
 }
 
 export async function updateOwnAvatar(client: MatrixClient, file: File): Promise<void> {

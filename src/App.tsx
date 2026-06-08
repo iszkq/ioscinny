@@ -1,4 +1,5 @@
 ﻿import { App as CapacitorApp } from '@capacitor/app';
+import { Capacitor } from '@capacitor/core';
 import { Device } from '@capacitor/device';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import {
@@ -7,8 +8,10 @@ import {
   Ban,
   Bell,
   CalendarDays,
+  Camera,
   Check,
   CheckSquare2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Circle,
@@ -55,6 +58,7 @@ import {
   UserMinus,
   UserPlus,
   Users,
+  Video,
   Volume2,
   VolumeX,
   X,
@@ -96,7 +100,10 @@ import {
   deleteCustomEmojiPack,
   deleteCustomEmojiPackItems,
   editTextMessage,
+  ExploreNavCard,
+  ExploreNavSection,
   ExploreSource,
+  ExploreSourceKind,
   fetchRoomMessageById,
   forwardMessagesToRooms,
   getCustomEmojiDebugSummary,
@@ -120,6 +127,7 @@ import {
   loginWithPassword,
   markRoomRead,
   MatrixSnapshot,
+  MessageReadReceipt,
   OwnProfile,
   paginateRoomMessages,
   PinnedMessageSummary,
@@ -133,6 +141,7 @@ import {
   searchPublicRooms,
   searchLocalMessages,
   EncryptedMediaFile,
+  saveExploreSources,
   sendEmoteMessage,
   sendReplyMessage,
   sendReaction,
@@ -160,6 +169,7 @@ import {
   StoredMatrixSession,
 } from './services/sessionStore';
 import { getCachedMediaUrl, peekCachedMediaUrl, storeCachedMediaBlob } from './services/mediaCache';
+import { mediaFetch } from './services/nativeFetch';
 
 type BootState = 'booting' | 'signedOut' | 'connecting' | 'signedIn' | 'error';
 type PrimaryView = 'home' | 'direct' | 'rooms' | 'spaces' | 'invites' | 'favorites' | 'explore' | 'settings';
@@ -169,7 +179,6 @@ type MobilePane = 'list' | 'chat';
 type Sheet =
   | 'new'
   | 'roomInfo'
-  | 'moreNav'
   | 'security'
   | 'emojiManager'
   | { type: 'messageInfo'; message: ChatMessage }
@@ -206,6 +215,30 @@ type AudioTranscriptionState = {
   detail?: string;
   error?: string;
 };
+type ExploreSourceEditorDraft = {
+  kind: ExploreSourceKind;
+  title: string;
+  value: string;
+  description: string;
+};
+type ExploreNavCardEditorDraft = {
+  title: string;
+  url: string;
+  description: string;
+  iconUrl: string;
+  tags: string;
+};
+type ExploreEditorSheet =
+  | { type: 'createSource'; initialKind?: ExploreSourceKind }
+  | { type: 'editSource'; source: ExploreSource }
+  | { type: 'createSection'; sourceId: string }
+  | { type: 'editSection'; sourceId: string; section: ExploreNavSection }
+  | { type: 'createCard'; sourceId: string; section: ExploreNavSection }
+  | { type: 'editCard'; sourceId: string; section: ExploreNavSection; card: ExploreNavCard };
+type ExploreDeleteIntent =
+  | { type: 'source'; source: ExploreSource }
+  | { type: 'section'; sourceId: string; section: ExploreNavSection }
+  | { type: 'card'; sourceId: string; sectionId: string; card: ExploreNavCard };
 type SpeechRecognitionLike = {
   lang: string;
   interimResults: boolean;
@@ -327,7 +360,6 @@ const reorderOrderableEmojiPacks = (
 };
 
 const bottomPrimaryViews: PrimaryView[] = ['home', 'direct', 'rooms', 'settings'];
-const moreNavViews: PrimaryView[] = ['invites', 'favorites', 'explore'];
 const roomFilterLabels: Record<RoomFilter, string> = {
   all: '全部',
   spaces: '空间',
@@ -368,22 +400,62 @@ const getOwnMessageReadReceiptSummary = (
   };
 };
 
+type InlineReadReceiptState = {
+  readReceipts: MessageReadReceipt[];
+  totalCount: number;
+};
+
+const getInlineReadReceiptStateByMessageId = (
+  messages: ChatMessage[]
+): Map<string, InlineReadReceiptState> => {
+  const states = new Map<string, InlineReadReceiptState>();
+  const ownMessages = messages.filter(
+    (message): message is ChatMessage & { sender: string } =>
+      message.kind === 'message' && message.mine && typeof message.sender === 'string'
+  );
+  if (ownMessages.length === 0) return states;
+
+  const latestMessageIdByReader = new Map<string, string>();
+
+  ownMessages.forEach((message) => {
+    message.readReceipts.forEach((receipt) => {
+      if (receipt.userId === message.sender) return;
+      latestMessageIdByReader.set(receipt.userId, message.id);
+    });
+  });
+
+  ownMessages.forEach((message) => {
+    const anchoredReadReceipts = message.readReceipts.filter(
+      (receipt) => receipt.userId !== message.sender && latestMessageIdByReader.get(receipt.userId) === message.id
+    );
+
+    if (anchoredReadReceipts.length > 0) {
+      states.set(message.id, {
+        readReceipts: anchoredReadReceipts,
+        totalCount: anchoredReadReceipts.length,
+      });
+    }
+  });
+
+  return states;
+};
+
 const formatOwnMessageReadReceiptSummary = (
   summary: { totalCount: number; readCount: number; unreadCount: number }
 ): string =>
   summary.totalCount === 1
     ? summary.readCount > 0
-      ? '对方已读'
-      : '对方未读'
+      ? '已读'
+      : '未读'
     : summary.readCount > 0
-      ? `${summary.readCount} 人已读`
-      : '暂未读';
+      ? `已读 ${summary.readCount}`
+      : '未读';
 
 const getReadReceiptStatusText = (
   message: ChatMessage,
   ownReadReceiptSummary?: { totalCount: number; readCount: number; unreadCount: number }
 ): string => {
-  if (ownReadReceiptSummary?.totalCount === 1) {
+  if (ownReadReceiptSummary) {
     return formatOwnMessageReadReceiptSummary(ownReadReceiptSummary);
   }
 
@@ -402,7 +474,7 @@ const viewLabels: Record<PrimaryView, string> = {
   direct: '私聊',
   rooms: '群组',
   spaces: '空间',
-  invites: '邀',
+  invites: '邀请',
   favorites: '收藏',
   explore: '探索',
   settings: '设置',
@@ -866,7 +938,10 @@ const getReadableSpeechError = (code?: string): string => {
     return '语音听写被浏览器拒绝了。请确认当前站点允许麦克风 / 语音识别；iOS WebView 真机需要接入原生 Speech Recognition 权限';
   }
   if (code === 'audio-capture' || code === 'NotFoundError') return '没有读取到麦克风输入，请检查系统麦克风权限';
-  if (code === 'network') return '浏览器语音识别服务连接失败，请稍后重试。';
+  if (code === 'network' && Capacitor.getPlatform() === 'ios') {
+    return '当前 IPA 还没接入 iOS 原生语音转文字；现在这套浏览器识别方案在 WKWebView 里不可用。';
+  }
+  if (code === 'network') return '当前预览环境还没接入稳定的语音转文字服务，浏览器预览里无法可靠测试。';
   if (code === 'no-speech') return '没有识别到语音内容。';
   return code ? `语音听写失败：${code}` : '语音听写失败';
 };
@@ -1055,6 +1130,16 @@ const buildMatrixMediaRetrySrcs = (...sources: Array<string | undefined>): strin
   return retrySources;
 };
 
+const buildMediaRetryCandidates = (
+  candidate: MediaCandidate
+): MediaCandidate[] =>
+  buildMatrixMediaRetrySrcs(candidate.src, candidate.fallbackSrc).map((retrySrc) => ({
+    src: retrySrc,
+    fallbackSrc: candidate.fallbackSrc,
+    encryptedFile: candidate.encryptedFile,
+    mimeType: candidate.mimeType,
+  }));
+
 const getPreviewEncryptedFile = (attachment?: ChatAttachment): EncryptedMediaFile | undefined => {
   if (!attachment) return undefined;
   if (attachment.previewEncryptedFile) return attachment.previewEncryptedFile;
@@ -1171,7 +1256,7 @@ const fetchMediaBlob = async (
   let lastError: unknown;
   for (const candidate of candidates) {
     try {
-      const response = await fetch(candidate.url, { headers: candidate.headers });
+      const response = await mediaFetch(candidate.url, { headers: candidate.headers });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const blob = await response.blob();
       return encryptedFile
@@ -1226,9 +1311,11 @@ const useAuthenticatedMediaState = (
     ? `${encryptedFile.url}|${encryptedFile.iv}|${encryptedFile.hashes?.sha256 ?? ''}`
     : '';
   const immediateDisplaySrc = getImmediateMediaDisplaySrc(src, accessToken, fallbackSrc);
+  const deferNativePlaybackSrc =
+    Capacitor.isNativePlatform() && (mimeType?.startsWith('audio/') || mimeType?.startsWith('video/'));
   const [state, setState] = useState<{ resolvedSrc?: string; loading: boolean; failed: boolean }>(() => ({
-    resolvedSrc: encryptedFile ? immediateDisplaySrc ?? fallbackSrc : immediateDisplaySrc,
-    loading: Boolean(src && encryptedFile),
+    resolvedSrc: encryptedFile || deferNativePlaybackSrc ? undefined : immediateDisplaySrc ?? fallbackSrc,
+    loading: Boolean(src && (encryptedFile || deferNativePlaybackSrc)),
     failed: false,
   }));
 
@@ -1242,9 +1329,9 @@ const useAuthenticatedMediaState = (
 
     if (!src) {
       setState({
-        resolvedSrc: nextImmediateDisplaySrc,
+        resolvedSrc: deferNativePlaybackSrc ? undefined : nextImmediateDisplaySrc,
         loading: false,
-        failed: !nextImmediateDisplaySrc,
+        failed: deferNativePlaybackSrc ? false : !nextImmediateDisplaySrc,
       });
       return undefined;
     }
@@ -1269,7 +1356,7 @@ const useAuthenticatedMediaState = (
     }
 
     setState({
-      resolvedSrc: nextImmediateDisplaySrc,
+      resolvedSrc: deferNativePlaybackSrc ? undefined : nextImmediateDisplaySrc,
       loading: true,
       failed: false,
     });
@@ -1317,7 +1404,7 @@ const useAuthenticatedMediaState = (
       cancelled = true;
       if (objectUrl) URL.revokeObjectURL(objectUrl);
     };
-  }, [accessToken, encryptedFileSignature, fallbackSrc, mimeType, src]);
+  }, [accessToken, deferNativePlaybackSrc, encryptedFileSignature, fallbackSrc, mimeType, src]);
 
   return state;
 };
@@ -1604,6 +1691,10 @@ const transcribeAudioBlobInBrowser = async (
   blob: Blob,
   onProgress?: (text: string, detail: string) => void
 ): Promise<string> => {
+  if (Capacitor.getPlatform() === 'ios') {
+    throw new Error('当前 IPA 还没接入 iOS 原生语音转文字；现有浏览器识别方案在 WKWebView 里不可用。');
+  }
+
   const AudioContextCtor =
     window.AudioContext ??
     (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -1749,6 +1840,54 @@ const normalizeServerName = (value: string): string => {
   }
 };
 
+const createLocalId = (prefix: string): string =>
+  `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+const trimToUndefined = (value: string): string | undefined => {
+  const trimmed = value.trim();
+  return trimmed ? trimmed : undefined;
+};
+
+const parseExploreTagDraft = (value: string): string[] | undefined => {
+  const tags = value
+    .split(/[,\n，]/)
+    .map((tag) => tag.trim())
+    .filter(Boolean);
+  return tags.length > 0 ? Array.from(new Set(tags)) : undefined;
+};
+
+const createEmptyExploreSourceDraft = (
+  kind: ExploreSourceKind = 'nav'
+): ExploreSourceEditorDraft => ({
+  kind,
+  title: '',
+  value: '',
+  description: '',
+});
+
+const toExploreSourceDraft = (source: ExploreSource): ExploreSourceEditorDraft => ({
+  kind: source.kind,
+  title: source.title,
+  value: source.kind === 'nav' ? source.value || source.title : source.value,
+  description: source.description ?? '',
+});
+
+const createEmptyExploreCardDraft = (): ExploreNavCardEditorDraft => ({
+  title: '',
+  url: '',
+  description: '',
+  iconUrl: '',
+  tags: '',
+});
+
+const toExploreCardDraft = (card: ExploreNavCard): ExploreNavCardEditorDraft => ({
+  title: card.title,
+  url: card.url,
+  description: card.description ?? '',
+  iconUrl: card.iconUrl ?? '',
+  tags: card.tags?.join(', ') ?? '',
+});
+
 const getCinnyFavoritesRoomId = (client: MatrixClient | undefined, rooms: RoomSummary[]): string | undefined => {
   const accountData = (client as unknown as {
     getAccountData?: (eventType: string) => { getContent?: () => unknown } | undefined;
@@ -1824,6 +1963,13 @@ type EmojiCollection =
     };
 
 const compactMediaEdgePx = 320;
+const composerAttachmentInputIds = {
+  file: 'composer-attachment-file',
+  image: 'composer-attachment-image',
+  video: 'composer-attachment-video',
+  cameraImage: 'composer-attachment-camera-image',
+  cameraVideo: 'composer-attachment-camera-video',
+} as const;
 
 const isCompactMediaAsset = (width?: number, height?: number): boolean =>
   typeof width === 'number' &&
@@ -1837,7 +1983,6 @@ const isStickerLikeMessage = (message: ChatMessage): boolean =>
 
 export function App() {
   const runtimeStopRef = useRef<(() => void) | undefined>();
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | undefined>();
   const mediaRecorderRef = useRef<MediaRecorder | undefined>();
   const mediaRecorderStreamRef = useRef<MediaStream | undefined>();
@@ -1877,6 +2022,7 @@ export function App() {
   const [messageSearchOpen, setMessageSearchOpen] = useState(false);
   const [messageDraft, setMessageDraft] = useState('');
   const [composerMode, setComposerMode] = useState<ComposerMode>({ type: 'normal' });
+  const [attachmentPickerOpen, setAttachmentPickerOpen] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string>();
   const [editingMessageDraft, setEditingMessageDraft] = useState('');
   const [savingInlineEdit, setSavingInlineEdit] = useState(false);
@@ -2186,6 +2332,11 @@ export function App() {
     return getRoomMessages(client, selectedRoomId, messageQuery);
   }, [client, messageQuery, selectedRoomId, snapshot.version]);
 
+  const selectedRoomInlineReadReceiptStates = useMemo(
+    () => getInlineReadReceiptStateByMessageId(selectedRoomMessages),
+    [selectedRoomMessages]
+  );
+
   const selectedForwardMessages = useMemo(
     () =>
       selectedRoomMessages.filter(
@@ -2381,22 +2532,26 @@ export function App() {
       refreshCustomEmojiState(client);
       return;
     }
-    let cancelled = false;
     setRoomMembers(getRoomMembers(client, selectedRoomId));
     setRoomMediaItems(getRoomMediaItems(client, selectedRoomId));
     setPinnedMessages(getPinnedMessages(client, selectedRoomId));
     refreshCustomEmojiState(client);
+  }, [client, refreshCustomEmojiState, selectedRoomId, snapshot.version]);
+
+  useEffect(() => {
+    if (!client || !selectedRoomId) return undefined;
+
+    let cancelled = false;
 
     void loadRoomMembers(client, selectedRoomId).then((members) => {
       if (cancelled) return;
       setRoomMembers(members);
-      refreshSnapshot(client);
     });
 
     return () => {
       cancelled = true;
     };
-  }, [client, refreshCustomEmojiState, selectedRoomId, snapshot.version]);
+  }, [client, selectedRoomId]);
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -2424,11 +2579,7 @@ export function App() {
             .join('|')
         : ''
     );
-
-    if (summary) {
-      console.info('[ioscinny:emoji-debug]', JSON.stringify(summary));
-    }
-  }, [client, selectedRoomId, snapshot.version]);
+  }, [client, selectedRoomId]);
 
   useEffect(() => {
     if (!client) return;
@@ -2989,6 +3140,7 @@ export function App() {
   const handleFileSelected = async (evt: ChangeEvent<HTMLInputElement>) => {
     const file = evt.target.files?.[0];
     evt.target.value = '';
+    setAttachmentPickerOpen(false);
     if (!client || !selectedRoom || !file) return;
 
     await runAction(
@@ -3535,6 +3687,289 @@ export function App() {
     setExploreServers((current) => current.filter((item) => item !== server));
   };
 
+  const commitExploreSources = useCallback(
+    async (
+      updater: (current: ExploreSource[]) => { sources: ExploreSource[]; selectedSourceId?: string },
+      success: string
+    ): Promise<boolean> => {
+      if (!client) return false;
+
+      setError(undefined);
+      try {
+        const nextState = updater(exploreSources);
+        const savedSources = await saveExploreSources(client, nextState.sources);
+        setExploreSources(savedSources);
+        if (nextState.selectedSourceId !== undefined) {
+          setSelectedExploreSourceId(nextState.selectedSourceId);
+        }
+        refreshSnapshot(client);
+        await Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
+        setNotice(success);
+        return true;
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        return false;
+      }
+    },
+    [client, exploreSources, refreshSnapshot]
+  );
+
+  const handleCreateExploreSource = useCallback(
+    async (draft: ExploreSourceEditorDraft): Promise<boolean> => {
+      const sourceId = createLocalId('source');
+      const now = Date.now();
+      const trimmedTitle = draft.title.trim();
+      const nextSource: ExploreSource = {
+        id: sourceId,
+        kind: draft.kind,
+        title: trimmedTitle,
+        description: trimToUndefined(draft.description),
+        value:
+          draft.kind === 'nav'
+            ? draft.value.trim() || trimmedTitle
+            : draft.value.trim(),
+        createdAt: now,
+        updatedAt: now,
+        ...(draft.kind === 'nav' ? { navSections: [] } : {}),
+        ...(draft.kind === 'web'
+          ? {
+              webOpenMode: 'auto' as const,
+              webEmbedStatus: 'unknown' as const,
+            }
+          : {}),
+      };
+
+      return commitExploreSources(
+        (current) => ({
+          sources: [nextSource, ...current],
+          selectedSourceId: sourceId,
+        }),
+        '已添加探索来源'
+      );
+    },
+    [commitExploreSources]
+  );
+
+  const handleUpdateExploreSource = useCallback(
+    async (sourceId: string, draft: ExploreSourceEditorDraft): Promise<boolean> =>
+      commitExploreSources(
+        (current) => ({
+          sources: current.map((source) =>
+            source.id !== sourceId
+              ? source
+              : {
+                  ...source,
+                  title: draft.title.trim(),
+                  description: trimToUndefined(draft.description),
+                  value:
+                    source.kind === 'nav'
+                      ? draft.value.trim() || draft.title.trim()
+                      : draft.value.trim(),
+                  updatedAt: Date.now(),
+                }
+          ),
+          selectedSourceId: sourceId,
+        }),
+        '已更新探索来源'
+      ),
+    [commitExploreSources]
+  );
+
+  const handleDeleteExploreSource = useCallback(
+    async (sourceId: string): Promise<boolean> =>
+      commitExploreSources((current) => {
+        const remainingSources = current.filter((source) => source.id !== sourceId);
+        const nextSelectedSource =
+          selectedExploreSourceId === sourceId
+            ? (remainingSources.find((source) => source.kind === 'nav') ?? remainingSources[0])?.id
+            : selectedExploreSourceId;
+        return {
+          sources: remainingSources,
+          selectedSourceId: nextSelectedSource,
+        };
+      }, '已删除探索来源'),
+    [commitExploreSources, selectedExploreSourceId]
+  );
+
+  const handleCreateExploreSection = useCallback(
+    async (sourceId: string, title: string): Promise<boolean> => {
+      const sectionId = createLocalId('section');
+      return commitExploreSources(
+        (current) => ({
+          sources: current.map((source) =>
+            source.id !== sourceId || source.kind !== 'nav'
+              ? source
+              : {
+                  ...source,
+                  updatedAt: Date.now(),
+                  navSections: [
+                    ...(source.navSections ?? []),
+                    {
+                      id: sectionId,
+                      title: title.trim(),
+                      cards: [],
+                    },
+                  ],
+                }
+          ),
+          selectedSourceId: sourceId,
+        }),
+        '已添加分组'
+      );
+    },
+    [commitExploreSources]
+  );
+
+  const handleUpdateExploreSection = useCallback(
+    async (sourceId: string, sectionId: string, title: string): Promise<boolean> =>
+      commitExploreSources(
+        (current) => ({
+          sources: current.map((source) =>
+            source.id !== sourceId || source.kind !== 'nav'
+              ? source
+              : {
+                  ...source,
+                  updatedAt: Date.now(),
+                  navSections: (source.navSections ?? []).map((section) =>
+                    section.id === sectionId ? { ...section, title: title.trim() } : section
+                  ),
+                }
+          ),
+          selectedSourceId: sourceId,
+        }),
+        '已更新分组'
+      ),
+    [commitExploreSources]
+  );
+
+  const handleDeleteExploreSection = useCallback(
+    async (sourceId: string, sectionId: string): Promise<boolean> =>
+      commitExploreSources(
+        (current) => ({
+          sources: current.map((source) =>
+            source.id !== sourceId || source.kind !== 'nav'
+              ? source
+              : {
+                  ...source,
+                  updatedAt: Date.now(),
+                  navSections: (source.navSections ?? []).filter((section) => section.id !== sectionId),
+                }
+          ),
+          selectedSourceId: sourceId,
+        }),
+        '已删除分组'
+      ),
+    [commitExploreSources]
+  );
+
+  const handleCreateExploreCard = useCallback(
+    async (sourceId: string, sectionId: string, draft: ExploreNavCardEditorDraft): Promise<boolean> => {
+      const cardId = createLocalId('card');
+      const nextCard: ExploreNavCard = {
+        id: cardId,
+        title: draft.title.trim(),
+        url: draft.url.trim(),
+        description: trimToUndefined(draft.description),
+        iconUrl: trimToUndefined(draft.iconUrl),
+        tags: parseExploreTagDraft(draft.tags),
+      };
+
+      return commitExploreSources(
+        (current) => ({
+          sources: current.map((source) =>
+            source.id !== sourceId || source.kind !== 'nav'
+              ? source
+              : {
+                  ...source,
+                  updatedAt: Date.now(),
+                  navSections: (source.navSections ?? []).map((section) =>
+                    section.id !== sectionId
+                      ? section
+                      : {
+                          ...section,
+                          cards: [...section.cards, nextCard],
+                        }
+                  ),
+                }
+          ),
+          selectedSourceId: sourceId,
+        }),
+        '已创建卡片'
+      );
+    },
+    [commitExploreSources]
+  );
+
+  const handleUpdateExploreCard = useCallback(
+    async (
+      sourceId: string,
+      sectionId: string,
+      cardId: string,
+      draft: ExploreNavCardEditorDraft
+    ): Promise<boolean> =>
+      commitExploreSources(
+        (current) => ({
+          sources: current.map((source) =>
+            source.id !== sourceId || source.kind !== 'nav'
+              ? source
+              : {
+                  ...source,
+                  updatedAt: Date.now(),
+                  navSections: (source.navSections ?? []).map((section) =>
+                    section.id !== sectionId
+                      ? section
+                      : {
+                          ...section,
+                          cards: section.cards.map((card) =>
+                            card.id !== cardId
+                              ? card
+                              : {
+                                  ...card,
+                                  title: draft.title.trim(),
+                                  url: draft.url.trim(),
+                                  description: trimToUndefined(draft.description),
+                                  iconUrl: trimToUndefined(draft.iconUrl),
+                                  tags: parseExploreTagDraft(draft.tags),
+                                }
+                          ),
+                        }
+                  ),
+                }
+          ),
+          selectedSourceId: sourceId,
+        }),
+        '已更新卡片'
+      ),
+    [commitExploreSources]
+  );
+
+  const handleDeleteExploreCard = useCallback(
+    async (sourceId: string, sectionId: string, cardId: string): Promise<boolean> =>
+      commitExploreSources(
+        (current) => ({
+          sources: current.map((source) =>
+            source.id !== sourceId || source.kind !== 'nav'
+              ? source
+              : {
+                  ...source,
+                  updatedAt: Date.now(),
+                  navSections: (source.navSections ?? []).map((section) =>
+                    section.id !== sectionId
+                      ? section
+                      : {
+                          ...section,
+                          cards: section.cards.filter((card) => card.id !== cardId),
+                        }
+                  ),
+                }
+          ),
+          selectedSourceId: sourceId,
+        }),
+        '已删除卡片'
+      ),
+    [commitExploreSources]
+  );
+
   const handlePublicSearch = async (
     evt?: FormEvent<HTMLFormElement>,
     overrideSearch?: { server: string; query: string }
@@ -3593,10 +4028,7 @@ export function App() {
     });
   };
 
-  const favoriteMessageCount = Object.values(favoriteMessageIds).reduce(
-    (count, ids) => count + ids.length,
-    0
-  );
+  const favoriteMessageCount = favoriteMessageItems.length;
 
   if (bootState === 'booting') {
     return <LoadingScreen label="正在启动 Starfire iOS" />;
@@ -3810,6 +4242,15 @@ export function App() {
             onSelectSource={setSelectedExploreSourceId}
             onChange={setPublicSearch}
             onSearch={handlePublicSearch}
+            onCreateSource={handleCreateExploreSource}
+            onUpdateSource={handleUpdateExploreSource}
+            onDeleteSource={handleDeleteExploreSource}
+            onCreateSection={handleCreateExploreSection}
+            onUpdateSection={handleUpdateExploreSection}
+            onDeleteSection={handleDeleteExploreSection}
+            onCreateCard={handleCreateExploreCard}
+            onUpdateCard={handleUpdateExploreCard}
+            onDeleteCard={handleDeleteExploreCard}
             onPickServer={(server) => {
               const nextSearch = { ...publicSearch, server };
               setPublicSearch(nextSearch);
@@ -3840,6 +4281,7 @@ export function App() {
             snapshot={snapshot}
             favoriteMessageCount={favoriteMessageCount}
             customEmojiCount={customEmojiItems.length}
+            exploreSourceCount={exploreSources.length}
             onLogout={handleLogout}
             ownProfile={ownProfile}
             profileForm={profileForm}
@@ -3852,6 +4294,18 @@ export function App() {
             onPreferencesChange={setPreferences}
             onOpenSecurity={() => setSheet('security')}
             onOpenEmojiManager={() => setSheet('emojiManager')}
+            onOpenFavorites={() => {
+              setActiveView('favorites');
+              setMobilePane('list');
+            }}
+            onOpenInvites={() => {
+              setActiveView('invites');
+              setMobilePane('list');
+            }}
+            onOpenExplore={() => {
+              setActiveView('explore');
+              setMobilePane('list');
+            }}
             onClearLocal={() => {
               window.localStorage.removeItem(favoriteRoomsKey);
               window.localStorage.removeItem(favoriteMessagesKey);
@@ -3874,7 +4328,6 @@ export function App() {
               <button className="mobile-back" onClick={() => setMobilePane('list')} aria-label="返回">
                 <ChevronLeft size={22} />
               </button>
-              <Avatar name={selectedRoom.name} src={selectedRoom.avatarUrl} accessToken={session?.accessToken} />
               <div className="chat-title">
                 <h2>{selectedRoom.name}</h2>
                 <span>
@@ -3882,37 +4335,39 @@ export function App() {
                   {selectedRoom.encrypted ? ' · E2EE' : ''}
                 </span>
               </div>
-              <button
-                className={messageSearchOpen || messageQuery.trim() ? 'icon-button active' : 'icon-button'}
-                onClick={() => {
-                  if (messageSearchOpen || messageQuery.trim()) {
-                    setMessageQuery('');
-                    setMessageSearchOpen(false);
-                    return;
-                  }
-                  setMessageSearchOpen(true);
-                }}
-                aria-label="搜索房间消息"
-              >
-                <Search size={19} />
-              </button>
-              <button
-                className={favoriteRoomIds.includes(selectedRoom.id) ? 'icon-button active' : 'icon-button'}
-                onClick={() => toggleFavoriteRoom(selectedRoom.id)}
-                aria-label="收藏房间"
-              >
-                <Star size={19} />
-              </button>
-              <button
-                className={cryptoStatus.cryptoReady ? 'icon-button' : 'icon-button warning'}
-                onClick={() => setSheet('security')}
-                aria-label="加密与密钥恢复"
-              >
-                <KeyRound size={19} />
-              </button>
-              <button className="icon-button" onClick={() => setSheet('roomInfo')} aria-label="房间信息">
-                <Info size={19} />
-              </button>
+              <div className="chat-header-actions">
+                <button
+                  className={messageSearchOpen || messageQuery.trim() ? 'icon-button active' : 'icon-button'}
+                  onClick={() => {
+                    if (messageSearchOpen || messageQuery.trim()) {
+                      setMessageQuery('');
+                      setMessageSearchOpen(false);
+                      return;
+                    }
+                    setMessageSearchOpen(true);
+                  }}
+                  aria-label="搜索房间消息"
+                >
+                  <Search size={19} />
+                </button>
+                <button
+                  className={favoriteRoomIds.includes(selectedRoom.id) ? 'icon-button active' : 'icon-button'}
+                  onClick={() => toggleFavoriteRoom(selectedRoom.id)}
+                  aria-label="收藏房间"
+                >
+                  <Star size={19} />
+                </button>
+                <button
+                  className={cryptoStatus.cryptoReady ? 'icon-button' : 'icon-button warning'}
+                  onClick={() => setSheet('security')}
+                  aria-label="加密与密钥恢复"
+                >
+                  <KeyRound size={19} />
+                </button>
+                <button className="icon-button" onClick={() => setSheet('roomInfo')} aria-label="房间信息">
+                  <Info size={19} />
+                </button>
+              </div>
             </header>
 
             {(messageSearchOpen || messageQuery.trim()) && (
@@ -4009,6 +4464,7 @@ export function App() {
                         members={roomMembers}
                         currentUserProfile={ownProfile}
                         readReceiptAvatarCount={preferences.readReceiptAvatarCount}
+                        inlineReadReceiptState={selectedRoomInlineReadReceiptStates.get(message.id)}
                         audioTranscription={audioTranscriptions[message.id]}
                         onToggleSelection={() => toggleMessageSelection(message)}
                         onFavorite={() => toggleFavoriteMessage(message)}
@@ -4120,12 +4576,57 @@ export function App() {
                   />
                 </div>
               )}
-              <input ref={fileInputRef} type="file" hidden onChange={handleFileSelected} />
+              <input
+                id={composerAttachmentInputIds.file}
+                className="attachment-picker-input"
+                type="file"
+                aria-hidden="true"
+                tabIndex={-1}
+                onChange={handleFileSelected}
+              />
+              <input
+                id={composerAttachmentInputIds.image}
+                className="attachment-picker-input"
+                type="file"
+                accept="image/*"
+                aria-hidden="true"
+                tabIndex={-1}
+                onChange={handleFileSelected}
+              />
+              <input
+                id={composerAttachmentInputIds.video}
+                className="attachment-picker-input"
+                type="file"
+                accept="video/*"
+                aria-hidden="true"
+                tabIndex={-1}
+                onChange={handleFileSelected}
+              />
+              <input
+                id={composerAttachmentInputIds.cameraImage}
+                className="attachment-picker-input"
+                type="file"
+                accept="image/*"
+                capture="environment"
+                aria-hidden="true"
+                tabIndex={-1}
+                onChange={handleFileSelected}
+              />
+              <input
+                id={composerAttachmentInputIds.cameraVideo}
+                className="attachment-picker-input"
+                type="file"
+                accept="video/*"
+                capture="environment"
+                aria-hidden="true"
+                tabIndex={-1}
+                onChange={handleFileSelected}
+              />
               <div className="composer-tools" aria-label="输入工具">
                 <button
                   className="icon-button"
                   type="button"
-                  onClick={() => fileInputRef.current?.click()}
+                  onClick={() => setAttachmentPickerOpen(true)}
                   aria-label="发送附件"
                   disabled={selectedRoom.membership !== 'join'}
                 >
@@ -4174,12 +4675,18 @@ export function App() {
           />
         )}
       </section>
+      {attachmentPickerOpen && <AttachmentPickerSheet onClose={() => setAttachmentPickerOpen(false)} />}
 
       <nav className="bottom-nav" aria-label="底部导航">
         {bottomPrimaryViews.map((view) => (
           <button
             key={view}
-            className={activeView === view ? 'bottom-button active' : 'bottom-button'}
+            className={
+              activeView === view ||
+              (view === 'settings' && ['favorites', 'invites', 'explore'].includes(activeView))
+                ? 'bottom-button active'
+                : 'bottom-button'
+            }
             onClick={() => {
               setActiveView(view);
               setMobilePane('list');
@@ -4189,27 +4696,7 @@ export function App() {
             <span>{viewLabels[view]}</span>
           </button>
         ))}
-        <button
-          className={moreNavViews.includes(activeView) ? 'bottom-button active' : 'bottom-button'}
-          onClick={() => setSheet('moreNav')}
-        >
-          <MoreHorizontal size={20} />
-          <span>更多</span>
-        </button>
       </nav>
-
-      {sheet === 'moreNav' && (
-        <MoreNavSheet
-          activeView={activeView}
-          unreadByView={unreadByView}
-          onClose={() => setSheet(undefined)}
-          onPick={(view) => {
-            setActiveView(view);
-            setMobilePane('list');
-            setSheet(undefined);
-          }}
-        />
-      )}
 
       {sheet === 'security' && (
         <SecuritySheet
@@ -5650,6 +6137,7 @@ function ProgressiveImagePreview({
   mimeType,
   alt,
   className,
+  previewOnly = false,
 }: {
   previewSrc?: string;
   previewFallbackSrc?: string;
@@ -5662,15 +6150,26 @@ function ProgressiveImagePreview({
   mimeType?: string;
   alt: string;
   className?: string;
+  previewOnly?: boolean;
 }) {
-  const previewState = useAuthenticatedMediaState(
-    previewSrc,
-    accessToken,
-    previewFallbackSrc,
-    previewEncryptedFile,
-    previewMimeType
+  const previewBaseCandidate = useMemo<MediaCandidate>(
+    () => ({
+      src: previewSrc,
+      fallbackSrc: previewFallbackSrc,
+      encryptedFile: previewEncryptedFile,
+      mimeType: previewMimeType,
+    }),
+    [previewEncryptedFile, previewFallbackSrc, previewMimeType, previewSrc]
   );
-  const fullState = useAuthenticatedMediaState(src, accessToken, fallbackSrc, encryptedFile, mimeType);
+  const fullBaseCandidate = useMemo<MediaCandidate>(
+    () => ({
+      src,
+      fallbackSrc,
+      encryptedFile,
+      mimeType,
+    }),
+    [encryptedFile, fallbackSrc, mimeType, src]
+  );
   const previewEncryptedSignature = previewEncryptedFile
     ? `${previewEncryptedFile.url}|${previewEncryptedFile.iv}|${previewEncryptedFile.hashes?.sha256 ?? ''}`
     : '';
@@ -5682,27 +6181,76 @@ function ProgressiveImagePreview({
     (previewFallbackSrc ?? '') === (fallbackSrc ?? '') &&
     previewEncryptedSignature === fullEncryptedSignature &&
     (previewMimeType ?? '') === (mimeType ?? '');
+  const previewCandidates = useMemo(
+    () =>
+      dedupeMediaCandidates([
+        previewBaseCandidate,
+        ...buildMediaRetryCandidates(previewBaseCandidate),
+        ...(previewAndFullSameAsset
+          ? []
+          : [
+              fullBaseCandidate,
+              ...buildMediaRetryCandidates(fullBaseCandidate),
+            ]),
+      ]),
+    [fullBaseCandidate, previewAndFullSameAsset, previewBaseCandidate]
+  );
+  const previewOnlyState = useResolvedMediaCandidateList(previewCandidates, accessToken);
+  const fullCandidates = useMemo(
+    () =>
+      dedupeMediaCandidates([
+        fullBaseCandidate,
+        ...buildMediaRetryCandidates(fullBaseCandidate),
+        ...(previewAndFullSameAsset
+          ? []
+          : [
+              previewBaseCandidate,
+              ...buildMediaRetryCandidates(previewBaseCandidate),
+            ]),
+      ]),
+    [fullBaseCandidate, previewAndFullSameAsset, previewBaseCandidate]
+  );
+  const previewState = previewOnlyState;
+  const fullState = useResolvedMediaCandidateList(fullCandidates, accessToken);
   const [fullLoaded, setFullLoaded] = useState(false);
-  const [fullFailed, setFullFailed] = useState(false);
-  const [previewFailed, setPreviewFailed] = useState(false);
-
-  useEffect(() => {
-    setPreviewFailed(false);
-  }, [previewState.resolvedSrc]);
 
   useEffect(() => {
     setFullLoaded(false);
-    setFullFailed(false);
   }, [fullState.resolvedSrc]);
 
   useEffect(() => {
     setFullLoaded(false);
-    setFullFailed(false);
-    setPreviewFailed(false);
   }, [previewSrc, src]);
 
-  const canShowPreview = Boolean(previewState.resolvedSrc) && !previewFailed;
-  const canShowFull = !previewAndFullSameAsset && Boolean(fullState.resolvedSrc) && !fullFailed;
+  if (previewOnly) {
+    const previewOnlyResolvedSrc = !previewOnlyState.loading ? previewOnlyState.resolvedSrc : undefined;
+    const fullFallbackResolvedSrc = !fullState.loading ? fullState.resolvedSrc : undefined;
+    const visiblePreviewOnlySrc = previewOnlyResolvedSrc ?? fullFallbackResolvedSrc;
+    const previewOnlyLoading = previewOnlyState.loading || (!previewOnlyResolvedSrc && fullState.loading);
+    const previewOnlyErrorHandler = previewOnlyResolvedSrc
+      ? previewOnlyState.onRenderedError
+      : fullState.onRenderedError;
+
+    if (!visiblePreviewOnlySrc) {
+      return (
+        <MediaFallback
+          label={previewOnlyLoading ? '图片加载中...' : '图片暂不可预览'}
+        />
+      );
+    }
+
+    return (
+      <img
+        className={className}
+        src={visiblePreviewOnlySrc}
+        alt={alt}
+        onError={previewOnlyErrorHandler}
+      />
+    );
+  }
+
+  const canShowPreview = Boolean(previewState.resolvedSrc);
+  const canShowFull = !previewAndFullSameAsset && Boolean(fullState.resolvedSrc);
   const visibleSrc = canShowFull ? fullState.resolvedSrc : canShowPreview ? previewState.resolvedSrc : undefined;
   if (!visibleSrc) {
     return (
@@ -5714,9 +6262,9 @@ function ProgressiveImagePreview({
 
   const overlayLabel = previewAndFullSameAsset
     ? undefined
-    : fullFailed
+    : fullState.failed
     ? '原图加载失败，已显示预览'
-    : fullState.loading || !fullLoaded
+    : canShowPreview && (fullState.loading || !fullLoaded)
       ? '原图正在加载中'
       : undefined;
 
@@ -5724,26 +6272,25 @@ function ProgressiveImagePreview({
     <div className="progressive-media-frame">
       {canShowPreview && (
         <img
-          className={`${className ?? ''} progressive-media-layer preview${fullLoaded && !fullFailed ? ' hidden' : ''}`.trim()}
+          className={`${className ?? ''} progressive-media-layer preview${fullLoaded && !fullState.failed ? ' hidden' : ''}`.trim()}
           src={previewState.resolvedSrc}
           alt=""
-          onError={() => setPreviewFailed(true)}
+          onError={previewState.onRenderedError}
         />
       )}
       {canShowFull && (
         <img
-          className={`${className ?? ''} progressive-media-layer full${fullLoaded && !fullFailed ? ' ready' : ''}`.trim()}
+          className={`${className ?? ''} progressive-media-layer full${fullLoaded && !fullState.failed ? ' ready' : ''}`.trim()}
           src={fullState.resolvedSrc}
           alt=""
           onLoad={() => {
             setFullLoaded(true);
-            setFullFailed(false);
           }}
-          onError={() => setFullFailed(true)}
+          onError={fullState.onRenderedError}
         />
       )}
       {overlayLabel && (
-        <div className={`media-preview-loading-overlay${fullFailed ? ' error' : ''}`}>
+        <div className={`media-preview-loading-overlay${fullState.failed ? ' error' : ''}`}>
           <small>{overlayLabel}</small>
         </div>
       )}
@@ -5774,29 +6321,58 @@ function ProgressiveVideoPreview({
   mimeType?: string;
   className?: string;
 }) {
-  const posterState = useAuthenticatedMediaState(
-    previewSrc,
-    accessToken,
-    previewFallbackSrc,
-    previewEncryptedFile,
-    previewMimeType
+  const posterBaseCandidate = useMemo<MediaCandidate>(
+    () => ({
+      src: previewSrc,
+      fallbackSrc: previewFallbackSrc,
+      encryptedFile: previewEncryptedFile,
+      mimeType: previewMimeType,
+    }),
+    [previewEncryptedFile, previewFallbackSrc, previewMimeType, previewSrc]
   );
-  const videoState = useAuthenticatedMediaState(src, accessToken, fallbackSrc, encryptedFile, mimeType);
+  const videoBaseCandidate = useMemo<MediaCandidate>(
+    () => ({
+      src,
+      fallbackSrc,
+      encryptedFile,
+      mimeType,
+    }),
+    [encryptedFile, fallbackSrc, mimeType, src]
+  );
+  const posterCandidates = useMemo(
+    () =>
+      dedupeMediaCandidates([
+        posterBaseCandidate,
+        ...buildMediaRetryCandidates(posterBaseCandidate),
+        videoBaseCandidate,
+        ...buildMediaRetryCandidates(videoBaseCandidate),
+      ]),
+    [posterBaseCandidate, videoBaseCandidate]
+  );
+  const videoCandidates = useMemo(
+    () =>
+      dedupeMediaCandidates([
+        videoBaseCandidate,
+        ...buildMediaRetryCandidates(videoBaseCandidate),
+        posterBaseCandidate,
+        ...buildMediaRetryCandidates(posterBaseCandidate),
+      ]),
+    [posterBaseCandidate, videoBaseCandidate]
+  );
+  const posterState = useResolvedMediaCandidateList(posterCandidates, accessToken);
+  const videoState = useResolvedMediaCandidateList(videoCandidates, accessToken);
   const [videoReady, setVideoReady] = useState(false);
-  const [videoFailed, setVideoFailed] = useState(false);
 
   useEffect(() => {
-    setVideoFailed(false);
+    setVideoReady(false);
   }, [posterState.resolvedSrc]);
 
   useEffect(() => {
     setVideoReady(false);
-    setVideoFailed(false);
   }, [videoState.resolvedSrc]);
 
   useEffect(() => {
     setVideoReady(false);
-    setVideoFailed(false);
   }, [previewSrc, src]);
 
   if (!posterState.resolvedSrc && !videoState.resolvedSrc) {
@@ -5807,7 +6383,7 @@ function ProgressiveVideoPreview({
     );
   }
 
-  const overlayLabel = videoFailed
+  const overlayLabel = videoState.failed
     ? '视频加载失败，已显示封面'
     : videoState.loading || !videoReady
       ? '正在加载视频'
@@ -5815,10 +6391,10 @@ function ProgressiveVideoPreview({
 
   return (
     <div className="progressive-video-shell">
-      {posterState.resolvedSrc && (!videoReady || videoFailed) && (
+      {posterState.resolvedSrc && (!videoReady || videoState.failed) && (
         <img className="media-preview-poster" src={posterState.resolvedSrc} alt="" />
       )}
-      {videoState.resolvedSrc && !videoFailed && (
+      {videoState.resolvedSrc && !videoState.failed && (
         <video
           className={className}
           src={videoState.resolvedSrc}
@@ -5827,12 +6403,12 @@ function ProgressiveVideoPreview({
           poster={posterState.resolvedSrc}
           onLoadedData={() => setVideoReady(true)}
           onCanPlay={() => setVideoReady(true)}
-          onError={() => setVideoFailed(true)}
+          onError={videoState.onRenderedError}
           style={{ opacity: videoReady ? 1 : 0 }}
         />
       )}
       {overlayLabel && (
-        <div className={`media-preview-loading-overlay${videoFailed ? ' error' : ''}`}>
+        <div className={`media-preview-loading-overlay${videoState.failed ? ' error' : ''}`}>
           <small>{overlayLabel}</small>
         </div>
       )}
@@ -5980,6 +6556,67 @@ function AttachmentLink({
   );
 }
 
+function AttachmentPickerSheet({ onClose }: { onClose: () => void }) {
+  const handleOptionClick = () => {
+    window.setTimeout(() => {
+      onClose();
+    }, 0);
+  };
+
+  return (
+    <div className="attachment-picker-backdrop" onClick={onClose}>
+      <div className="attachment-picker-sheet" onClick={(event) => event.stopPropagation()}>
+        <span className="attachment-picker-grabber" aria-hidden="true" />
+        <div className="attachment-picker-card">
+          <div className="attachment-picker-options">
+            <label className="attachment-picker-option" htmlFor={composerAttachmentInputIds.image} onClick={handleOptionClick}>
+              <span className="attachment-picker-option-icon" aria-hidden="true">
+                <ImageIcon size={18} />
+              </span>
+              <span className="attachment-picker-option-label">从相册选照片</span>
+            </label>
+            <label className="attachment-picker-option" htmlFor={composerAttachmentInputIds.video} onClick={handleOptionClick}>
+              <span className="attachment-picker-option-icon" aria-hidden="true">
+                <Video size={18} />
+              </span>
+              <span className="attachment-picker-option-label">从相册选视频</span>
+            </label>
+            <label
+              className="attachment-picker-option"
+              htmlFor={composerAttachmentInputIds.cameraImage}
+              onClick={handleOptionClick}
+            >
+              <span className="attachment-picker-option-icon" aria-hidden="true">
+                <Camera size={18} />
+              </span>
+              <span className="attachment-picker-option-label">拍照发送</span>
+            </label>
+            <label
+              className="attachment-picker-option"
+              htmlFor={composerAttachmentInputIds.cameraVideo}
+              onClick={handleOptionClick}
+            >
+              <span className="attachment-picker-option-icon" aria-hidden="true">
+                <Video size={18} />
+              </span>
+              <span className="attachment-picker-option-label">录像发送</span>
+            </label>
+            <label className="attachment-picker-option" htmlFor={composerAttachmentInputIds.file} onClick={handleOptionClick}>
+              <span className="attachment-picker-option-icon" aria-hidden="true">
+                <FileUp size={18} />
+              </span>
+              <span className="attachment-picker-option-label">发送文件</span>
+            </label>
+          </div>
+        </div>
+        <button className="attachment-picker-cancel" type="button" onClick={onClose}>
+          取消
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function AudioPlayer({
   src,
   fallbackSrc,
@@ -6001,6 +6638,20 @@ function AudioPlayer({
   transcription?: AudioTranscriptionState;
   onTranscribe?: () => void;
 }) {
+  const playbackRateOptions = useMemo(
+    () => [0.75, 1, 1.25, 1.5, 2].map((rate) => ({ value: rate, label: `${rate}x` })),
+    []
+  );
+  const volumeOptions = useMemo(
+    () => [
+      { value: 0, label: '静音' },
+      { value: 0.25, label: '25%' },
+      { value: 0.5, label: '50%' },
+      { value: 0.75, label: '75%' },
+      { value: 1, label: '100%' },
+    ],
+    []
+  );
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const [playing, setPlaying] = useState(false);
   const [duration, setDuration] = useState(0);
@@ -6009,13 +6660,20 @@ function AudioPlayer({
   const [volume, setVolume] = useState(1);
   const [muted, setMuted] = useState(false);
   const [audioError, setAudioError] = useState('');
+  const [pickerOpen, setPickerOpen] = useState<'speed' | 'volume'>();
   const resolvedSrc = useAuthenticatedMediaUrl(src, accessToken, fallbackSrc, encryptedFile, mimeType);
+  const volumeValue = muted ? 0 : volume;
+  const selectedPlaybackRateLabel =
+    playbackRateOptions.find((option) => option.value === playbackRate)?.label ?? `${playbackRate}x`;
+  const selectedVolumeLabel =
+    volumeOptions.find((option) => option.value === volumeValue)?.label ?? `${Math.round(volumeValue * 100)}%`;
 
   useEffect(() => {
     setPlaying(false);
     setDuration(0);
     setCurrentTime(0);
     setAudioError('');
+    setPickerOpen(undefined);
     audioRef.current?.load();
   }, [resolvedSrc]);
 
@@ -6074,72 +6732,55 @@ function AudioPlayer({
         onEnded={() => setPlaying(false)}
         onError={() => setAudioError('音频加载失败，可能需要媒体授权或文件已不可访问。')}
       />
-      <button
-        className="audio-play"
-        type="button"
-        onClick={handleToggle}
-        aria-label={playing ? '暂停音频' : '播放音频'}
-        disabled={!resolvedSrc}
-      >
-        {playing ? <Pause size={17} /> : <Play size={17} />}
-      </button>
-      <div className="audio-info">
-        <strong>{title || '音频消息'}</strong>
-        <input
-          type="range"
-          min="0"
-          max={duration || (durationMs ?? 0) / 1000 || currentTime || 0}
-          step="0.1"
-          value={Math.min(currentTime, duration || (durationMs ?? 0) / 1000 || currentTime)}
-          onChange={handleSeek}
-          aria-label="音频进度"
-        />
-        <span>
-          {formatDuration(currentTime)} / {formatDuration(duration || (durationMs ?? 0) / 1000)}
-        </span>
-        <div className="audio-control-row">
-          <div className="audio-rate-row" aria-label="播放速度">
-            {[0.75, 1, 1.25, 1.5, 2].map((rate) => (
-              <button
-                key={rate}
-                className={playbackRate === rate ? 'active' : ''}
-                type="button"
-                onClick={() => setPlaybackRate(rate)}
-              >
-                {rate}x
-              </button>
-            ))}
-          </div>
-          <label className="audio-volume-control">
-            <button
-              type="button"
-              aria-label={muted ? '取消静音' : '静音'}
-              onClick={() => setMuted((value) => !value)}
-            >
-              {muted || volume === 0 ? <VolumeX size={14} /> : <Volume2 size={14} />}
-            </button>
-            <input
-              type="range"
-              min="0"
-              max="1"
-              step="0.05"
-              value={muted ? 0 : volume}
-              aria-label="音量"
-              onChange={(evt) => {
-                const nextVolume = Number(evt.target.value);
-                setVolume(nextVolume);
-                setMuted(nextVolume === 0);
-              }}
-            />
-          </label>
+      <strong className="audio-title">{title || '音频消息'}</strong>
+      <div className="audio-main-row">
+        <button
+          className="audio-play"
+          type="button"
+          onClick={handleToggle}
+          aria-label={playing ? '暂停音频' : '播放音频'}
+          disabled={!resolvedSrc}
+        >
+          {playing ? <Pause size={17} /> : <Play size={17} />}
+        </button>
+        <div className="audio-progress-block">
+          <input
+            type="range"
+            min="0"
+            max={duration || (durationMs ?? 0) / 1000 || currentTime || 0}
+            step="0.1"
+            value={Math.min(currentTime, duration || (durationMs ?? 0) / 1000 || currentTime)}
+            onChange={handleSeek}
+            aria-label="音频进度"
+          />
+          <span>
+            {formatDuration(currentTime)} / {formatDuration(duration || (durationMs ?? 0) / 1000)}
+          </span>
         </div>
-        {audioError && <em>{audioError}</em>}
+        <button
+          className="audio-inline-trigger"
+          type="button"
+          aria-label="播放速度"
+          aria-expanded={pickerOpen === 'speed'}
+          onClick={() => setPickerOpen((current) => (current === 'speed' ? undefined : 'speed'))}
+        >
+          <RotateCw size={14} />
+          <span className="audio-inline-value">{selectedPlaybackRateLabel}</span>
+          <ChevronDown size={14} className={pickerOpen === 'speed' ? 'audio-inline-chevron open' : 'audio-inline-chevron'} />
+        </button>
+        <button
+          className="audio-inline-trigger"
+          type="button"
+          aria-label="音量"
+          aria-expanded={pickerOpen === 'volume'}
+          onClick={() => setPickerOpen((current) => (current === 'volume' ? undefined : 'volume'))}
+        >
+          {volumeValue === 0 ? <VolumeX size={14} /> : <Volume2 size={14} />}
+          <span className="audio-inline-value">{selectedVolumeLabel}</span>
+          <ChevronDown size={14} className={pickerOpen === 'volume' ? 'audio-inline-chevron open' : 'audio-inline-chevron'} />
+        </button>
       </div>
-      {resolvedSrc && (
-        <a className="audio-open" href={resolvedSrc} target="_blank" rel="noreferrer" download={title}>
-          <Eye size={15} />
-        </a>
-      )}
+      {audioError && <em className="audio-error">{audioError}</em>}
       {onTranscribe && (
         <button className="audio-transcribe" type="button" onClick={onTranscribe}>
           <Volume2 size={15} />
@@ -6155,52 +6796,44 @@ function AudioPlayer({
               : transcription.error}
         </div>
       )}
-    </div>
-  );
-}
-
-function MoreNavSheet({
-  activeView,
-  unreadByView,
-  onPick,
-  onClose,
-}: {
-  activeView: PrimaryView;
-  unreadByView: Record<PrimaryView, number>;
-  onPick: (view: PrimaryView) => void;
-  onClose: () => void;
-}) {
-  return (
-    <div className="sheet-backdrop">
-      <section className="sheet compact-sheet">
-        <header className="sheet-header">
-          <div>
-            <p className="eyebrow">Navigation</p>
-            <h2>更多入口</h2>
-          </div>
-          <button className="icon-button" onClick={onClose} aria-label="关闭">
-            <X size={20} />
-          </button>
-        </header>
-
-        <div className="more-nav-grid">
-          {moreNavViews.map((view) => (
-            <button
-              key={view}
-              className={activeView === view ? 'more-nav-item active' : 'more-nav-item'}
-              onClick={() => onPick(view)}
-            >
-              {viewIcon(view)}
-              <span>
-                <strong>{viewLabels[view]}</strong>
-                <small>
-                  {unreadByView[view] > 0 ? `${unreadByView[view]} 个待处理` : '已同步'}
-                </small>
-              </span>
+      {pickerOpen && (
+        <div className="audio-choice-sheet-backdrop" onClick={() => setPickerOpen(undefined)}>
+          <div className="audio-choice-sheet" onClick={(event) => event.stopPropagation()}>
+            <span className="audio-choice-sheet-grabber" aria-hidden="true" />
+            <div className="audio-choice-sheet-card">
+              <strong>{pickerOpen === 'speed' ? '播放速度' : '音量'}</strong>
+              <div className="audio-choice-sheet-options">
+                {(pickerOpen === 'speed' ? playbackRateOptions : volumeOptions).map((option) => {
+                  const selected =
+                    pickerOpen === 'speed' ? option.value === playbackRate : option.value === volumeValue;
+                  return (
+                    <button
+                      key={option.label}
+                      className={selected ? 'audio-choice-sheet-option active' : 'audio-choice-sheet-option'}
+                      type="button"
+                      onClick={() => {
+                        if (pickerOpen === 'speed') {
+                          setPlaybackRate(option.value);
+                        } else {
+                          setVolume(option.value);
+                          setMuted(option.value === 0);
+                        }
+                        setPickerOpen(undefined);
+                      }}
+                    >
+                      <span>{option.label}</span>
+                      {selected && <Check size={16} />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            <button className="audio-choice-sheet-cancel" type="button" onClick={() => setPickerOpen(undefined)}>
+              取消
             </button>
-          ))}
+          </div>
         </div>
-      </section>
+      )}
     </div>
   );
 }
@@ -7286,6 +7919,7 @@ function MessageBubble({
   members,
   currentUserProfile,
   readReceiptAvatarCount,
+  inlineReadReceiptState,
   audioTranscription,
   editing,
   editingDraft,
@@ -7322,6 +7956,7 @@ function MessageBubble({
   members: RoomMemberSummary[];
   currentUserProfile?: OwnProfile;
   readReceiptAvatarCount: number;
+  inlineReadReceiptState?: InlineReadReceiptState;
   audioTranscription?: AudioTranscriptionState;
   editing: boolean;
   editingDraft: string;
@@ -7381,6 +8016,10 @@ function MessageBubble({
     message.body && (!attachment || message.body !== attachmentName)
   );
   const stickerLikeImage = attachment?.kind === 'image' && isStickerLikeMessage(message);
+  const hasVisualAttachment = attachment?.kind === 'image' || attachment?.kind === 'video';
+  const mediaOnlyBubble = Boolean(
+    hasVisualAttachment && !showBody && !message.replyTo && !editing
+  );
   const attachmentPreviewSrc = attachment
     ? attachment.authUrl ?? attachment.url ?? attachment.authDownloadUrl ?? attachment.downloadUrl
     : undefined;
@@ -7394,16 +8033,29 @@ function MessageBubble({
   const attachmentFullFallbackSrc = attachment
     ? attachment.downloadUrl ?? attachment.url
     : undefined;
-  const ownReadReceiptSummary = getOwnMessageReadReceiptSummary(message, members);
   const visibleReadReceiptCount = clampReadReceiptAvatarCount(readReceiptAvatarCount);
-  const bubbleReadReceipts = message.mine
-    ? message.readReceipts.filter((receipt) => receipt.userId !== message.sender)
-    : message.readReceipts;
-  const visibleReadReceipts = bubbleReadReceipts.slice(0, visibleReadReceiptCount);
-  const readReceiptOverflow = Math.max(bubbleReadReceipts.length - visibleReadReceipts.length, 0);
-  const readReceiptLabel = getReadReceiptStatusText(message, ownReadReceiptSummary);
-  const showInlineReadReceiptText = ownReadReceiptSummary?.totalCount === 1;
-  const showReadReceiptIndicator = bubbleReadReceipts.length > 0 || Boolean(message.mine && ownReadReceiptSummary);
+  const bubbleReadReceipts = inlineReadReceiptState?.readReceipts ?? [];
+  const inlineReadReceiptLimit = Math.min(3, visibleReadReceiptCount);
+  const visibleReadReceipts = bubbleReadReceipts.slice(0, inlineReadReceiptLimit);
+  const receiptAvatarEntries = visibleReadReceipts.map((reader) => ({
+    key: reader.userId,
+    name: reader.name,
+    avatarUrl: reader.avatarUrl,
+  }));
+  const receiptAudienceCount = inlineReadReceiptState?.totalCount ?? bubbleReadReceipts.length;
+  const readReceiptOverflow = Math.max(receiptAudienceCount - receiptAvatarEntries.length, 0);
+  const showReadReceiptIndicator = Boolean(
+    message.mine && (receiptAvatarEntries.length > 0 || readReceiptOverflow > 0)
+  );
+  const showSenderLine = !message.mine && members.length > 2;
+  const messageDetailLabel = [
+    formatFullTime(message.timestamp),
+    message.edited ? '已编辑' : undefined,
+    message.pinned ? '已置顶' : undefined,
+    message.encrypted ? '已加密' : undefined,
+  ]
+    .filter(Boolean)
+    .join(' · ');
   const inlineEditTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
@@ -7552,7 +8204,7 @@ function MessageBubble({
   return (
     <article
       ref={articleRef}
-      className={`${message.mine ? 'message mine' : 'message'}${highlighted ? ' highlighted' : ''}${actionsOpen ? ' actions-open' : ''}${selectionMode ? ' selecting' : ''}${selected ? ' selected' : ''}${!forwardable ? ' not-forwardable' : ''}${editing ? ' editing' : ''}`}
+      className={`${message.mine ? 'message mine' : 'message'}${showSenderLine ? ' with-sender-line' : ''}${highlighted ? ' highlighted' : ''}${actionsOpen ? ' actions-open' : ''}${selectionMode ? ' selecting' : ''}${selected ? ' selected' : ''}${!forwardable ? ' not-forwardable' : ''}${editing ? ' editing' : ''}`}
       data-message-id={message.id}
       data-swipe-ready={swipeOffset > 56}
       onPointerDown={handlePointerDown}
@@ -7562,6 +8214,7 @@ function MessageBubble({
       onClickCapture={handleMessageClickCapture}
       onClick={handleMessageClick}
       onContextMenu={handleContextMenu}
+      title={messageDetailLabel}
       style={swipeOffset > 0 ? { transform: `translateX(${swipeOffset}px)` } : undefined}
     >
       {selectionMode && (
@@ -7588,57 +8241,44 @@ function MessageBubble({
         />
       )}
       <div className="bubble-wrap">
-        <div className="message-meta">
-          {!message.mine && (
-            onOpenUserProfile && !selectionMode ? (
+        {showSenderLine && (
+          <div className="message-meta">
+            {onOpenUserProfile && !selectionMode ? (
               <button className="message-sender-button" type="button" onClick={onOpenUserProfile}>
                 {message.senderName ?? message.sender}
               </button>
             ) : (
               <strong>{message.senderName ?? message.sender}</strong>
-            )
-          )}
-          <span>{formatTime(message.timestamp)}</span>
-          {message.encrypted && <Shield size={13} />}
-          {message.pinned && <Pin size={13} />}
-          {message.edited && <span>已编辑</span>}
-        </div>
-        <div className="bubble">
+            )}
+          </div>
+        )}
+        <div className={mediaOnlyBubble ? 'bubble bubble-media-only' : 'bubble'}>
           {message.replyTo && (
             <button className="reply-preview" onClick={() => onOpenReply(message.replyTo!.eventId)}>
               <strong>{message.replyTo.senderName ?? '回复'}</strong>
               <span>{getReadableMessageBody(message.replyTo.body)}</span>
             </button>
           )}
-          {attachment?.kind === 'image' && attachmentPreviewSrc && (
+          {attachment?.kind === 'image' && (attachmentPreviewSrc || attachmentFullSrc) && (
             <button
               className={stickerLikeImage ? 'message-media-button sticker' : 'message-media-button'}
               type="button"
               onClick={selectionMode ? onToggleSelection : onPreviewAttachment}
               aria-label="预览图片"
             >
-              <AuthenticatedImage
+              <ProgressiveImagePreview
                 className={stickerLikeImage ? 'message-image sticker' : 'message-image'}
-                src={attachmentPreviewSrc}
-                fallbackSrc={attachmentPreviewFallbackSrc}
+                previewSrc={attachmentPreviewSrc}
+                previewFallbackSrc={attachmentPreviewFallbackSrc}
                 accessToken={mediaAccessToken}
-                encryptedFile={attachmentPreviewEncryptedFile}
-                mimeType={attachment.previewMimeType ?? attachment.mimeType}
-                retrySrcs={[
-                  {
-                    src: attachment.authDownloadUrl ?? attachment.downloadUrl,
-                    fallbackSrc: attachment.downloadUrl ?? attachment.url,
-                    encryptedFile: attachment.encryptedFile,
-                    mimeType: attachment.mimeType,
-                  },
-                  ...buildMatrixMediaRetrySrcs(attachment.authUrl, attachment.url).map((retrySrc) => ({
-                    src: retrySrc,
-                    fallbackSrc: attachment.downloadUrl ?? attachment.url,
-                    encryptedFile: attachment.encryptedFile,
-                    mimeType: attachment.mimeType,
-                  })),
-                ]}
+                previewEncryptedFile={attachmentPreviewEncryptedFile}
+                previewMimeType={attachment.previewMimeType ?? attachment.mimeType}
+                src={attachmentFullSrc}
+                fallbackSrc={attachmentFullFallbackSrc}
+                encryptedFile={attachment.encryptedFile}
+                mimeType={attachment.mimeType}
                 alt={attachmentName}
+                previewOnly
               />
             </button>
           )}
@@ -7728,32 +8368,32 @@ function MessageBubble({
             />
           ) : null}
         </div>
-        {showReadReceiptIndicator && (
+        {showReadReceiptIndicator && !editing && (
           <button
             type="button"
             className="message-read-receipts message-read-receipts-button"
-            aria-label={showInlineReadReceiptText ? `查看消息已读详情：${readReceiptLabel}` : '查看消息已读详情'}
+            aria-label="查看消息已读详情"
             onClick={onOpenReadReceipts}
           >
-            <Check size={12} />
-            {visibleReadReceipts.length > 0 && (
-              <div className="message-read-receipt-stack">
-                {visibleReadReceipts.map((reader) => (
-                  <span key={reader.userId} className="message-read-receipt-avatar" title={reader.name}>
-                    <Avatar
-                      name={reader.name}
-                      src={reader.avatarUrl}
-                      accessToken={mediaAccessToken}
-                      small
-                    />
-                  </span>
-                ))}
-                {readReceiptOverflow > 0 && (
-                  <span className="message-read-receipt-more">+{readReceiptOverflow}</span>
-                )}
-              </div>
-            )}
-            {showInlineReadReceiptText && <span>{readReceiptLabel}</span>}
+            <div className="message-read-receipt-stack">
+              {receiptAvatarEntries.map((reader) => (
+                <span
+                  key={reader.key}
+                  className="message-read-receipt-avatar"
+                  title={reader.name}
+                >
+                  <Avatar
+                    name={reader.name}
+                    src={reader.avatarUrl}
+                    accessToken={mediaAccessToken}
+                    small
+                  />
+                </span>
+              ))}
+              {readReceiptOverflow > 0 && (
+                <span className="message-read-receipt-more">+{readReceiptOverflow}</span>
+              )}
+            </div>
           </button>
         )}
         {!editing && (
@@ -9312,6 +9952,15 @@ function ExplorePanel({
   onSelectSource,
   onChange,
   onSearch,
+  onCreateSource,
+  onUpdateSource,
+  onDeleteSource,
+  onCreateSection,
+  onUpdateSection,
+  onDeleteSection,
+  onCreateCard,
+  onUpdateCard,
+  onDeleteCard,
   onPickServer,
   onAddServer,
   onRemoveServer,
@@ -9330,6 +9979,20 @@ function ExplorePanel({
   onSelectSource: (sourceId: string) => void;
   onChange: (value: { server: string; query: string }) => void;
   onSearch: (evt?: FormEvent<HTMLFormElement>, overrideSearch?: { server: string; query: string }) => void;
+  onCreateSource: (draft: ExploreSourceEditorDraft) => Promise<boolean>;
+  onUpdateSource: (sourceId: string, draft: ExploreSourceEditorDraft) => Promise<boolean>;
+  onDeleteSource: (sourceId: string) => Promise<boolean>;
+  onCreateSection: (sourceId: string, title: string) => Promise<boolean>;
+  onUpdateSection: (sourceId: string, sectionId: string, title: string) => Promise<boolean>;
+  onDeleteSection: (sourceId: string, sectionId: string) => Promise<boolean>;
+  onCreateCard: (sourceId: string, sectionId: string, draft: ExploreNavCardEditorDraft) => Promise<boolean>;
+  onUpdateCard: (
+    sourceId: string,
+    sectionId: string,
+    cardId: string,
+    draft: ExploreNavCardEditorDraft
+  ) => Promise<boolean>;
+  onDeleteCard: (sourceId: string, sectionId: string, cardId: string) => Promise<boolean>;
   onPickServer: (server: string) => void;
   onAddServer: (server: string) => void;
   onRemoveServer: (server: string) => void;
@@ -9337,6 +10000,9 @@ function ExplorePanel({
   onJoin: (roomIdOrAlias: string) => void;
 }) {
   const [serverDraft, setServerDraft] = useState('');
+  const [editorSheet, setEditorSheet] = useState<ExploreEditorSheet>();
+  const [deleteIntent, setDeleteIntent] = useState<ExploreDeleteIntent>();
+  const [deleteSubmitting, setDeleteSubmitting] = useState(false);
   const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? sources[0];
   const suggestedServers = Array.from(
     new Set(
@@ -9367,6 +10033,10 @@ function ExplorePanel({
     setServerDraft('');
   };
 
+  const openLink = (url: string) => {
+    window.open(url, '_blank', 'noopener,noreferrer');
+  };
+
   const getSourceMeta = (source: ExploreSource): string => {
     if (source.kind === 'server') return source.value;
     if (source.kind === 'web') {
@@ -9379,47 +10049,203 @@ function ExplorePanel({
     return `${source.navSections?.reduce((count, section) => count + section.cards.length, 0) ?? 0} 个入口`;
   };
 
-  const renderNavSource = (source: ExploreSource) => {
-    const sections = (source.navSections ?? []).filter((section) => section.cards.length > 0);
-    if (sections.length === 0) {
-      return (
-        <div className="explore-empty">
-          <Compass size={24} />
-          <strong>这个导航站还没有入口</strong>
-          <span>登录后的账户数据里还没有可显示的导航卡片</span>
-        </div>
-      );
+  const handleSubmitSourceSheet = async (draft: ExploreSourceEditorDraft) => {
+    const success =
+      editorSheet?.type === 'editSource'
+        ? await onUpdateSource(editorSheet.source.id, draft)
+        : await onCreateSource(draft);
+    if (success) setEditorSheet(undefined);
+  };
+
+  const handleSubmitSectionSheet = async (title: string) => {
+    if (!editorSheet || (editorSheet.type !== 'createSection' && editorSheet.type !== 'editSection')) return;
+    const success =
+      editorSheet.type === 'editSection'
+        ? await onUpdateSection(editorSheet.sourceId, editorSheet.section.id, title)
+        : await onCreateSection(editorSheet.sourceId, title);
+    if (success) setEditorSheet(undefined);
+  };
+
+  const handleSubmitCardSheet = async (draft: ExploreNavCardEditorDraft) => {
+    if (!editorSheet || (editorSheet.type !== 'createCard' && editorSheet.type !== 'editCard')) return;
+    const success =
+      editorSheet.type === 'editCard'
+        ? await onUpdateCard(editorSheet.sourceId, editorSheet.section.id, editorSheet.card.id, draft)
+        : await onCreateCard(editorSheet.sourceId, editorSheet.section.id, draft);
+    if (success) setEditorSheet(undefined);
+  };
+
+  const handleConfirmDelete = async () => {
+    if (!deleteIntent || deleteSubmitting) return;
+
+    setDeleteSubmitting(true);
+    try {
+      const success =
+        deleteIntent.type === 'source'
+          ? await onDeleteSource(deleteIntent.source.id)
+          : deleteIntent.type === 'section'
+            ? await onDeleteSection(deleteIntent.sourceId, deleteIntent.section.id)
+            : await onDeleteCard(deleteIntent.sourceId, deleteIntent.sectionId, deleteIntent.card.id);
+
+      if (success) {
+        setDeleteIntent(undefined);
+      }
+    } finally {
+      setDeleteSubmitting(false);
     }
+  };
+
+  const deleteSheetCopy =
+    deleteIntent?.type === 'source'
+      ? {
+          title: '删除探索来源',
+          body: `“${deleteIntent.source.title}”会从当前账号的探索列表中移除。`,
+          confirmLabel: '删除来源',
+        }
+      : deleteIntent?.type === 'section'
+        ? {
+            title: '删除分组',
+            body: `“${deleteIntent.section.title}”里的卡片也会一起删除。`,
+            confirmLabel: '删除分组',
+          }
+        : deleteIntent
+          ? {
+              title: '删除卡片',
+              body: `“${deleteIntent.card.title}”会从这个分组里移除。`,
+              confirmLabel: '删除卡片',
+            }
+          : undefined;
+
+  const renderNavSource = (source: ExploreSource) => {
+    const sections = source.navSections ?? [];
 
     return (
-      <div className="explore-nav-sections">
-        {sections.map((section) => (
-          <section key={section.id} className="explore-nav-section">
-            <div className="section-title">
-              <span>{section.title}</span>
-              <strong>{section.cards.length}</strong>
-            </div>
-            <div className="explore-nav-grid">
-              {section.cards.map((card) => (
-                <button
-                  key={card.id}
-                  type="button"
-                  className="explore-nav-card"
-                  onClick={() => window.open(card.url, '_blank', 'noopener,noreferrer')}
-                >
-                  <Avatar name={card.title} src={card.iconUrl} small />
-                  <span>
-                    <strong>{card.title}</strong>
-                    <small>{card.description ?? card.url}</small>
-                    {card.tags && card.tags.length > 0 && <em>{card.tags.join(' · ')}</em>}
-                  </span>
-                  <FolderOpen size={16} />
-                </button>
-              ))}
-            </div>
-          </section>
-        ))}
-      </div>
+      <>
+        <section className="explore-workspace-header">
+          <div>
+            <span className="explore-source-kind">导航站</span>
+            <h3>{source.title}</h3>
+            <small>{source.description ?? '收纳常用网站和工具'}</small>
+          </div>
+          <div className="explore-workspace-actions">
+            <button type="button" onClick={() => setEditorSheet({ type: 'createSection', sourceId: source.id })}>
+              <Plus size={16} />
+              添加分组
+            </button>
+            <button type="button" onClick={() => setEditorSheet({ type: 'editSource', source })}>
+              <Edit3 size={16} />
+              编辑导航
+            </button>
+            <button type="button" className="danger" onClick={() => setDeleteIntent({ type: 'source', source })}>
+              <Trash2 size={16} />
+              删除导航
+            </button>
+          </div>
+        </section>
+
+        {sections.length === 0 ? (
+          <div className="explore-empty">
+            <Compass size={24} />
+            <strong>这个导航站还没有分组</strong>
+            <span>先创建分组，再把常用网站和工具整理进去。</span>
+            <button
+              type="button"
+              className="primary-button compact"
+              onClick={() => setEditorSheet({ type: 'createSection', sourceId: source.id })}
+            >
+              <Plus size={16} />
+              添加分组
+            </button>
+          </div>
+        ) : (
+          <div className="explore-nav-sections">
+            {sections.map((section) => (
+              <section key={section.id} className="explore-nav-section">
+                <div className="explore-nav-section-header">
+                  <div>
+                    <h4>{section.title}</h4>
+                    <small>{section.cards.length} 张卡片</small>
+                  </div>
+                  <div className="explore-inline-actions">
+                    <button
+                      type="button"
+                      onClick={() => setEditorSheet({ type: 'createCard', sourceId: source.id, section })}
+                    >
+                      <Plus size={15} />
+                      添加卡片
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setEditorSheet({ type: 'editSection', sourceId: source.id, section })}
+                    >
+                      <Edit3 size={15} />
+                      编辑分组
+                    </button>
+                    <button
+                      type="button"
+                      className="danger"
+                      onClick={() => setDeleteIntent({ type: 'section', sourceId: source.id, section })}
+                    >
+                      <Trash2 size={15} />
+                      删除分组
+                    </button>
+                  </div>
+                </div>
+                {section.cards.length === 0 ? (
+                  <div className="explore-empty compact">
+                    <FolderOpen size={20} />
+                    <strong>这个分组还没有卡片</strong>
+                    <span>把常用站点、系统和工具加进来。</span>
+                  </div>
+                ) : (
+                  <div className="explore-nav-grid">
+                    {section.cards.map((card) => (
+                      <article key={card.id} className="explore-nav-card">
+                        <button
+                          type="button"
+                          className="explore-nav-card-main"
+                          onClick={() => openLink(card.url)}
+                        >
+                          <Avatar name={card.title} src={card.iconUrl} small />
+                          <span>
+                            <strong>{card.title}</strong>
+                            <small>{card.description ?? card.url}</small>
+                            {card.tags && card.tags.length > 0 && <em>{card.tags.join(' · ')}</em>}
+                          </span>
+                        </button>
+                        <div className="explore-nav-card-actions">
+                          <button
+                            type="button"
+                            aria-label={`编辑 ${card.title}`}
+                            onClick={() => setEditorSheet({ type: 'editCard', sourceId: source.id, section, card })}
+                          >
+                            <Edit3 size={16} />
+                          </button>
+                          <button
+                            type="button"
+                            className="danger"
+                            aria-label={`删除 ${card.title}`}
+                            onClick={() =>
+                              setDeleteIntent({
+                                type: 'card',
+                                sourceId: source.id,
+                                sectionId: section.id,
+                                card,
+                              })
+                            }
+                          >
+                            <Trash2 size={16} />
+                          </button>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
+                )}
+              </section>
+            ))}
+          </div>
+        )}
+      </>
     );
   };
 
@@ -9428,16 +10254,23 @@ function ExplorePanel({
       <div>
         <span className="explore-source-kind">网页</span>
         <strong>{source.title}</strong>
+        {source.description && <small>{source.description}</small>}
         <small>{source.value}</small>
       </div>
-      <button
-        type="button"
-        className="primary-button compact"
-        onClick={() => window.open(source.value, '_blank', 'noopener,noreferrer')}
-      >
-        <FolderOpen size={16} />
-        打开站点
-      </button>
+      <div className="explore-inline-actions">
+        <button type="button" className="primary-button compact" onClick={() => openLink(source.value)}>
+          <FolderOpen size={16} />
+          打开站点
+        </button>
+        <button type="button" onClick={() => setEditorSheet({ type: 'editSource', source })}>
+          <Edit3 size={15} />
+          编辑
+        </button>
+        <button type="button" className="danger" onClick={() => setDeleteIntent({ type: 'source', source })}>
+          <Trash2 size={15} />
+          删除
+        </button>
+      </div>
     </section>
   );
 
@@ -9447,9 +10280,21 @@ function ExplorePanel({
         <div>
           <p className="eyebrow">Explore</p>
           <h2>探索</h2>
-          <span>公开目录、服务器源和已加入房间</span>
+          <span>公开目录、导航站、网页和服务器源</span>
         </div>
-        <Compass size={24} />
+        <button
+          type="button"
+          className="icon-button strong"
+          onClick={() =>
+            setEditorSheet({
+              type: 'createSource',
+              initialKind: selectedSource?.kind === 'web' || selectedSource?.kind === 'server' ? selectedSource.kind : 'nav',
+            })
+          }
+          aria-label="添加探索来源"
+        >
+          <Plus size={20} />
+        </button>
       </header>
 
       {sources.length > 0 && (
@@ -9471,156 +10316,576 @@ function ExplorePanel({
         </section>
       )}
 
+      {sources.length === 0 && (
+        <div className="explore-empty">
+          <Compass size={24} />
+          <strong>还没有探索来源</strong>
+          <span>先添加导航站、网页书签或服务器源。</span>
+          <button
+            type="button"
+            className="primary-button compact"
+            onClick={() => setEditorSheet({ type: 'createSource', initialKind: 'nav' })}
+          >
+            <Plus size={16} />
+            添加探索来源
+          </button>
+        </div>
+      )}
+
       {selectedSource?.kind === 'nav' ? (
         renderNavSource(selectedSource)
       ) : selectedSource?.kind === 'web' ? (
         renderWebSource(selectedSource)
       ) : (
         <>
-
-      <section className="explore-directory">
-        <form className="explore-form" onSubmit={onSearch}>
-          <label className="create-field">
-            <span>
-              <Server size={16} />
-              服务器            </span>
-            <input
-              value={publicSearch.server}
-              placeholder={currentServer ? `当前服务器：${currentServer}` : '留空使用当前服务'}
-              autoCapitalize="none"
-              autoCorrect="off"
-              onChange={(evt) => onChange({ ...publicSearch, server: evt.target.value })}
-            />
-          </label>
-          <label className="create-field">
-            <span>
-              <Search size={16} />
-              关键词            </span>
-            <input
-              value={publicSearch.query}
-              placeholder="搜索公开房间、空间、主题"
-              onChange={(evt) => onChange({ ...publicSearch, query: evt.target.value })}
-            />
-          </label>
-          <button className="primary-button compact" type="submit" disabled={publicLoading}>
-            <Search size={17} />
-            {publicLoading ? '搜索中...' : '搜索目录'}
-          </button>
-        </form>
-      </section>
-
-      <section className="explore-source-strip">
-        <div className="section-title">
-          <span>服务器源</span>
-          <strong>{suggestedServers.length}</strong>
-        </div>
-        <div className="explore-server-row">
-          {suggestedServers.map((server) => (
-            <span key={server} className={server === publicSearch.server ? 'active' : ''}>
-              <button type="button" onClick={() => onPickServer(server)}>
-                {server === currentServer ? <Globe2 size={13} /> : <Server size={13} />}
-                {server}
-              </button>
-              {customServers.includes(server) && (
-                <button type="button" onClick={() => onRemoveServer(server)} aria-label={`移除 ${server}`}>
-                  <X size={13} />
+          {selectedSource && (
+            <section className="explore-web-card">
+              <div>
+                <span className="explore-source-kind">服务器源</span>
+                <strong>{selectedSource.title}</strong>
+                {selectedSource.description && <small>{selectedSource.description}</small>}
+                <small>{selectedSource.value}</small>
+              </div>
+              <div className="explore-inline-actions">
+                <button type="button" onClick={() => setEditorSheet({ type: 'editSource', source: selectedSource })}>
+                  <Edit3 size={15} />
+                  编辑
                 </button>
-              )}
-            </span>
-          ))}
-        </div>
-        <form className="explore-source-add" onSubmit={handleAddServer}>
-          <input
-            value={serverDraft}
-            placeholder="添加服务器，例如 matrix.org"
-            autoCapitalize="none"
-            autoCorrect="off"
-            onChange={(evt) => setServerDraft(evt.target.value)}
-          />
-          <button type="submit">
-            <Plus size={16} />
-            添加
-          </button>
-        </form>
-      </section>
+                <button
+                  type="button"
+                  className="danger"
+                  onClick={() => setDeleteIntent({ type: 'source', source: selectedSource })}
+                >
+                  <Trash2 size={15} />
+                  删除
+                </button>
+              </div>
+            </section>
+          )}
 
-      {visibleJoinedRooms.length > 0 && (
-        <section className="explore-joined">
-          <div className="section-title">
-            <span>已加入</span>
-            <strong>{visibleJoinedRooms.length}</strong>
-          </div>
-          <div className="explore-joined-list">
-            {visibleJoinedRooms.map((room) => (
-              <button key={room.id} type="button" onClick={() => onOpenJoined(room.id)}>
-                <Avatar name={room.name} src={room.avatarUrl} accessToken={mediaAccessToken} small />
+          <section className="explore-directory">
+            <form className="explore-form" onSubmit={onSearch}>
+              <label className="create-field">
                 <span>
-                  <strong>{room.name}</strong>
-                  <small>{room.space ? '空间' : room.direct ? '私聊' : '群组'} · {room.memberCount} </small>
+                  <Server size={16} />
+                  服务器
                 </span>
-                {room.unread > 0 && <b>{room.unread}</b>}
+                <input
+                  value={publicSearch.server}
+                  placeholder={currentServer ? `当前服务器：${currentServer}` : '留空使用当前服务'}
+                  autoCapitalize="none"
+                  autoCorrect="off"
+                  onChange={(evt) => onChange({ ...publicSearch, server: evt.target.value })}
+                />
+              </label>
+              <label className="create-field">
+                <span>
+                  <Search size={16} />
+                  关键词
+                </span>
+                <input
+                  value={publicSearch.query}
+                  placeholder="搜索公开房间、空间、主题"
+                  onChange={(evt) => onChange({ ...publicSearch, query: evt.target.value })}
+                />
+              </label>
+              <button className="primary-button compact" type="submit" disabled={publicLoading}>
+                <Search size={17} />
+                {publicLoading ? '搜索中...' : '搜索目录'}
               </button>
-            ))}
-          </div>
-        </section>
-      )}
+            </form>
+          </section>
 
-      <section className="explore-results">
-        <div className="section-title">
-          <span>公开目录</span>
-          <strong>{publicRooms.length}</strong>
-        </div>
-        {publicRooms.length === 0 ? (
-          <div className="explore-empty">
-            <Compass size={24} />
-            <strong>{publicLoading ? '正在搜索目录' : '还没有目录结果'}</strong>
-            <span>输入关键词搜索，或者点上面的服务器快捷入口浏览公开房间</span>
-          </div>
-        ) : (
-          <div className="public-room-list">
-            {publicRooms.map((room) => {
-              const joinedRoom = joinedRoomForPublicRoom(room);
-              return (
-                <article key={room.id || room.alias} className="public-room-card">
-                  <button
-                    className="public-room-main"
-                    type="button"
-                    onClick={() => joinedRoom ? onOpenJoined(joinedRoom.id) : onJoin(room.alias ?? room.id)}
-                  >
-                    <Avatar name={room.name} src={room.avatarUrl} accessToken={mediaAccessToken} />
+          <section className="explore-source-strip">
+            <div className="section-title">
+              <span>服务器源</span>
+              <strong>{suggestedServers.length}</strong>
+            </div>
+            <div className="explore-server-row">
+              {suggestedServers.map((server) => (
+                <span key={server} className={server === publicSearch.server ? 'active' : ''}>
+                  <button type="button" onClick={() => onPickServer(server)}>
+                    {server === currentServer ? <Globe2 size={13} /> : <Server size={13} />}
+                    {server}
+                  </button>
+                  {customServers.includes(server) && (
+                    <button type="button" onClick={() => onRemoveServer(server)} aria-label={`移除 ${server}`}>
+                      <X size={13} />
+                    </button>
+                  )}
+                </span>
+              ))}
+            </div>
+            <form className="explore-source-add" onSubmit={handleAddServer}>
+              <input
+                value={serverDraft}
+                placeholder="添加服务器，例如 matrix.org"
+                autoCapitalize="none"
+                autoCorrect="off"
+                onChange={(evt) => setServerDraft(evt.target.value)}
+              />
+              <button type="submit">
+                <Plus size={16} />
+                添加
+              </button>
+            </form>
+          </section>
+
+          {visibleJoinedRooms.length > 0 && (
+            <section className="explore-joined">
+              <div className="section-title">
+                <span>已加入</span>
+                <strong>{visibleJoinedRooms.length}</strong>
+              </div>
+              <div className="explore-joined-list">
+                {visibleJoinedRooms.map((room) => (
+                  <button key={room.id} type="button" onClick={() => onOpenJoined(room.id)}>
+                    <Avatar name={room.name} src={room.avatarUrl} accessToken={mediaAccessToken} small />
                     <span>
                       <strong>{room.name}</strong>
-                      <small>{room.alias || room.id}</small>
-                      {room.topic && <em>{room.topic}</em>}
+                      <small>
+                        {room.space ? '空间' : room.direct ? '私聊' : '群组'} · {room.memberCount}
+                      </small>
                     </span>
+                    {room.unread > 0 && <b>{room.unread}</b>}
                   </button>
-                  <div className="public-room-meta">
-                    <span>
-                      <Users size={13} />
-                      {room.joinedMembers}
-                    </span>
-                    {room.alias && (
-                      <span>
-                        <Link2 size={13} />
-                        别名
-                      </span>
-                    )}
-                    {room.worldReadable && <span>可预览</span>}
-                    <button
-                      type="button"
-                      onClick={() => joinedRoom ? onOpenJoined(joinedRoom.id) : onJoin(room.alias ?? room.id)}
-                    >
-                      {joinedRoom ? '打开' : '加入'}
-                    </button>
-                  </div>
-                </article>
-              );
-            })}
-          </div>
-        )}
-      </section>
+                ))}
+              </div>
+            </section>
+          )}
+
+          <section className="explore-results">
+            <div className="section-title">
+              <span>公开目录</span>
+              <strong>{publicRooms.length}</strong>
+            </div>
+            {publicRooms.length === 0 ? (
+              <div className="explore-empty">
+                <Compass size={24} />
+                <strong>{publicLoading ? '正在搜索目录' : '还没有目录结果'}</strong>
+                <span>输入关键词搜索，或者点上面的服务器快捷入口浏览公开房间</span>
+              </div>
+            ) : (
+              <div className="public-room-list">
+                {publicRooms.map((room) => {
+                  const joinedRoom = joinedRoomForPublicRoom(room);
+                  return (
+                    <article key={room.id || room.alias} className="public-room-card">
+                      <button
+                        className="public-room-main"
+                        type="button"
+                        onClick={() => (joinedRoom ? onOpenJoined(joinedRoom.id) : onJoin(room.alias ?? room.id))}
+                      >
+                        <Avatar name={room.name} src={room.avatarUrl} accessToken={mediaAccessToken} />
+                        <span>
+                          <strong>{room.name}</strong>
+                          <small>{room.alias || room.id}</small>
+                          {room.topic && <em>{room.topic}</em>}
+                        </span>
+                      </button>
+                      <div className="public-room-meta">
+                        <span>
+                          <Users size={13} />
+                          {room.joinedMembers}
+                        </span>
+                        {room.alias && (
+                          <span>
+                            <Link2 size={13} />
+                            别名
+                          </span>
+                        )}
+                        {room.worldReadable && <span>可预览</span>}
+                        <button
+                          type="button"
+                          onClick={() => (joinedRoom ? onOpenJoined(joinedRoom.id) : onJoin(room.alias ?? room.id))}
+                        >
+                          {joinedRoom ? '打开' : '加入'}
+                        </button>
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
+          </section>
         </>
       )}
+
+      {editorSheet?.type === 'createSource' && (
+        <ExploreSourceEditorSheet
+          title="添加探索来源"
+          confirmLabel="保存并打开"
+          initialDraft={createEmptyExploreSourceDraft(editorSheet.initialKind ?? 'nav')}
+          onClose={() => setEditorSheet(undefined)}
+          onSubmit={handleSubmitSourceSheet}
+        />
+      )}
+
+      {editorSheet?.type === 'editSource' && (
+        <ExploreSourceEditorSheet
+          title={editorSheet.source.kind === 'nav' ? '编辑导航站' : '编辑探索来源'}
+          confirmLabel="保存修改"
+          initialDraft={toExploreSourceDraft(editorSheet.source)}
+          lockKind
+          onClose={() => setEditorSheet(undefined)}
+          onSubmit={handleSubmitSourceSheet}
+        />
+      )}
+
+      {editorSheet?.type === 'createSection' && (
+        <ExploreSectionEditorSheet
+          title="添加分组"
+          confirmLabel="创建分组"
+          initialTitle=""
+          onClose={() => setEditorSheet(undefined)}
+          onSubmit={handleSubmitSectionSheet}
+        />
+      )}
+
+      {editorSheet?.type === 'editSection' && (
+        <ExploreSectionEditorSheet
+          title="编辑分组"
+          confirmLabel="保存分组"
+          initialTitle={editorSheet.section.title}
+          onClose={() => setEditorSheet(undefined)}
+          onSubmit={handleSubmitSectionSheet}
+        />
+      )}
+
+      {editorSheet?.type === 'createCard' && (
+        <ExploreCardEditorSheet
+          title="添加卡片"
+          confirmLabel="创建卡片"
+          initialDraft={createEmptyExploreCardDraft()}
+          sectionTitle={editorSheet.section.title}
+          onClose={() => setEditorSheet(undefined)}
+          onSubmit={handleSubmitCardSheet}
+        />
+      )}
+
+      {editorSheet?.type === 'editCard' && (
+        <ExploreCardEditorSheet
+          title="编辑卡片"
+          confirmLabel="保存卡片"
+          initialDraft={toExploreCardDraft(editorSheet.card)}
+          sectionTitle={editorSheet.section.title}
+          onClose={() => setEditorSheet(undefined)}
+          onSubmit={handleSubmitCardSheet}
+        />
+      )}
+
+      {deleteIntent && deleteSheetCopy && (
+        <ExploreDeleteConfirmSheet
+          title={deleteSheetCopy.title}
+          body={deleteSheetCopy.body}
+          confirmLabel={deleteSheetCopy.confirmLabel}
+          busy={deleteSubmitting}
+          onClose={() => {
+            if (!deleteSubmitting) setDeleteIntent(undefined);
+          }}
+          onConfirm={() => void handleConfirmDelete()}
+        />
+      )}
+    </div>
+  );
+}
+
+function ExploreDeleteConfirmSheet({
+  title,
+  body,
+  confirmLabel,
+  busy,
+  onClose,
+  onConfirm,
+}: {
+  title: string;
+  body: string;
+  confirmLabel: string;
+  busy: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  return (
+    <div className="sheet-backdrop">
+      <section className="sheet compact-sheet">
+        <header className="sheet-header">
+          <div>
+            <h2>{title}</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭" disabled={busy}>
+            <X size={20} />
+          </button>
+        </header>
+
+        <div className="explore-editor-body">
+          <div className="explore-confirm-copy">
+            <Trash2 size={18} />
+            <span>
+              <strong>删除后会立即同步到当前账号</strong>
+              <small>{body}</small>
+            </span>
+          </div>
+          <div className="explore-confirm-actions">
+            <button type="button" className="secondary-button" onClick={onClose} disabled={busy}>
+              取消
+            </button>
+            <button type="button" className="secondary-button danger" onClick={onConfirm} disabled={busy}>
+              {busy ? '删除中...' : confirmLabel}
+            </button>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ExploreSourceEditorSheet({
+  title,
+  confirmLabel,
+  initialDraft,
+  lockKind = false,
+  onClose,
+  onSubmit,
+}: {
+  title: string;
+  confirmLabel: string;
+  initialDraft: ExploreSourceEditorDraft;
+  lockKind?: boolean;
+  onClose: () => void;
+  onSubmit: (draft: ExploreSourceEditorDraft) => void | Promise<void>;
+}) {
+  const [draft, setDraft] = useState<ExploreSourceEditorDraft>(initialDraft);
+  const titleLabel = draft.kind === 'nav' ? '导航站名称' : draft.kind === 'web' ? '来源名称' : '服务器名称';
+  const valueLabel = draft.kind === 'nav' ? '导航站标识（可选）' : draft.kind === 'web' ? '网页地址' : '服务器地址';
+  const valuePlaceholder =
+    draft.kind === 'nav'
+      ? '例如：工作台'
+      : draft.kind === 'web'
+        ? '例如：https://example.com'
+        : '例如：matrix.org';
+  const submitDisabled =
+    draft.kind === 'nav'
+      ? !draft.title.trim()
+      : !draft.value.trim();
+
+  return (
+    <div className="sheet-backdrop">
+      <section className="sheet compact-sheet">
+        <header className="sheet-header">
+          <div>
+            <h2>{title}</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">
+            <X size={20} />
+          </button>
+        </header>
+
+        <div className="explore-editor-body">
+          <p className="explore-editor-copy">添加的来源会写入当前 Matrix 账号，同账号的其他设备也会同步。</p>
+          <div className="create-field">
+            <span>来源类型</span>
+            <div className="segmented three">
+              {(['server', 'web', 'nav'] as ExploreSourceKind[]).map((kind) => (
+                <button
+                  key={kind}
+                  type="button"
+                  className={draft.kind === kind ? 'active' : ''}
+                  disabled={lockKind}
+                  onClick={() =>
+                    setDraft((current) => ({
+                      ...current,
+                      kind,
+                      value: kind === 'nav' ? current.value : current.value,
+                    }))
+                  }
+                >
+                  {kind === 'server' ? '社区服务器' : kind === 'web' ? '自定义网页' : '导航站'}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <label className="create-field">
+            <span>{titleLabel}</span>
+            <input
+              value={draft.title}
+              placeholder={draft.kind === 'nav' ? '例如：工作台' : '例如：常用入口'}
+              onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))}
+            />
+          </label>
+
+          <label className="create-field">
+            <span>{valueLabel}</span>
+            <input
+              value={draft.value}
+              placeholder={valuePlaceholder}
+              autoCapitalize="none"
+              autoCorrect="off"
+              onChange={(event) => setDraft((current) => ({ ...current, value: event.target.value }))}
+            />
+            {draft.kind === 'nav' && <small>留空时会默认跟导航站名称保持一致。</small>}
+          </label>
+
+          <label className="create-field">
+            <span>{draft.kind === 'nav' ? '导航站简介（可选）' : '来源简介（可选）'}</span>
+            <textarea
+              value={draft.description}
+              rows={3}
+              placeholder={draft.kind === 'nav' ? '例如：收纳常用网站和工具' : '例如：团队知识库或外部站点'}
+              onChange={(event) => setDraft((current) => ({ ...current, description: event.target.value }))}
+            />
+          </label>
+
+          <button
+            type="button"
+            className="primary-button"
+            disabled={submitDisabled}
+            onClick={() => void onSubmit(draft)}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ExploreSectionEditorSheet({
+  title,
+  confirmLabel,
+  initialTitle,
+  onClose,
+  onSubmit,
+}: {
+  title: string;
+  confirmLabel: string;
+  initialTitle: string;
+  onClose: () => void;
+  onSubmit: (title: string) => void | Promise<void>;
+}) {
+  const [value, setValue] = useState(initialTitle);
+
+  return (
+    <div className="sheet-backdrop">
+      <section className="sheet compact-sheet">
+        <header className="sheet-header">
+          <div>
+            <h2>{title}</h2>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">
+            <X size={20} />
+          </button>
+        </header>
+
+        <div className="explore-editor-body">
+          <label className="create-field">
+            <span>分组名称</span>
+            <input
+              value={value}
+              placeholder="例如：公司相关"
+              onChange={(event) => setValue(event.target.value)}
+            />
+          </label>
+          <button
+            type="button"
+            className="primary-button"
+            disabled={!value.trim()}
+            onClick={() => void onSubmit(value)}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function ExploreCardEditorSheet({
+  title,
+  confirmLabel,
+  initialDraft,
+  sectionTitle,
+  onClose,
+  onSubmit,
+}: {
+  title: string;
+  confirmLabel: string;
+  initialDraft: ExploreNavCardEditorDraft;
+  sectionTitle: string;
+  onClose: () => void;
+  onSubmit: (draft: ExploreNavCardEditorDraft) => void | Promise<void>;
+}) {
+  const [draft, setDraft] = useState<ExploreNavCardEditorDraft>(initialDraft);
+
+  return (
+    <div className="sheet-backdrop">
+      <section className="sheet">
+        <header className="sheet-header">
+          <div>
+            <h2>{title}</h2>
+            <small>{sectionTitle}</small>
+          </div>
+          <button className="icon-button" onClick={onClose} aria-label="关闭">
+            <X size={20} />
+          </button>
+        </header>
+
+        <div className="explore-editor-body">
+          <label className="create-field">
+            <span>标题</span>
+            <input
+              value={draft.title}
+              placeholder="例如：Google 翻译"
+              onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))}
+            />
+          </label>
+          <label className="create-field">
+            <span>链接地址</span>
+            <input
+              value={draft.url}
+              placeholder="例如：https://translate.google.com"
+              autoCapitalize="none"
+              autoCorrect="off"
+              onChange={(event) => setDraft((current) => ({ ...current, url: event.target.value }))}
+            />
+          </label>
+          <label className="create-field">
+            <span>描述（可选）</span>
+            <textarea
+              value={draft.description}
+              rows={4}
+              placeholder="补一行简短说明，方便以后快速识别"
+              onChange={(event) => setDraft((current) => ({ ...current, description: event.target.value }))}
+            />
+          </label>
+          <label className="create-field">
+            <span>图标链接（可选）</span>
+            <input
+              value={draft.iconUrl}
+              placeholder="例如：https://example.com/logo.png"
+              autoCapitalize="none"
+              autoCorrect="off"
+              onChange={(event) => setDraft((current) => ({ ...current, iconUrl: event.target.value }))}
+            />
+          </label>
+          <label className="create-field">
+            <span>标签（可选）</span>
+            <input
+              value={draft.tags}
+              placeholder="用逗号分隔，例如：翻译，工具"
+              onChange={(event) => setDraft((current) => ({ ...current, tags: event.target.value }))}
+            />
+          </label>
+          <button
+            type="button"
+            className="primary-button"
+            disabled={!draft.title.trim() || !draft.url.trim()}
+            onClick={() => void onSubmit(draft)}
+          >
+            {confirmLabel}
+          </button>
+        </div>
+      </section>
     </div>
   );
 }
@@ -9630,6 +10895,7 @@ function SettingsPanel({
   snapshot,
   favoriteMessageCount,
   customEmojiCount,
+  exploreSourceCount,
   ownProfile,
   profileForm,
   preferences,
@@ -9642,12 +10908,16 @@ function SettingsPanel({
   onPreferencesChange,
   onOpenSecurity,
   onOpenEmojiManager,
+  onOpenFavorites,
+  onOpenInvites,
+  onOpenExplore,
   onClearLocal,
 }: {
   session?: StoredMatrixSession;
   snapshot: MatrixSnapshot;
   favoriteMessageCount: number;
   customEmojiCount: number;
+  exploreSourceCount: number;
   ownProfile?: OwnProfile;
   profileForm: { displayName: string };
   preferences: AppPreferences;
@@ -9660,6 +10930,9 @@ function SettingsPanel({
   onPreferencesChange: (value: AppPreferences) => void;
   onOpenSecurity: () => void;
   onOpenEmojiManager: () => void;
+  onOpenFavorites: () => void;
+  onOpenInvites: () => void;
+  onOpenExplore: () => void;
   onClearLocal: () => void;
 }) {
   const notificationPermission =
@@ -9832,13 +11105,27 @@ function SettingsPanel({
             <small>{customEmojiCount} 个可用 · 来自个人表情包和房间</small>
           </span>
         </button>
-        <div className="settings-item">
+        <button className="settings-item button-like" type="button" onClick={onOpenFavorites}>
           <Star size={19} />
           <span>
             <strong>收藏</strong>
             <small>{favoriteMessageCount} 条收藏消息</small>
           </span>
-        </div>
+        </button>
+        <button className="settings-item button-like" type="button" onClick={onOpenInvites}>
+          <Bell size={19} />
+          <span>
+            <strong>邀请</strong>
+            <small>{inviteRooms > 0 ? `${inviteRooms} 个待处理邀请` : '暂时没有新的邀请'}</small>
+          </span>
+        </button>
+        <button className="settings-item button-like" type="button" onClick={onOpenExplore}>
+          <Compass size={19} />
+          <span>
+            <strong>探索</strong>
+            <small>{exploreSourceCount > 0 ? `${exploreSourceCount} 个已保存来源` : '添加导航站、网页和服务器源'}</small>
+          </span>
+        </button>
       </section>
 
       <section className="settings-section">
@@ -9873,8 +11160,8 @@ function ExploreHero() {
   return (
     <div className="hero-panel">
       <Compass size={38} />
-      <h2>探索公开房间</h2>
-      <p>搜索服务器目录，加入公开群组和社区空间</p>
+      <h2>探索与导航</h2>
+      <p>搜索公开目录，整理导航站、网页和服务器源</p>
     </div>
   );
 }
