@@ -59,6 +59,7 @@ export type EncryptedMediaFile = {
 
 export type ChatAttachment = {
   kind: 'image' | 'video' | 'audio' | 'file';
+  mxcUrl?: string;
   url?: string;
   authUrl?: string;
   previewEncryptedFile?: EncryptedMediaFile;
@@ -76,8 +77,10 @@ export type ChatAttachment = {
 
 export type ChatReaction = {
   key: string;
+  shortcode?: string;
   count: number;
   reactedByMe: boolean;
+  reactors: MessageReadReceipt[];
 };
 
 export type MessageReadReceipt = {
@@ -185,6 +188,7 @@ export type RoomMediaItem = {
   messageId: string;
   roomId: string;
   kind: ChatAttachment['kind'];
+  mxcUrl?: string;
   url?: string;
   authUrl?: string;
   previewEncryptedFile?: EncryptedMediaFile;
@@ -194,6 +198,7 @@ export type RoomMediaItem = {
   encryptedFile?: EncryptedMediaFile;
   name: string;
   mimeType?: string;
+  size?: number;
   durationMs?: number;
   width?: number;
   height?: number;
@@ -404,6 +409,15 @@ const createNativeMatrixClient = (options: MatrixClientOptions): MatrixClient =>
     ...options,
     fetchFn: matrixFetch,
   } as MatrixClientOptions & { fetchFn: typeof fetch });
+
+const sanitizeStoreSegment = (value: string): string =>
+  value
+    .trim()
+    .replace(/[^a-z0-9_-]+/gi, '_')
+    .replace(/^_+|_+$/g, '') || 'session';
+
+const getSessionStoreKey = (session: Pick<StoredMatrixSession, 'userId' | 'deviceId'>): string =>
+  `${sanitizeStoreSegment(session.userId)}__${sanitizeStoreSegment(session.deviceId)}`;
 
 const getAccountDataContent = (
   client: MatrixClient,
@@ -1055,7 +1069,7 @@ const getMemberAvatarUrl = (
   );
 };
 
-const mxcToHttp = (
+export const mxcToHttp = (
   client: MatrixClient,
   mxcUrl: unknown,
   width?: number,
@@ -1160,6 +1174,7 @@ const getAttachment = (
   if (msgType === MsgType.Image || msgType === 'm.image') {
     return {
       kind: 'image',
+      mxcUrl: typeof mediaMxc === 'string' ? mediaMxc : undefined,
       url: thumbnailUrl ?? downloadUrl,
       authUrl: authThumbnailUrl ?? authDownloadUrl,
       previewEncryptedFile: thumbnailFile,
@@ -1179,6 +1194,7 @@ const getAttachment = (
   if (msgType === MsgType.Video || msgType === 'm.video') {
     return {
       kind: 'video',
+      mxcUrl: typeof mediaMxc === 'string' ? mediaMxc : undefined,
       url: thumbnailUrl ?? downloadUrl,
       authUrl: authThumbnailUrl ?? authDownloadUrl,
       previewEncryptedFile: thumbnailFile,
@@ -1198,6 +1214,7 @@ const getAttachment = (
   if (msgType === MsgType.Audio || msgType === 'm.audio') {
     return {
       kind: 'audio',
+      mxcUrl: typeof mediaMxc === 'string' ? mediaMxc : undefined,
       url: downloadUrl,
       authUrl: authDownloadUrl,
       downloadUrl,
@@ -1213,6 +1230,7 @@ const getAttachment = (
   if (msgType === MsgType.File || msgType === 'm.file') {
     return {
       kind: 'file',
+      mxcUrl: typeof mediaMxc === 'string' ? mediaMxc : undefined,
       url: downloadUrl,
       authUrl: authDownloadUrl,
       downloadUrl,
@@ -1246,25 +1264,82 @@ const getEventReactions = (
       }
     ).relations?.getChildEventsForEvent?.(eventId, 'm.annotation', 'm.reaction');
 
-    const counts = new Map<string, { count: number; reactedByMe: boolean }>();
+    const counts = new Map<
+      string,
+      {
+        count: number;
+        reactedByMe: boolean;
+        shortcode?: string;
+        reactors: Map<string, MessageReadReceipt>;
+        latestTimestamp: number;
+      }
+    >();
+    const seenReactionIds = new Set<string>();
+
     relations?.getRelations().forEach((reaction) => {
+      if (reaction.isRedacted?.()) return;
+
+      const reactionId = reaction.getId();
+      if (reactionId) {
+        if (seenReactionIds.has(reactionId)) return;
+        seenReactionIds.add(reactionId);
+      }
+
       const content = getEventContent(reaction);
       const relation = content['m.relates_to'];
       if (!relation || typeof relation !== 'object') return;
       const key = (relation as Record<string, unknown>).key;
       if (typeof key !== 'string' || key.length === 0) return;
+      const shortcode =
+        typeof content.shortcode === 'string' && content.shortcode.trim()
+          ? content.shortcode.trim()
+          : undefined;
+      const senderId = reaction.getSender();
+      const senderMember = senderId ? room.getMember(senderId) : undefined;
+      const senderTimestamp = reaction.getTs();
 
-      const current = counts.get(key) ?? { count: 0, reactedByMe: false };
+      const current = counts.get(key) ?? {
+        count: 0,
+        reactedByMe: false,
+        shortcode,
+        reactors: new Map<string, MessageReadReceipt>(),
+        latestTimestamp: 0,
+      };
       current.count += 1;
       current.reactedByMe = current.reactedByMe || reaction.getSender() === client.getUserId();
+      current.shortcode ??= shortcode;
+      current.latestTimestamp = Math.max(current.latestTimestamp, senderTimestamp);
+
+      if (senderId && !current.reactors.has(senderId)) {
+        current.reactors.set(senderId, {
+          userId: senderId,
+          name: getMemberDisplayName(room, senderId),
+          avatarUrl: getMemberAvatarUrl(client, senderMember, 48),
+          timestamp: senderTimestamp,
+        });
+      }
+
       counts.set(key, current);
     });
 
-    return Array.from(counts.entries()).map(([key, value]) => ({
-      key,
-      count: value.count,
-      reactedByMe: value.reactedByMe,
-    }));
+    return Array.from(counts.entries())
+      .map(([key, value]) => ({
+        key,
+        shortcode: value.shortcode,
+        count: value.count,
+        reactedByMe: value.reactedByMe,
+        latestTimestamp: value.latestTimestamp,
+        reactors: Array.from(value.reactors.values()).sort((left, right) => {
+          if (typeof left.timestamp === 'number' && typeof right.timestamp === 'number') {
+            return right.timestamp - left.timestamp;
+          }
+          if (typeof left.timestamp === 'number') return -1;
+          if (typeof right.timestamp === 'number') return 1;
+          return left.name.localeCompare(right.name, 'zh-Hans-CN');
+        }),
+      }))
+      .sort((left, right) => right.latestTimestamp - left.latestTimestamp || right.count - left.count)
+      .map(({ latestTimestamp: _latestTimestamp, ...reaction }) => reaction);
   } catch {
     return [];
   }
@@ -1906,19 +1981,39 @@ export async function loginWithPassword(input: LoginInput): Promise<StoredMatrix
   }
 }
 
+export async function verifyStoredSession(session: StoredMatrixSession): Promise<void> {
+  const client = createNativeMatrixClient({
+    baseUrl: session.baseUrl,
+    accessToken: session.accessToken,
+    userId: session.userId,
+    deviceId: session.deviceId,
+  });
+
+  try {
+    const response = await client.whoami();
+    if (response.user_id && response.user_id !== session.userId) {
+      throw new Error('Stored session user does not match homeserver response.');
+    }
+  } catch (error) {
+    throw matrixRequestError(error, session.baseUrl);
+  }
+}
+
 export async function createMatrixRuntime(
   session: StoredMatrixSession,
   onSnapshotChanged: (snapshot: MatrixSnapshot) => void,
   onSyncStateChanged: (state: SyncState | null) => void
 ): Promise<MatrixRuntime> {
+  const sessionStoreKey = getSessionStoreKey(session);
+  const rustCryptoDatabasePrefix = `ioscinny-rust-crypto-${sessionStoreKey}`;
   const indexedDBStore = new IndexedDBStore({
     indexedDB: globalThis.indexedDB,
     localStorage: globalThis.localStorage,
-    dbName: `ioscinny-sync-${session.userId}`,
+    dbName: `ioscinny-sync-${sessionStoreKey}`,
   });
   const cryptoStore = new IndexedDBCryptoStore(
     globalThis.indexedDB,
-    `ioscinny-crypto-${session.userId}`
+    `ioscinny-crypto-${sessionStoreKey}`
   );
 
   const client = createNativeMatrixClient({
@@ -1933,7 +2028,9 @@ export async function createMatrixRuntime(
   });
 
   await indexedDBStore.startup();
-  await client.initRustCrypto();
+  await client.initRustCrypto({
+    cryptoDatabasePrefix: rustCryptoDatabasePrefix,
+  });
 
   const refresh = () => onSnapshotChanged(buildSnapshot(client));
   const handleSync = (state: SyncState | null) => {
@@ -1978,13 +2075,17 @@ export function getMatrixSnapshot(client: MatrixClient): MatrixSnapshot {
 export function getRoomMessages(
   client: MatrixClient,
   roomId: string,
-  query = ''
+  query = '',
+  limit?: number
 ): ChatMessage[] {
   const room = client.getRoom(roomId);
   if (!room) return [];
 
   const normalizedQuery = query.trim().toLowerCase();
-  const messages = getTimelineMessages(client, room);
+  const loadedEventCount = room.getLiveTimeline().getEvents().length;
+  const effectiveLimit =
+    typeof limit === 'number' ? limit : Math.max(loadedEventCount, DEFAULT_MESSAGE_LIMIT);
+  const messages = getTimelineMessages(client, room, effectiveLimit);
   if (!normalizedQuery) return messages;
 
   return messages.filter((message) =>
@@ -2003,78 +2104,74 @@ export function getRoomInlineReadReceiptStates(
   const ownUserId = client.getUserId();
   if (!ownUserId) return new Map();
 
-  const events = room.getLiveTimeline().getEvents();
-  if (events.length === 0) return new Map();
-
-  const eventIndexById = new Map<string, number>();
-  events.forEach((event, index) => {
-    const eventId = event.getId();
-    if (eventId) eventIndexById.set(eventId, index);
-  });
-
   const ownVisibleMessages = messages.filter(
     (message): message is ChatMessage & { sender: string } =>
       message.kind === 'message' && message.mine && typeof message.sender === 'string'
   );
   if (ownVisibleMessages.length === 0) return new Map();
 
-  const ownVisibleIndices = ownVisibleMessages
-    .map((message) => eventIndexById.get(message.id))
-    .filter((index): index is number => typeof index === 'number')
-    .sort((left, right) => left - right);
-  if (ownVisibleIndices.length === 0) return new Map();
+  const timelineEvents = room.getLiveTimeline().getEvents();
+  const timelineIndexByEventId = new Map<string, number>();
 
-  const messageIdByIndex = new Map<number, string>();
-  ownVisibleMessages.forEach((message) => {
-    const index = eventIndexById.get(message.id);
-    if (typeof index === 'number') {
-      messageIdByIndex.set(index, message.id);
+  timelineEvents.forEach((event, index) => {
+    const eventId = event.getId();
+    if (eventId) {
+      timelineIndexByEventId.set(eventId, index);
     }
   });
 
+  const visibleOwnTimelineEntries = ownVisibleMessages
+    .map((message) => {
+      const timelineIndex = timelineIndexByEventId.get(message.id);
+      return typeof timelineIndex === 'number'
+        ? {
+            messageId: message.id,
+            timelineIndex,
+          }
+        : undefined;
+    })
+    .filter((entry): entry is { messageId: string; timelineIndex: number } => Boolean(entry))
+    .sort((left, right) => left.timelineIndex - right.timelineIndex);
+
   const statesByMessageId = new Map<string, InlineReadReceiptState>();
+  const assignedUsers = new Set<string>();
 
-  room.getMembers().forEach((member) => {
-    if (member.userId === ownUserId || member.membership !== 'join') return;
+  for (let index = visibleOwnTimelineEntries.length - 1; index >= 0; index -= 1) {
+    const entry = visibleOwnTimelineEntries[index];
+    const event = timelineEvents[entry.timelineIndex];
+    if (!event) continue;
 
-    const readUpToEventId =
-      room.getEventReadUpTo(member.userId, true) ?? room.getEventReadUpTo(member.userId);
-    if (!readUpToEventId) return;
+    const readers = Array.from(new Set(room.getUsersReadUpTo(event)))
+      .filter((userId) => userId && userId !== ownUserId && !assignedUsers.has(userId))
+      .map((userId, readerIndex) => {
+        const member = room.getMember(userId);
+        return {
+          userId,
+          name: getMemberDisplayName(room, userId),
+          avatarUrl: getMemberAvatarUrl(client, member, 48),
+          timestamp: getReceiptTimestamp(room, userId),
+          readerIndex,
+        };
+      });
 
-    const readUpToIndex = eventIndexById.get(readUpToEventId);
-    if (typeof readUpToIndex !== 'number') return;
+    if (readers.length === 0) continue;
 
-    const anchorIndex = findLatestIndexAtOrBefore(ownVisibleIndices, readUpToIndex);
-    if (typeof anchorIndex !== 'number') return;
-
-    const anchorMessageId = messageIdByIndex.get(anchorIndex);
-    if (!anchorMessageId) return;
-
-    const nextState = statesByMessageId.get(anchorMessageId) ?? {
-      readReceipts: [],
-      totalCount: 0,
-    };
-
-    nextState.readReceipts.push({
-      userId: member.userId,
-      name: getMemberDisplayName(room, member.userId),
-      avatarUrl: getMemberAvatarUrl(client, member, 48),
-      timestamp: getReceiptTimestamp(room, member.userId),
-    });
-    nextState.totalCount = nextState.readReceipts.length;
-    statesByMessageId.set(anchorMessageId, nextState);
-  });
-
-  statesByMessageId.forEach((state) => {
-    state.readReceipts.sort((left, right) => {
+    readers.sort((left, right) => {
       if (typeof left.timestamp === 'number' && typeof right.timestamp === 'number') {
         return right.timestamp - left.timestamp;
       }
       if (typeof left.timestamp === 'number') return -1;
       if (typeof right.timestamp === 'number') return 1;
-      return left.name.localeCompare(right.name, 'zh-Hans-CN');
+      return left.readerIndex - right.readerIndex;
     });
-  });
+
+    statesByMessageId.set(entry.messageId, {
+      readReceipts: readers.map(({ readerIndex: _readerIndex, ...reader }) => reader),
+      totalCount: readers.length,
+    });
+
+    readers.forEach((reader) => assignedUsers.add(reader.userId));
+  }
 
   return statesByMessageId;
 }
@@ -2115,6 +2212,7 @@ export function getRoomMediaItems(client: MatrixClient, roomId: string): RoomMed
       messageId: message.id,
       roomId: message.roomId,
       kind: message.attachment!.kind,
+      mxcUrl: message.attachment!.mxcUrl,
       url: message.attachment!.url,
       authUrl: message.attachment!.authUrl,
       previewEncryptedFile: message.attachment!.previewEncryptedFile,
@@ -2124,6 +2222,7 @@ export function getRoomMediaItems(client: MatrixClient, roomId: string): RoomMed
       encryptedFile: message.attachment!.encryptedFile,
       name: message.attachment!.name ?? message.body,
       mimeType: message.attachment!.mimeType,
+      size: message.attachment!.size,
       durationMs: message.attachment!.durationMs,
       width: message.attachment!.width,
       height: message.attachment!.height,
@@ -2367,11 +2466,31 @@ const getCinnyUserEmojiPackMap = (
     : {};
 };
 
+const normalizeCinnyUserEmojiPackOrder = (
+  order: unknown,
+  packs: Record<string, Record<string, unknown> | undefined>
+): string[] => {
+  const rawOrder = Array.isArray(order)
+    ? order.filter((packId): packId is string => typeof packId === 'string' && packId.length > 0)
+    : [];
+  const availablePackIds = new Set(
+    Object.keys(packs).filter((packId) => packId.length > 0 && packId !== 'user')
+  );
+  const normalizedOrder: string[] = [];
+
+  rawOrder.forEach((packId) => {
+    if (!availablePackIds.has(packId)) return;
+    availablePackIds.delete(packId);
+    normalizedOrder.push(packId);
+  });
+
+  availablePackIds.forEach((packId) => normalizedOrder.push(packId));
+  return normalizedOrder;
+};
+
 const getCinnyUserEmojiPackOrder = (client: MatrixClient): string[] => {
   const root = getCinnyUserEmojiPackRoot(client);
-  return Array.isArray(root.order)
-    ? (root.order as unknown[]).filter((packId): packId is string => typeof packId === 'string' && packId.length > 0)
-    : [];
+  return normalizeCinnyUserEmojiPackOrder(root.order, getCinnyUserEmojiPackMap(client));
 };
 
 const saveEditableUserPackContent = async (
@@ -2390,7 +2509,7 @@ const saveCinnyUserEmojiPackRoot = async (
   await setAccountDataContent(client, 'in.cinny.user_emoji_packs', {
     ...currentRoot,
     packs,
-    order,
+    order: normalizeCinnyUserEmojiPackOrder(order, packs),
   });
 };
 
@@ -2449,6 +2568,12 @@ const ensureUniqueEmojiShortcode = (
 
   return candidate;
 };
+
+const findEmojiShortcodeByMxcUrl = (
+  images: Record<string, Record<string, unknown> | undefined>,
+  mxcUrl: string
+): string | undefined =>
+  Object.entries(images).find(([, image]) => image?.url === mxcUrl)?.[0];
 
 const createPersonalEmojiPackId = (): string =>
   `personal-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -2519,11 +2644,7 @@ export function getPersonalCustomEmojiPacks(client: MatrixClient): CustomEmojiPa
   );
 
   const customPacks = getCinnyUserEmojiPackMap(client);
-  const orderedPackIds = getCinnyUserEmojiPackOrder(client);
-  const packIds = [
-    ...orderedPackIds,
-    ...Object.keys(customPacks).filter((packId) => !orderedPackIds.includes(packId)),
-  ];
+  const packIds = getCinnyUserEmojiPackOrder(client);
 
   packIds.forEach((packId) => {
     packs.push(
@@ -2714,11 +2835,7 @@ export async function reorderCustomEmojiPack(
   if (packId === 'user') return;
 
   const packs = getCinnyUserEmojiPackMap(client);
-  const order = getCinnyUserEmojiPackOrder(client);
-  const normalizedOrder = [
-    ...order,
-    ...Object.keys(packs).filter((id) => !order.includes(id)),
-  ];
+  const normalizedOrder = getCinnyUserEmojiPackOrder(client);
   const index = normalizedOrder.indexOf(packId);
 
   if (index === -1) return;
@@ -2796,6 +2913,81 @@ export async function uploadCustomEmojiPackFiles(
 
   await saveCinnyUserEmojiPackRoot(client, packs, getCinnyUserEmojiPackOrder(client));
   return imageFiles.length;
+}
+
+export async function addImageToDefaultCustomEmojiPack(
+  client: MatrixClient,
+  image: {
+    mxcUrl: string;
+    name?: string;
+    body?: string;
+    info?: Record<string, unknown>;
+    usage?: CustomEmojiUsage[];
+    preferredShortcode?: string;
+  }
+): Promise<string> {
+  if (!image.mxcUrl.startsWith('mxc://')) {
+    throw new Error('只能把 Matrix 媒体添加到默认表情包。');
+  }
+
+  const editableContent = getEditableUserPackContent(client);
+  const editableImages = getPackImagesRecord(editableContent);
+  const mergedImages = getPackImagesRecord(getAccountDataContent(client, 'im.ponies.user_emotes'));
+  const normalizedUsage = normalizeEditableEmojiUsageInput(image.usage ?? ['emoticon']);
+  const existingShortcode =
+    findEmojiShortcodeByMxcUrl(editableImages, image.mxcUrl) ??
+    findEmojiShortcodeByMxcUrl(mergedImages, image.mxcUrl);
+
+  if (existingShortcode) {
+    const existingImage = editableImages[existingShortcode] ?? mergedImages[existingShortcode];
+    const currentUsage = normalizeEmojiUsage(existingImage?.usage, undefined);
+    const mergedUsage = normalizeEditableEmojiUsageInput([...currentUsage, ...normalizedUsage]);
+
+    if (mergedUsage.join('|') !== currentUsage.join('|')) {
+      editableImages[existingShortcode] = {
+        ...(existingImage ?? {}),
+        url: image.mxcUrl,
+        body:
+          (typeof existingImage?.body === 'string' && existingImage.body.trim()) ||
+          image.body?.trim() ||
+          stripFileExtension(image.name ?? '') ||
+          existingShortcode,
+        info:
+          existingImage?.info && typeof existingImage.info === 'object'
+            ? existingImage.info
+            : image.info,
+        usage: mergedUsage,
+      };
+
+      await saveEditableUserPackContent(client, {
+        ...editableContent,
+        images: editableImages,
+      });
+    }
+
+    return existingShortcode;
+  }
+
+  const shortcode = ensureUniqueEmojiShortcode(
+    editableImages,
+    makeEmojiShortcodeBase(image.preferredShortcode ?? image.name ?? image.body ?? 'emoji')
+  );
+  const nextImages: Record<string, Record<string, unknown> | undefined> = {
+    [shortcode]: {
+      url: image.mxcUrl,
+      body: image.body?.trim() || stripFileExtension(image.name ?? '') || shortcode,
+      info: image.info,
+      usage: normalizedUsage,
+    },
+    ...editableImages,
+  };
+
+  await saveEditableUserPackContent(client, {
+    ...editableContent,
+    images: nextImages,
+  });
+
+  return shortcode;
 }
 
 export async function deleteCustomEmojiPackItems(
@@ -2926,18 +3118,8 @@ export function getCustomEmojiItems(client: MatrixClient, roomId?: string): Cust
   const userPack = filterSyncedPersonalPackImages(getAccountDataContent(client, 'im.ponies.user_emotes'));
   items.push(...collectCustomEmojiPackItems(client, 'user', userPack, '我的表情'));
 
-  const cinnyPacks = getAccountDataContent(client, 'in.cinny.user_emoji_packs');
-  const customPacks =
-    cinnyPacks?.packs && typeof cinnyPacks.packs === 'object'
-      ? (cinnyPacks.packs as Record<string, Record<string, unknown> | undefined>)
-      : {};
-  const orderedPackIds = Array.isArray(cinnyPacks?.order)
-    ? (cinnyPacks.order as unknown[]).filter((packId): packId is string => typeof packId === 'string')
-    : [];
-  const packIds = [
-    ...orderedPackIds,
-    ...Object.keys(customPacks).filter((packId) => !orderedPackIds.includes(packId)),
-  ];
+  const customPacks = getCinnyUserEmojiPackMap(client);
+  const packIds = getCinnyUserEmojiPackOrder(client);
 
   packIds.forEach((packId) => {
     items.push(...collectCustomEmojiPackItems(client, packId, customPacks[packId], packId));
@@ -3007,17 +3189,9 @@ export function getCustomEmojiDebugSummary(
   ).sort((a, b) => a.localeCompare(b, 'zh-Hans-CN'));
 
   const cinnyContent = getAccountDataContent(client, 'in.cinny.user_emoji_packs');
-  const cinnyPacks =
-    cinnyContent?.packs && typeof cinnyContent.packs === 'object'
-      ? (cinnyContent.packs as Record<string, Record<string, unknown> | undefined>)
-      : {};
-  const cinnyOrder = Array.isArray(cinnyContent?.order)
-    ? (cinnyContent.order as unknown[]).filter((packId): packId is string => typeof packId === 'string')
-    : [];
-  const cinnyPackIds = [
-    ...cinnyOrder,
-    ...Object.keys(cinnyPacks).filter((packId) => !cinnyOrder.includes(packId)),
-  ];
+  const cinnyPacks = getCinnyUserEmojiPackMap(client);
+  const cinnyOrder = normalizeCinnyUserEmojiPackOrder(cinnyContent?.order, cinnyPacks);
+  const cinnyPackIds = cinnyOrder;
 
   const roomPackIds = new Set<string>();
   if (roomId) roomPackIds.add(roomId);
@@ -3434,10 +3608,13 @@ export async function paginateRoomMessages(
   client: MatrixClient,
   roomId: string,
   limit = 40
-): Promise<void> {
+): Promise<number> {
   const room = client.getRoom(roomId);
-  if (!room) return;
+  if (!room) return 0;
+  const beforeCount = room.getLiveTimeline().getEvents().length;
   await client.scrollback(room, limit);
+  const afterCount = room.getLiveTimeline().getEvents().length;
+  return Math.max(0, afterCount - beforeCount);
 }
 
 export async function updateTypingStatus(
@@ -3666,7 +3843,8 @@ export async function sendReaction(
   client: MatrixClient,
   roomId: string,
   eventId: string,
-  key: string
+  key: string,
+  shortcode?: string
 ): Promise<void> {
   const room = client.getRoom(roomId);
   const ownReactionEventId = room ? getOwnReactionEventId(client, room, eventId, key) : undefined;
@@ -3687,6 +3865,7 @@ export async function sendReaction(
         event_id: eventId,
         key,
       },
+      ...(shortcode ? { shortcode } : {}),
     } as never
   );
 }

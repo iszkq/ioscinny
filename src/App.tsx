@@ -2,6 +2,7 @@
 import { Capacitor } from '@capacitor/core';
 import { Device } from '@capacitor/device';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
+import { Keyboard as CapacitorKeyboard } from '@capacitor/keyboard';
 import {
   Archive,
   AtSign,
@@ -28,6 +29,7 @@ import {
   History,
   Image as ImageIcon,
   Info,
+  Keyboard as KeyboardIcon,
   KeyRound,
   Link2,
   Lock,
@@ -63,7 +65,8 @@ import {
   VolumeX,
   X,
 } from 'lucide-react';
-import { MatrixClient, SyncState } from 'matrix-js-sdk';
+import { ClientEvent, MatrixClient, MatrixEvent, RoomEvent, SyncState } from 'matrix-js-sdk';
+import { HttpApiEvent } from 'matrix-js-sdk/lib/http-api/interface.js';
 import {
   CSSProperties,
   ChangeEvent,
@@ -85,6 +88,7 @@ import {
 
 import {
   acceptInvite,
+  addImageToDefaultCustomEmojiPack,
   banMember,
   ChatAttachment,
   ChatReply,
@@ -154,6 +158,7 @@ import {
   restoreKeyBackupFromSecretStorage,
   restoreKeyBackupWithPassphrase,
   moveCustomEmojiPackItems,
+  mxcToHttp,
   updateCustomEmojiPack,
   updateCustomEmojiPackItem,
   updateOwnAvatar,
@@ -163,6 +168,7 @@ import {
   updateTypingStatus,
   uploadCustomEmojiPackFiles,
   uploadFileMessage,
+  verifyStoredSession,
 } from './services/matrix';
 import {
   clearStoredSession,
@@ -172,6 +178,25 @@ import {
 } from './services/sessionStore';
 import { getCachedMediaUrl, peekCachedMediaUrl, storeCachedMediaBlob } from './services/mediaCache';
 import { mediaFetch } from './services/nativeFetch';
+import {
+  AUDIO_TRANSCRIPTION_ACCOUNT_DATA_EVENT_TYPE,
+  AIHUBMIX_AUDIO_TRANSCRIPTION_MAX_FILE_SIZE,
+  AIHUBMIX_AUDIO_TRANSCRIPTION_MODEL,
+  applyAudioTranscriptionSettingsAccountData,
+  AudioTranscriptionResult,
+  AudioTranscriptionSegment,
+  AudioTranscriptionSettings,
+  defaultAudioTranscriptionSettings,
+  getAudioTranscriptionSettingsAccountDataSignature,
+  getSyncedAudioTranscriptionSettings,
+  hasAihubmixAudioTranscription,
+  isDefaultAudioTranscriptionSettings,
+  loadAudioTranscriptionSettings,
+  normalizeAudioTranscriptionSettings,
+  saveSyncedAudioTranscriptionSettings,
+  saveAudioTranscriptionSettings,
+  transcribeAudioWithAihubmix,
+} from './services/audioTranscription';
 
 type BootState = 'booting' | 'signedOut' | 'connecting' | 'signedIn' | 'error';
 type PrimaryView = 'home' | 'direct' | 'rooms' | 'spaces' | 'invites' | 'favorites' | 'explore' | 'settings';
@@ -184,7 +209,7 @@ type Sheet =
   | 'security'
   | 'emojiManager'
   | { type: 'messageInfo'; message: ChatMessage }
-  | { type: 'readReceipts'; message: ChatMessage }
+  | { type: 'readReceipts'; message: ChatMessage; inlineState?: InlineReadReceiptState }
   | { type: 'forward'; messages: ChatMessage[] }
   | { type: 'userProfile'; member: RoomMemberSummary }
   | undefined;
@@ -254,13 +279,37 @@ type SpeechRecognitionLike = {
   stop: () => void;
   abort?: () => void;
 };
+type BrowserAudioTranscriptionSupport = {
+  supported: boolean;
+  reason?: string;
+};
+type StoredFavoriteMessageSnapshot = {
+  roomId: string;
+  roomName: string;
+  roomAvatarUrl?: string;
+  roomDirect: boolean;
+  roomSpace: boolean;
+  roomEncrypted: boolean;
+  roomMemberCount: number;
+  capturedAt: number;
+  message: ChatMessage;
+};
 
 const defaultHomeserver = 'https://mtx01.cc';
 const favoriteRoomsKey = 'ioscinny.favoriteRooms';
 const favoriteMessagesKey = 'ioscinny.favoriteMessages';
+const favoriteMessageSnapshotsKey = 'ioscinny.favoriteMessageSnapshots';
 const appPreferencesKey = 'ioscinny.preferences';
 const roomDraftsKey = 'ioscinny.roomDrafts';
 const exploreServerSourcesKey = 'ioscinny.exploreServers';
+const MAX_AUDIO_TRANSCRIPTION_DURATION_SEC = 5 * 60;
+const BROWSER_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC = 20;
+const BROWSER_AUDIO_TRANSCRIPTION_SEGMENT_COOLDOWN_MS = 150;
+const MAX_BROWSER_AUDIO_TRANSCRIPTION_DURATION_SEC = 60;
+const AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC = 75;
+const AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_COOLDOWN_MS = 120;
+const AIHUBMIX_CHUNKING_MIN_DURATION_SEC = 90;
+const MAX_RECOGNITION_RESTARTS_PER_SEGMENT = 2;
 const quickReactionOptions = ['👍', '❤️', '😀', '🎉', '😖', '✅'];
 const composerEmojiOptions = [
   '😺',
@@ -377,9 +426,16 @@ const clampReadReceiptAvatarCount = (value: number | undefined): number => {
   );
 };
 
+const getEffectiveMessageReadReceipts = (
+  message: ChatMessage,
+  inlineReadReceiptState?: InlineReadReceiptState
+): MessageReadReceipt[] =>
+  message.mine && inlineReadReceiptState ? inlineReadReceiptState.readReceipts : message.readReceipts;
+
 const getOwnMessageReadReceiptSummary = (
   message: ChatMessage,
-  members: RoomMemberSummary[]
+  members: RoomMemberSummary[],
+  readReceipts: MessageReadReceipt[] = message.readReceipts
 ): {
   totalCount: number;
   readCount: number;
@@ -388,10 +444,12 @@ const getOwnMessageReadReceiptSummary = (
 } | undefined => {
   if (!message.mine || !message.sender) return undefined;
 
-  const audience = members.filter((member) => member.id !== message.sender);
+  const audience = members.filter(
+    (member) => member.id !== message.sender && member.membership !== 'leave' && member.membership !== 'ban'
+  );
   if (audience.length === 0) return undefined;
 
-  const readUserIds = new Set(message.readReceipts.map((receipt) => receipt.userId));
+  const readUserIds = new Set(readReceipts.map((receipt) => receipt.userId));
   const unreadMembers = audience.filter((member) => !readUserIds.has(member.id));
 
   return {
@@ -487,9 +545,36 @@ const formatTime = (ts: number): string => {
   const date = new Date(ts);
   const now = new Date();
   if (date.toDateString() === now.toDateString()) {
-    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+    return date.toLocaleTimeString('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false,
+    });
   }
   return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+};
+
+const formatMessageTime = (ts: number): string => {
+  if (!ts) return '';
+
+  const date = new Date(ts);
+  const now = new Date();
+  const timeLabel = date.toLocaleTimeString('zh-CN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
+
+  if (date.toDateString() === now.toDateString()) {
+    return timeLabel;
+  }
+
+  const dateLabel = date.toLocaleDateString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+  });
+
+  return `${dateLabel} ${timeLabel}`;
 };
 
 const formatFullTime = (ts: number): string =>
@@ -521,6 +606,65 @@ const formatDateSeparator = (ts: number): string => {
     day: 'numeric',
     weekday: 'short',
   });
+};
+
+const fallbackCopyTextToClipboard = (text: string): boolean => {
+  if (typeof document === 'undefined') return false;
+
+  const activeElement = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
+  const selection = window.getSelection();
+  const savedRanges =
+    selection && selection.rangeCount > 0
+      ? Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index).cloneRange())
+      : [];
+  const textarea = document.createElement('textarea');
+
+  textarea.value = text;
+  textarea.setAttribute('readonly', 'true');
+  textarea.setAttribute('aria-hidden', 'true');
+  textarea.style.position = 'fixed';
+  textarea.style.top = '0';
+  textarea.style.left = '-9999px';
+  textarea.style.opacity = '0';
+  textarea.style.pointerEvents = 'none';
+  textarea.style.fontSize = '16px';
+
+  document.body.appendChild(textarea);
+  textarea.focus({ preventScroll: true });
+  textarea.select();
+  textarea.setSelectionRange(0, textarea.value.length);
+
+  let copied = false;
+  try {
+    copied = document.execCommand('copy');
+  } catch {
+    copied = false;
+  }
+
+  document.body.removeChild(textarea);
+
+  if (selection) {
+    selection.removeAllRanges();
+    savedRanges.forEach((range) => selection.addRange(range));
+  }
+  activeElement?.focus({ preventScroll: true });
+
+  return copied;
+};
+
+const copyTextToClipboard = async (text: string): Promise<boolean> => {
+  const value = text ?? '';
+
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(value);
+      return true;
+    } catch {
+      // Fall through to legacy copy handling for iOS WebView / insecure contexts.
+    }
+  }
+
+  return fallbackCopyTextToClipboard(value);
 };
 
 const getReadableMessageBody = (body: string): string => {
@@ -901,11 +1045,34 @@ const getReadableSpeechError = (code?: string): string => {
   }
   if (code === 'audio-capture' || code === 'NotFoundError') return '没有读取到麦克风输入，请检查系统麦克风权限';
   if (code === 'network' && Capacitor.getPlatform() === 'ios') {
-    return '当前 IPA 还没接入 iOS 原生语音转文字；现在这套浏览器识别方案在 WKWebView 里不可用。';
+    return '当前 IPA 里的浏览器识别不可用，请在设置里配置 AIHubMix 云端转写。';
   }
-  if (code === 'network') return '当前预览环境还没接入稳定的语音转文字服务，浏览器预览里无法可靠测试。';
+  if (code === 'network') return '浏览器语音识别服务连接失败。请稍后重试，或在设置里配置 AIHubMix 云端转写。';
   if (code === 'no-speech') return '没有识别到语音内容。';
   return code ? `语音听写失败：${code}` : '语音听写失败';
+};
+
+const getReadableLoginError = (err: unknown): string => {
+  const message = err instanceof Error ? err.message : String(err);
+  const data = isRecord(err) && isRecord(err.data) ? err.data : undefined;
+  const errcode =
+    (isRecord(err) && typeof err.errcode === 'string' ? err.errcode : undefined) ??
+    (typeof data?.errcode === 'string' ? data.errcode : undefined);
+
+  if (/invalid username\/password/i.test(message)) {
+    return '用户名或密码错误，请重新输入。';
+  }
+  if (errcode === 'M_FORBIDDEN') {
+    return '用户名或密码错误，请重新输入。';
+  }
+  if (errcode === 'M_USER_DEACTIVATED') {
+    return '当前账号已被停用，请联系服务器管理员。';
+  }
+  if (errcode === 'M_LIMIT_EXCEEDED') {
+    return '登录过于频繁，请稍后再试。';
+  }
+
+  return message;
 };
 
 const audioRecorderMimeCandidates = [
@@ -1116,6 +1283,33 @@ const getPreviewEncryptedFile = (attachment?: ChatAttachment): EncryptedMediaFil
     previewPrimarySrc === fullPrimarySrc || previewFallbackSrc === fullFallbackSrc;
 
   return previewUsesOriginalAsset ? attachment.encryptedFile : undefined;
+};
+
+const isHttpLikeUrl = (value: string): boolean => /^https?:\/\//i.test(value);
+
+const canPreviewRoomMediaItem = (item: RoomMediaItem): boolean =>
+  Boolean(item.authDownloadUrl ?? item.authUrl ?? item.downloadUrl ?? item.url);
+
+const getNavigableRoomMediaItems = (
+  items: RoomMediaItem[],
+  kind: RoomMediaItem['kind']
+): RoomMediaItem[] =>
+  [...items]
+    .filter((item) => item.kind === kind && canPreviewRoomMediaItem(item))
+    .sort((left, right) => left.timestamp - right.timestamp || left.messageId.localeCompare(right.messageId));
+
+const buildCustomEmojiInfoFromMedia = (media: {
+  mimeType?: string;
+  width?: number;
+  height?: number;
+  size?: number;
+}): Record<string, unknown> | undefined => {
+  const info: Record<string, unknown> = {};
+  if (media.mimeType) info.mimetype = media.mimeType;
+  if (typeof media.width === 'number') info.w = media.width;
+  if (typeof media.height === 'number') info.h = media.height;
+  if (typeof media.size === 'number') info.size = media.size;
+  return Object.keys(info).length > 0 ? info : undefined;
 };
 
 const decodeUnpaddedBase64 = (value: string): Uint8Array => {
@@ -1479,28 +1673,271 @@ const useDeferredMediaActivation = (
   return { hostRef, active };
 };
 
-const combineTranscript = (leftText = '', rightText = ''): string =>
-  `${leftText} ${rightText}`.replace(/\s+/g, ' ').trim();
+const cjkCharacterPattern = /[\u3400-\u9fff]/;
+const transcriptSentenceEndingPattern = /[。！？!?]$/;
+const transcriptPunctuationPattern = /[，。！？；：、,.!?;:]/;
+const transcriptConnectorPattern =
+  /^(但是|然后|所以|因为|如果|后来|结果|另外|不过|其实|而且|并且|同时|接着|最后|现在|那么|就是)/;
+
+const normalizeTranscriptSpacing = (value = ''): string => {
+  let nextValue = value
+    .replace(/\r\n?/g, '\n')
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\s*\n\s*/g, '\n')
+    .trim();
+
+  for (let index = 0; index < 3; index += 1) {
+    const previousValue = nextValue;
+    nextValue = nextValue
+      .replace(/([\u3400-\u9fff])\s+([\u3400-\u9fff])/g, '$1$2')
+      .replace(/\s+([，。！？；：、])/g, '$1')
+      .replace(/([（《“‘【])\s+/g, '$1')
+      .replace(/\s+([）》。！？；：、】”’])/g, '$1');
+    if (nextValue === previousValue) break;
+  }
+
+  return nextValue;
+};
+
+const normalizeTranscriptPunctuation = (value = ''): string =>
+  normalizeTranscriptSpacing(value)
+    .replace(/,/g, '，')
+    .replace(/;/g, '；')
+    .replace(/:/g, '：')
+    .replace(/\?/g, '？')
+    .replace(/!/g, '！')
+    .replace(/\.{3,}/g, '……')
+    .replace(/。{2,}/g, '。')
+    .replace(/，{2,}/g, '，')
+    .replace(/！{2,}/g, '！')
+    .replace(/？{2,}/g, '？');
+
+const combineTranscript = (leftText = '', rightText = ''): string => {
+  const leftValue = normalizeTranscriptSpacing(leftText);
+  const rightValue = normalizeTranscriptSpacing(rightText);
+  if (!leftValue) return rightValue;
+  if (!rightValue) return leftValue;
+
+  const shouldJoinWithoutSpace =
+    cjkCharacterPattern.test(leftValue[leftValue.length - 1] ?? '') &&
+    cjkCharacterPattern.test(rightValue[0] ?? '');
+  const shouldJoinDirectly = shouldJoinWithoutSpace || /^[，。！？；：、]/.test(rightValue);
+
+  return `${leftValue}${shouldJoinDirectly ? '' : ' '}${rightValue}`.trim();
+};
+
+const ensureTranscriptSentenceEnding = (value: string): string => {
+  if (!value) return value;
+  if (transcriptSentenceEndingPattern.test(value)) return value;
+  return `${value}${cjkCharacterPattern.test(value) ? '。' : '.'}`;
+};
+
+const splitPlainTranscriptIntoSentences = (value: string): string[] => {
+  if (!value) return [];
+
+  const sentences: string[] = [];
+  let cursor = 0;
+  const targetLength = 22;
+  const maxLength = 34;
+
+  while (cursor < value.length) {
+    const remaining = value.length - cursor;
+    if (remaining <= 18) {
+      const tail = value.slice(cursor).trim();
+      if (tail) sentences.push(tail);
+      break;
+    }
+
+    let breakIndex = Math.min(value.length, cursor + maxLength);
+    let fallbackIndex = -1;
+
+    for (let index = cursor + 10; index < Math.min(value.length, cursor + maxLength); index += 1) {
+      const currentChar = value[index];
+      const nextSlice = value.slice(index).trimStart();
+      if (index - cursor >= targetLength && transcriptConnectorPattern.test(nextSlice)) {
+        breakIndex = index;
+        fallbackIndex = index;
+        break;
+      }
+      if (/[吧吗啊呀呢啦嘛么呗哇]/.test(currentChar ?? '')) {
+        fallbackIndex = index + 1;
+      }
+      if (index - cursor >= targetLength && /[的地得了着过]/.test(currentChar ?? '')) {
+        fallbackIndex = index + 1;
+      }
+    }
+
+    if (fallbackIndex > cursor && fallbackIndex < breakIndex) {
+      breakIndex = fallbackIndex;
+    }
+
+    const sentence = value.slice(cursor, breakIndex).trim();
+    if (sentence) sentences.push(sentence);
+    cursor = breakIndex;
+  }
+
+  return sentences;
+};
+
+const formatTranscriptParagraph = (value: string): string => {
+  const normalized = normalizeTranscriptPunctuation(value);
+  if (!normalized) return '';
+
+  if (transcriptSentenceEndingPattern.test(normalized) || /[。！？]/.test(normalized)) {
+    return ensureTranscriptSentenceEnding(normalized);
+  }
+
+  if (transcriptPunctuationPattern.test(normalized)) {
+    const clauses = normalized.split(/[，；：、]/).map((clause) => clause.trim()).filter(Boolean);
+    if (clauses.length > 1) {
+      return clauses
+        .map((clause, index) => `${clause}${index === clauses.length - 1 ? '。' : index % 2 === 0 ? '，' : '。'}`)
+        .join('');
+    }
+    return ensureTranscriptSentenceEnding(normalized);
+  }
+
+  const sentences = splitPlainTranscriptIntoSentences(normalized);
+  return sentences
+    .map((sentence, index) => `${sentence}${index === sentences.length - 1 ? '。' : index % 2 === 0 ? '，' : '。'}`)
+    .join('');
+};
+
+const groupTranscriptSegments = (segments: AudioTranscriptionSegment[]): string[] => {
+  const paragraphs: string[] = [];
+  let paragraph = '';
+  let previousEnd: number | undefined;
+
+  segments.forEach((segment) => {
+    const text = normalizeTranscriptSpacing(segment.text);
+    if (!text) return;
+
+    const gap =
+      typeof previousEnd === 'number' && typeof segment.start === 'number'
+        ? segment.start - previousEnd
+        : 0;
+    const shouldBreak = Boolean(paragraph) && (gap >= 1.2 || paragraph.length >= 48);
+
+    if (shouldBreak) {
+      paragraphs.push(paragraph);
+      paragraph = text;
+    } else {
+      paragraph = combineTranscript(paragraph, text);
+    }
+
+    previousEnd = typeof segment.end === 'number' ? segment.end : previousEnd;
+  });
+
+  if (paragraph) paragraphs.push(paragraph);
+  return paragraphs;
+};
+
+const formatTranscriptionForDisplay = (
+  text = '',
+  segments?: AudioTranscriptionSegment[]
+): string => {
+  const paragraphSources =
+    segments && segments.length > 0
+      ? groupTranscriptSegments(segments)
+      : normalizeTranscriptSpacing(text)
+          .split(/\n+/)
+          .map((paragraph) => paragraph.trim())
+          .filter(Boolean);
+
+  const paragraphs = paragraphSources
+    .map((paragraph) => formatTranscriptParagraph(paragraph))
+    .filter(Boolean);
+
+  if (paragraphs.length > 0) {
+    return paragraphs.join('\n\n');
+  }
+
+  return formatTranscriptParagraph(text);
+};
+
+const getBrowserAudioTranscriptionSupport = (): BrowserAudioTranscriptionSupport => {
+  if (Capacitor.getPlatform() === 'ios') {
+    return {
+      supported: false,
+      reason: 'iOS WebView 里没有浏览器语音识别兜底，请先配置 AIHubMix 云端转写。',
+    };
+  }
+
+  if (typeof window === 'undefined' || typeof navigator === 'undefined') {
+    return {
+      supported: false,
+      reason: '当前环境没有可用的浏览器语音识别能力，请先配置 AIHubMix 云端转写。',
+    };
+  }
+
+  const userAgent = navigator.userAgent || '';
+  const isChromeLike = /\b(?:Chrome|Chromium)\/\d+/i.test(userAgent);
+  const isUnsupportedShell = /\b(?:Edg|OPR|Electron|DuckDuckGo|YaBrowser|QQBrowser|UCBrowser|SamsungBrowser)\b/i
+    .test(userAgent);
+
+  if (!isChromeLike || isUnsupportedShell) {
+    return {
+      supported: false,
+      reason: 'Web 预览里的历史语音本地转写目前只建议在桌面 Chrome 使用；当前环境请优先配置 AIHubMix 云端转写。',
+    };
+  }
+
+  const SpeechRecognitionCtor =
+    (window as unknown as { SpeechRecognition?: new () => SpeechRecognitionLike }).SpeechRecognition ??
+    (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognitionLike }).webkitSpeechRecognition;
+  const AudioContextCtor =
+    window.AudioContext ??
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+  if (!SpeechRecognitionCtor || !AudioContextCtor) {
+    return {
+      supported: false,
+      reason: '当前 Chrome 环境缺少历史语音识别所需能力，请先配置 AIHubMix 云端转写。',
+    };
+  }
+
+  return {
+    supported: true,
+    reason: `浏览器本地转写仅建议用于 ${MAX_BROWSER_AUDIO_TRANSCRIPTION_DURATION_SEC} 秒内的短语音`,
+  };
+};
 
 const createAudioBufferSegment = (
   audioContext: AudioContext,
   audioBuffer: AudioBuffer,
   startSecond: number,
-  endSecond: number
+  endSecond: number,
+  options?: { mono?: boolean }
 ): AudioBuffer => {
   const startFrame = Math.max(0, Math.floor(startSecond * audioBuffer.sampleRate));
   const endFrame = Math.min(audioBuffer.length, Math.ceil(endSecond * audioBuffer.sampleRate));
   const frameLength = Math.max(1, endFrame - startFrame);
+  const mono = Boolean(options?.mono);
   const segment = audioContext.createBuffer(
-    audioBuffer.numberOfChannels,
+    mono ? 1 : audioBuffer.numberOfChannels,
     frameLength,
     audioBuffer.sampleRate
   );
 
+  if (mono) {
+    const targetChannelData = segment.getChannelData(0);
+    const channelCount = Math.max(audioBuffer.numberOfChannels, 1);
+
+    for (let channel = 0; channel < channelCount; channel += 1) {
+      const sourceChannelData = audioBuffer.getChannelData(channel);
+      for (let frame = 0; frame < frameLength; frame += 1) {
+        targetChannelData[frame] += (sourceChannelData[startFrame + frame] ?? 0) / channelCount;
+      }
+    }
+
+    return segment;
+  }
+
   for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
-    segment
-      .getChannelData(channel)
-      .set(audioBuffer.getChannelData(channel).subarray(startFrame, endFrame));
+    segment.getChannelData(channel).set(
+      audioBuffer.getChannelData(channel).subarray(startFrame, endFrame)
+    );
   }
 
   return segment;
@@ -1510,6 +1947,51 @@ const wait = (durationMs: number): Promise<void> =>
   new Promise((resolve) => {
     window.setTimeout(resolve, durationMs);
   });
+
+const encodeAudioBufferAsWav = (audioBuffer: AudioBuffer): Blob => {
+  const channelCount = audioBuffer.numberOfChannels;
+  const sampleRate = audioBuffer.sampleRate;
+  const frameCount = audioBuffer.length;
+  const bytesPerSample = 2;
+  const blockAlign = channelCount * bytesPerSample;
+  const byteRate = sampleRate * blockAlign;
+  const wavBuffer = new ArrayBuffer(44 + frameCount * blockAlign);
+  const view = new DataView(wavBuffer);
+  const channels = Array.from({ length: channelCount }, (_, channelIndex) =>
+    audioBuffer.getChannelData(channelIndex)
+  );
+
+  const writeAscii = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index));
+    }
+  };
+
+  writeAscii(0, 'RIFF');
+  view.setUint32(4, 36 + frameCount * blockAlign, true);
+  writeAscii(8, 'WAVE');
+  writeAscii(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, channelCount, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, byteRate, true);
+  view.setUint16(32, blockAlign, true);
+  view.setUint16(34, bytesPerSample * 8, true);
+  writeAscii(36, 'data');
+  view.setUint32(40, frameCount * blockAlign, true);
+
+  let offset = 44;
+  for (let frame = 0; frame < frameCount; frame += 1) {
+    for (let channel = 0; channel < channelCount; channel += 1) {
+      const sample = Math.max(-1, Math.min(1, channels[channel][frame] ?? 0));
+      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+      offset += 2;
+    }
+  }
+
+  return new Blob([wavBuffer], { type: 'audio/wav' });
+};
 
 const transcribeAudioSegmentInBrowser = async (
   audioContext: AudioContext,
@@ -1521,7 +2003,7 @@ const transcribeAudioSegmentInBrowser = async (
     (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognitionLike }).webkitSpeechRecognition;
 
   if (!SpeechRecognitionCtor) {
-    throw new Error('当前浏览器不支持历史语音转文字；iOS 真机需要接入原生语音识别或云端 STT');
+    throw new Error('当前浏览器不支持历史语音转文字；请改用支持语音识别的浏览器，或在设置里配置 AIHubMix 云端转写。');
   }
 
   const destination = audioContext.createMediaStreamDestination();
@@ -1617,7 +2099,7 @@ const transcribeAudioSegmentInBrowser = async (
       sessionFinalText = '';
       sessionPartialText = '';
 
-      if (!finishedBySource && !fatalError && restartCount < 2) {
+      if (!finishedBySource && !fatalError && restartCount < MAX_RECOGNITION_RESTARTS_PER_SEGMENT) {
         restartCount += 1;
         try {
           startRecognition();
@@ -1649,12 +2131,37 @@ const transcribeAudioSegmentInBrowser = async (
   });
 };
 
-const transcribeAudioBlobInBrowser = async (
+const transcribeAudioWithAihubmixAdaptive = async (
+  settings: AudioTranscriptionSettings,
   blob: Blob,
-  onProgress?: (text: string, detail: string) => void
-): Promise<string> => {
-  if (Capacitor.getPlatform() === 'ios') {
-    throw new Error('当前 IPA 还没接入 iOS 原生语音转文字；现有浏览器识别方案在 WKWebView 里不可用。');
+  options: {
+    durationMs?: number;
+    filename?: string;
+    mimeType?: string;
+    onProgress?: (text: string, detail: string) => void;
+  } = {}
+): Promise<AudioTranscriptionResult & { detail: string }> => {
+  const durationSec =
+    typeof options.durationMs === 'number' && Number.isFinite(options.durationMs)
+      ? options.durationMs / 1000
+      : undefined;
+  const shouldChunk =
+    blob.size > AIHUBMIX_AUDIO_TRANSCRIPTION_MAX_FILE_SIZE ||
+    Boolean(durationSec && durationSec > AIHUBMIX_CHUNKING_MIN_DURATION_SEC);
+
+  if (!shouldChunk) {
+    const result = await transcribeAudioWithAihubmix(settings, blob, {
+      model: AIHUBMIX_AUDIO_TRANSCRIPTION_MODEL,
+      language: 'zh',
+      temperature: 0.2,
+      filename: options.filename ?? 'voice-message.webm',
+      mimeType: options.mimeType,
+    });
+
+    return {
+      ...result,
+      detail: `AIHubMix · ${AIHUBMIX_AUDIO_TRANSCRIPTION_MODEL}`,
+    };
   }
 
   const AudioContextCtor =
@@ -1662,7 +2169,134 @@ const transcribeAudioBlobInBrowser = async (
     (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
 
   if (!AudioContextCtor) {
-    throw new Error('当前浏览器不支持历史语音转文字；iOS 真机需要接入原生语音识别或云端 STT');
+    if (blob.size <= AIHUBMIX_AUDIO_TRANSCRIPTION_MAX_FILE_SIZE) {
+      const result = await transcribeAudioWithAihubmix(settings, blob, {
+        model: AIHUBMIX_AUDIO_TRANSCRIPTION_MODEL,
+        language: 'zh',
+        temperature: 0.2,
+        filename: options.filename ?? 'voice-message.webm',
+        mimeType: options.mimeType,
+      });
+
+      return {
+        ...result,
+        detail: `AIHubMix · ${AIHUBMIX_AUDIO_TRANSCRIPTION_MODEL}`,
+      };
+    }
+
+    throw new Error('当前环境无法解析长语音分段，请在支持音频解码的浏览器中重试，或缩短音频后再转写。');
+  }
+
+  const audioContext = new AudioContextCtor();
+  try {
+    if (audioContext.state === 'suspended') {
+      await audioContext.resume().catch(() => undefined);
+    }
+
+    const decodedAudio = await audioContext.decodeAudioData((await blob.arrayBuffer()).slice(0));
+    if (!Number.isFinite(decodedAudio.duration) || decodedAudio.duration <= 0) {
+      throw new Error('无法解析这条语音。');
+    }
+
+    const totalSegments = Math.max(
+      1,
+      Math.ceil(decodedAudio.duration / AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC)
+    );
+    let transcript = '';
+    const transcriptSegments: AudioTranscriptionSegment[] = [];
+
+    for (let segmentIndex = 0; segmentIndex < totalSegments; segmentIndex += 1) {
+      const startSecond = segmentIndex * AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC;
+      const endSecond = Math.min(
+        decodedAudio.duration,
+        startSecond + AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC
+      );
+      const detail = `AIHubMix 正在转写第 ${segmentIndex + 1}/${totalSegments} 段...`;
+      options.onProgress?.(formatTranscriptionForDisplay(transcript, transcriptSegments), detail);
+
+      const segment = createAudioBufferSegment(audioContext, decodedAudio, startSecond, endSecond, {
+        mono: true,
+      });
+      const wavBlob = encodeAudioBufferAsWav(segment);
+      const segmentResult = await transcribeAudioWithAihubmix(settings, wavBlob, {
+        model: AIHUBMIX_AUDIO_TRANSCRIPTION_MODEL,
+        language: 'zh',
+        temperature: 0.2,
+        filename: `${(options.filename ?? 'voice-message').replace(/\.[^.]+$/, '')}-${segmentIndex + 1}.wav`,
+        mimeType: 'audio/wav',
+      });
+
+      transcript = combineTranscript(transcript, segmentResult.text);
+      if (segmentResult.segments && segmentResult.segments.length > 0) {
+        transcriptSegments.push(
+          ...segmentResult.segments.map((item) => ({
+            start: typeof item.start === 'number' ? item.start + startSecond : startSecond,
+            end: typeof item.end === 'number' ? item.end + startSecond : endSecond,
+            text: item.text,
+          }))
+        );
+      } else if (segmentResult.text) {
+        transcriptSegments.push({
+          start: startSecond,
+          end: endSecond,
+          text: segmentResult.text,
+        });
+      }
+      options.onProgress?.(formatTranscriptionForDisplay(transcript, transcriptSegments), detail);
+
+      if (segmentIndex + 1 < totalSegments) {
+        await wait(AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_COOLDOWN_MS);
+      }
+    }
+
+    if (!transcript) {
+      throw new Error('语音转写结果为空，请稍后再试。');
+    }
+
+    return {
+      text: transcript,
+      segments: transcriptSegments,
+      detail: `AIHubMix · ${AIHUBMIX_AUDIO_TRANSCRIPTION_MODEL} · ${totalSegments} 段`,
+    };
+  } catch (error) {
+    if (blob.size <= AIHUBMIX_AUDIO_TRANSCRIPTION_MAX_FILE_SIZE) {
+      const result = await transcribeAudioWithAihubmix(settings, blob, {
+        model: AIHUBMIX_AUDIO_TRANSCRIPTION_MODEL,
+        language: 'zh',
+        temperature: 0.2,
+        filename: options.filename ?? 'voice-message.webm',
+        mimeType: options.mimeType,
+      });
+
+      return {
+        ...result,
+        detail: `AIHubMix · ${AIHUBMIX_AUDIO_TRANSCRIPTION_MODEL}`,
+      };
+    }
+
+    throw error instanceof Error ? error : new Error('语音转写失败，请稍后再试。');
+  } finally {
+    await audioContext.close().catch(() => undefined);
+  }
+};
+
+const transcribeAudioBlobInBrowser = async (
+  blob: Blob,
+  onProgress?: (text: string, detail: string) => void
+): Promise<AudioTranscriptionResult> => {
+  const support = getBrowserAudioTranscriptionSupport();
+  if (!support.supported) {
+    throw new Error(
+      support.reason ?? '当前环境没有可用的浏览器语音识别能力，请先配置 AIHubMix 云端转写。'
+    );
+  }
+
+  const AudioContextCtor =
+    window.AudioContext ??
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+
+  if (!AudioContextCtor) {
+    throw new Error('当前浏览器不支持历史语音转文字；请改用支持语音识别的浏览器，或在设置里配置 AIHubMix 云端转写。');
   }
 
   const audioContext = new AudioContextCtor();
@@ -1673,43 +2307,79 @@ const transcribeAudioBlobInBrowser = async (
 
     const audioBuffer = await audioContext.decodeAudioData((await blob.arrayBuffer()).slice(0));
     if (!Number.isFinite(audioBuffer.duration) || audioBuffer.duration <= 0) {
-      throw new Error('无法解析这条语音');
+      throw new Error('无法解析这条语音。');
     }
-    if (audioBuffer.duration > 5 * 60) {
+    if (audioBuffer.duration > MAX_AUDIO_TRANSCRIPTION_DURATION_SEC) {
       throw new Error('当前版本最长支持 5 分钟内的语音转文字。');
     }
+    if (audioBuffer.duration > MAX_BROWSER_AUDIO_TRANSCRIPTION_DURATION_SEC) {
+      throw new Error(
+        `浏览器本地转写目前只建议用于 ${MAX_BROWSER_AUDIO_TRANSCRIPTION_DURATION_SEC} 秒内的短语音；较长语音请改用 AIHubMix 云端转写。`
+      );
+    }
 
-    const totalSegments = Math.max(1, Math.ceil(audioBuffer.duration / 20));
+    const totalSegments = Math.max(
+      1,
+      Math.ceil(audioBuffer.duration / BROWSER_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC)
+    );
     let transcript = '';
+    const transcriptSegments: AudioTranscriptionSegment[] = [];
 
     for (let segmentIndex = 0; segmentIndex < totalSegments; segmentIndex += 1) {
-      const startSecond = segmentIndex * 20;
-      const endSecond = Math.min(audioBuffer.duration, startSecond + 20);
+      const startSecond = segmentIndex * BROWSER_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC;
+      const endSecond = Math.min(
+        audioBuffer.duration,
+        startSecond + BROWSER_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC
+      );
       const detail = `正在识别第 ${segmentIndex + 1}/${totalSegments} 段`;
       const segment = createAudioBufferSegment(audioContext, audioBuffer, startSecond, endSecond);
 
-      onProgress?.(transcript, detail);
+      onProgress?.(formatTranscriptionForDisplay(transcript, transcriptSegments), detail);
       try {
         const segmentText = await transcribeAudioSegmentInBrowser(audioContext, segment, (partialText) => {
-          onProgress?.(combineTranscript(transcript, partialText), detail);
+          onProgress?.(
+            formatTranscriptionForDisplay(combineTranscript(transcript, partialText), transcriptSegments),
+            detail
+          );
         });
         transcript = combineTranscript(transcript, segmentText);
-        onProgress?.(transcript, detail);
+        transcriptSegments.push({
+          start: startSecond,
+          end: endSecond,
+          text: segmentText,
+        });
+        onProgress?.(formatTranscriptionForDisplay(transcript, transcriptSegments), detail);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         if (!/没有识别/.test(message)) throw error;
       }
 
       if (segmentIndex + 1 < totalSegments) {
-        await wait(150);
+        await wait(BROWSER_AUDIO_TRANSCRIPTION_SEGMENT_COOLDOWN_MS);
       }
     }
 
     if (!transcript) throw new Error('没有识别到可转写的语音内容。');
-    return transcript;
+    return {
+      text: transcript,
+      segments: transcriptSegments,
+    };
   } finally {
     await audioContext.close().catch(() => undefined);
   }
+};
+
+const canTranscribeAudioInBrowser = (): boolean => {
+  return getBrowserAudioTranscriptionSupport().supported;
+};
+
+const getAudioTranscriptionSupportLabel = (settings: AudioTranscriptionSettings): string => {
+  if (hasAihubmixAudioTranscription(settings)) {
+    return `已启用 AIHubMix 云端转写 · ${AIHUBMIX_AUDIO_TRANSCRIPTION_MODEL}`;
+  }
+
+  return getBrowserAudioTranscriptionSupport().reason ??
+    '当前环境没有可用的语音转文字能力，请先配置 AIHubMix 云端转写。';
 };
 
 const loadStringArray = (key: string): string[] => {
@@ -1739,6 +2409,91 @@ const loadFavoriteMessages = (): Record<string, string[]> => {
 const saveFavoriteMessages = (value: Record<string, string[]>) => {
   window.localStorage.setItem(favoriteMessagesKey, JSON.stringify(value));
 };
+
+const loadFavoriteMessageSnapshots = (): Record<string, StoredFavoriteMessageSnapshot> => {
+  try {
+    const value = window.localStorage.getItem(favoriteMessageSnapshotsKey);
+    const parsed = value ? JSON.parse(value) : {};
+    if (!parsed || typeof parsed !== 'object') return {};
+
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([, item]) => {
+        if (!item || typeof item !== 'object') return false;
+        const record = item as Partial<StoredFavoriteMessageSnapshot>;
+        return (
+          typeof record.roomId === 'string' &&
+          typeof record.roomName === 'string' &&
+          typeof record.capturedAt === 'number' &&
+          record.message &&
+          typeof record.message === 'object'
+        );
+      })
+    ) as Record<string, StoredFavoriteMessageSnapshot>;
+  } catch {
+    return {};
+  }
+};
+
+const saveFavoriteMessageSnapshots = (value: Record<string, StoredFavoriteMessageSnapshot>) => {
+  window.localStorage.setItem(favoriteMessageSnapshotsKey, JSON.stringify(value));
+};
+
+const getFavoriteSnapshotKey = (roomId: string, eventId: string): string => `${roomId}|${eventId}`;
+
+const cloneFavoriteSnapshotMessage = (message: ChatMessage): ChatMessage => {
+  try {
+    return typeof structuredClone === 'function'
+      ? structuredClone(message)
+      : (JSON.parse(JSON.stringify(message)) as ChatMessage);
+  } catch {
+    return {
+      ...message,
+      attachment: message.attachment ? { ...message.attachment } : undefined,
+      replyTo: message.replyTo ? { ...message.replyTo } : undefined,
+      reactions: message.reactions.map((reaction) => ({
+        ...reaction,
+        reactors: reaction.reactors.map((reactor) => ({ ...reactor })),
+      })),
+      readReceipts: message.readReceipts.map((receipt) => ({ ...receipt })),
+      favoriteSource: message.favoriteSource ? { ...message.favoriteSource } : undefined,
+      forwardContent: message.forwardContent ? { ...message.forwardContent } : undefined,
+    };
+  }
+};
+
+const buildStoredFavoriteMessageSnapshot = (
+  message: ChatMessage,
+  room?: RoomSummary
+): StoredFavoriteMessageSnapshot => ({
+  roomId: room?.id ?? message.roomId,
+  roomName: room?.name ?? message.favoriteSource?.roomName ?? '未知房间',
+  roomAvatarUrl: room?.avatarUrl ?? message.favoriteSource?.roomAvatarUrl,
+  roomDirect: room?.direct ?? false,
+  roomSpace: room?.space ?? false,
+  roomEncrypted: room?.encrypted ?? message.encrypted,
+  roomMemberCount: room?.memberCount ?? 0,
+  capturedAt: Date.now(),
+  message: cloneFavoriteSnapshotMessage(message),
+});
+
+const buildFavoriteSnapshotRoomSummary = (snapshot: StoredFavoriteMessageSnapshot): RoomSummary => ({
+  id: snapshot.roomId,
+  name: snapshot.roomName,
+  canonicalAlias: undefined,
+  topic: undefined,
+  avatarUrl: snapshot.roomAvatarUrl,
+  parentSpaceIds: [],
+  encrypted: snapshot.roomEncrypted,
+  muted: false,
+  direct: snapshot.roomDirect,
+  space: snapshot.roomSpace,
+  membership: 'join',
+  unread: 0,
+  highlight: 0,
+  memberCount: snapshot.roomMemberCount,
+  lastMessage: getReadableMessageBody(snapshot.message.body || snapshot.message.attachment?.name || '附件消息'),
+  lastTs: snapshot.message.timestamp,
+});
 
 const loadRoomDrafts = (): Record<string, string> => {
   try {
@@ -1925,6 +2680,12 @@ type EmojiCollection =
     };
 
 const compactMediaEdgePx = 320;
+const timelinePinnedThresholdPx = 84;
+const scrollToLatestThresholdPx = 180;
+const previewSnapToFitZoomThreshold = 1.05;
+const previewMaxZoom = 4;
+const composerCollapsedMinHeightPx = 42;
+const composerCollapsedMaxHeightPx = 96;
 const composerAttachmentInputIds = {
   file: 'composer-attachment-file',
   image: 'composer-attachment-image',
@@ -1943,8 +2704,74 @@ const isStickerLikeMessage = (message: ChatMessage): boolean =>
   (message.attachment?.kind === 'image' &&
     isCompactMediaAsset(message.attachment.width, message.attachment.height));
 
+function ExpandComposerIcon() {
+  return (
+    <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true" focusable="false">
+      <path
+        d="M7 3H3v4M13 3h4v4M3 13v4h4M17 13v4h-4"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="1.7"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+const expiredSessionMessage = '当前登录已失效，请重新登录';
+const invalidSessionErrorPattern = /M_UNKNOWN_TOKEN|Token is not active|Unknown token/i;
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null;
+
+const isUnauthorizedStatus = (value: unknown): boolean => value === 401 || value === '401';
+
+const isMatrixSessionExpiredError = (error: unknown): boolean => {
+  if (typeof error === 'string') {
+    return invalidSessionErrorPattern.test(error);
+  }
+
+  if (error instanceof Error && invalidSessionErrorPattern.test(error.message)) {
+    return true;
+  }
+
+  if (!isRecord(error)) {
+    return false;
+  }
+
+  if (error.errcode === 'M_UNKNOWN_TOKEN') {
+    return true;
+  }
+
+  const data = isRecord(error.data) ? error.data : undefined;
+
+  if (data?.errcode === 'M_UNKNOWN_TOKEN') {
+    return true;
+  }
+
+  if (invalidSessionErrorPattern.test(String(error.message ?? ''))) {
+    return true;
+  }
+
+  if (invalidSessionErrorPattern.test(String(data?.error ?? data?.message ?? ''))) {
+    return true;
+  }
+
+  return [
+    error.httpStatus,
+    error.statusCode,
+    error.status,
+    data?.httpStatus,
+    data?.statusCode,
+    data?.status,
+  ].some(isUnauthorizedStatus);
+};
+
 export function App() {
   const runtimeStopRef = useRef<(() => void) | undefined>();
+  const runtimeSessionCleanupRef = useRef<(() => void) | undefined>();
+  const sessionExpiryHandledRef = useRef(false);
   const speechRecognitionRef = useRef<SpeechRecognitionLike | undefined>();
   const mediaRecorderRef = useRef<MediaRecorder | undefined>();
   const mediaRecorderStreamRef = useRef<MediaStream | undefined>();
@@ -1957,8 +2784,23 @@ export function App() {
   const emojiToggleButtonRef = useRef<HTMLButtonElement | null>(null);
   const loadingOlderRef = useRef(false);
   const autoScrollToBottomRef = useRef(true);
+  const composerBottomLockRef = useRef(false);
+  const suppressAutoLoadOlderRef = useRef(false);
+  const initialRoomScrollRoomIdRef = useRef<string>();
+  const initialRoomScrollFrameRef = useRef<number>();
+  const initialRoomScrollSettleTimeoutRef = useRef<number>();
+  const pinnedTimelineFrameRef = useRef<number>();
+  const pinnedTimelineSettleTimeoutRef = useRef<number>();
   const paginationAnchorRef = useRef<
-    { roomId: string; scrollTop: number; scrollHeight: number } | undefined
+    {
+      roomId: string;
+      scrollTop: number;
+      scrollHeight: number;
+      messageId?: string;
+      messageOffsetTop?: number;
+      stabilizationFrames: number;
+      animationFrameId?: number;
+    } | undefined
   >(undefined);
   const sheetRef = useRef<Sheet>(undefined);
   const mobilePaneRef = useRef<MobilePane>('list');
@@ -1983,6 +2825,9 @@ export function App() {
   const [messageQuery, setMessageQuery] = useState('');
   const [messageSearchOpen, setMessageSearchOpen] = useState(false);
   const [messageDraft, setMessageDraft] = useState('');
+  const [composerExpanded, setComposerExpanded] = useState(false);
+  const [composerTextareaHeight, setComposerTextareaHeight] = useState(composerCollapsedMinHeightPx);
+  const [composerCanExpand, setComposerCanExpand] = useState(false);
   const [composerMode, setComposerMode] = useState<ComposerMode>({ type: 'normal' });
   const [attachmentPickerOpen, setAttachmentPickerOpen] = useState(false);
   const [editingMessageId, setEditingMessageId] = useState<string>();
@@ -1993,6 +2838,8 @@ export function App() {
   const [voiceRecording, setVoiceRecording] = useState(false);
   const [voiceRecordingMs, setVoiceRecordingMs] = useState(0);
   const [recordingCancelled, setRecordingCancelled] = useState(false);
+  const [selectedRoomReceiptTick, setSelectedRoomReceiptTick] = useState(0);
+  const [showScrollToLatest, setShowScrollToLatest] = useState(false);
   const [sending, setSending] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [deviceName, setDeviceName] = useState('iPhone');
@@ -2000,8 +2847,14 @@ export function App() {
   const [favoriteMessageIds, setFavoriteMessageIds] = useState<Record<string, string[]>>(
     () => loadFavoriteMessages()
   );
+  const [favoriteMessageSnapshots, setFavoriteMessageSnapshots] = useState<
+    Record<string, StoredFavoriteMessageSnapshot>
+  >(() => loadFavoriteMessageSnapshots());
   const [roomDrafts, setRoomDrafts] = useState<Record<string, string>>(() => loadRoomDrafts());
   const [preferences, setPreferences] = useState<AppPreferences>(() => loadPreferences());
+  const [audioTranscriptionSettings, setAudioTranscriptionSettings] = useState<AudioTranscriptionSettings>(() =>
+    loadAudioTranscriptionSettings()
+  );
   const [exploreServers, setExploreServers] = useState<string[]>(() => loadStringArray(exploreServerSourcesKey));
   const [exploreSources, setExploreSources] = useState<ExploreSource[]>([]);
   const [selectedExploreSourceId, setSelectedExploreSourceId] = useState<string>();
@@ -2038,6 +2891,11 @@ export function App() {
     encrypted: true,
     publicRoom: false,
   });
+  const audioTranscriptionSettingsRef = useRef(audioTranscriptionSettings);
+  const audioTranscriptionRemoteSignatureRef = useRef<string>();
+  const audioTranscriptionApplyingRemoteSignatureRef = useRef<string>();
+  const audioTranscriptionPendingSaveSignatureRef = useRef<string>();
+  const audioTranscriptionHydratedRef = useRef(false);
 
   const currentUserServer = serverFromUserId(session?.userId);
   const selectedExploreSource = useMemo(
@@ -2063,6 +2921,8 @@ export function App() {
   }, []);
 
   const stopRuntime = useCallback(() => {
+    runtimeSessionCleanupRef.current?.();
+    runtimeSessionCleanupRef.current = undefined;
     runtimeStopRef.current?.();
     runtimeStopRef.current = undefined;
     setClient(undefined);
@@ -2096,6 +2956,33 @@ export function App() {
     [client, selectedRoomId]
   );
 
+  const handleSessionExpired = useCallback(
+    async (error?: unknown, expiredSession?: StoredMatrixSession) => {
+      if (sessionExpiryHandledRef.current) {
+        return;
+      }
+
+      sessionExpiryHandledRef.current = true;
+      stopRuntime();
+      await clearStoredSession().catch(() => undefined);
+      setSession(undefined);
+      setBootState('signedOut');
+      setNotice(undefined);
+      setError(expiredSessionMessage);
+      setLoginForm((current) => ({
+        ...current,
+        baseUrl: expiredSession?.baseUrl ?? current.baseUrl,
+        username: expiredSession?.userId ?? current.username,
+        password: '',
+      }));
+
+      if (!isMatrixSessionExpiredError(error) && error instanceof Error) {
+        console.warn('Session expired fallback triggered by unexpected error', error);
+      }
+    },
+    [stopRuntime]
+  );
+
   const syncCustomEmojiState = useCallback(
     (mx = client) => {
       refreshSnapshot(mx);
@@ -2104,40 +2991,76 @@ export function App() {
     [client, refreshCustomEmojiState, refreshSnapshot]
   );
 
-  const refreshCryptoStatus = useCallback(
-    async (mx = client) => {
-      if (!mx) {
-        setCryptoStatus({ cryptoReady: false });
-        return;
-      }
-      try {
-        setCryptoStatus(await getCryptoStatus(mx));
-      } catch {
-        setCryptoStatus({ cryptoReady: Boolean(mx.getCrypto()) });
-      }
-    },
-    [client]
-  );
+  const refreshCryptoStatus = useCallback(async (mx?: MatrixClient) => {
+    if (!mx) {
+      setCryptoStatus({ cryptoReady: false });
+      return;
+    }
+    try {
+      setCryptoStatus(await getCryptoStatus(mx));
+    } catch {
+      setCryptoStatus({ cryptoReady: Boolean(mx.getCrypto()) });
+    }
+  }, []);
 
   const connectSession = useCallback(
     async (nextSession: StoredMatrixSession) => {
+      sessionExpiryHandledRef.current = false;
       stopRuntime();
       setBootState('connecting');
       setError(undefined);
 
       try {
+        await verifyStoredSession(nextSession);
         const runtime = await createMatrixRuntime(nextSession, setSnapshot, setSyncState);
+
+        const handleRuntimeLoggedOut = (err: Error) => {
+          void handleSessionExpired(err, nextSession);
+        };
+        const handleRuntimeUnexpectedError = (err: Error) => {
+          if (!isMatrixSessionExpiredError(err)) {
+            return;
+          }
+
+          void handleSessionExpired(err, nextSession);
+        };
+        const handleRuntimeSyncError = (
+          state: SyncState | null,
+          _prevState: SyncState | null,
+          data?: { error?: Error | string }
+        ) => {
+          if (state !== SyncState.Error || !isMatrixSessionExpiredError(data?.error)) {
+            return;
+          }
+
+          void handleSessionExpired(data?.error, nextSession);
+        };
+
+        runtime.client.on(HttpApiEvent.SessionLoggedOut, handleRuntimeLoggedOut);
+        runtime.client.on(ClientEvent.SyncUnexpectedError, handleRuntimeUnexpectedError);
+        runtime.client.on(ClientEvent.Sync, handleRuntimeSyncError);
+        runtimeSessionCleanupRef.current = () => {
+          runtime.client.removeListener(HttpApiEvent.SessionLoggedOut, handleRuntimeLoggedOut);
+          runtime.client.removeListener(ClientEvent.SyncUnexpectedError, handleRuntimeUnexpectedError);
+          runtime.client.removeListener(ClientEvent.Sync, handleRuntimeSyncError);
+        };
+
         runtimeStopRef.current = runtime.stop;
         setClient(runtime.client);
         setSession(nextSession);
         setBootState('signedIn');
         void refreshCryptoStatus(runtime.client);
       } catch (err) {
+        if (isMatrixSessionExpiredError(err)) {
+          await handleSessionExpired(err, nextSession);
+          return;
+        }
+
         setError(err instanceof Error ? err.message : String(err));
         setBootState('error');
       }
     },
-    [stopRuntime]
+    [handleSessionExpired, refreshCryptoStatus, stopRuntime]
   );
 
   useEffect(() => {
@@ -2184,6 +3107,113 @@ export function App() {
       void backButton.then((listener) => listener.remove());
     };
   }, [connectSession, stopRuntime]);
+
+  const handleAudioTranscriptionSettingsChange = useCallback(
+    (value: AudioTranscriptionSettings) => {
+      setAudioTranscriptionSettings((current) => {
+        const normalized = normalizeAudioTranscriptionSettings(value);
+        if (
+          normalized.apiKey === current.apiKey &&
+          normalized.baseUrl === current.baseUrl
+        ) {
+          return current;
+        }
+
+        return {
+          ...normalized,
+          updatedAt: Date.now(),
+        };
+      });
+    },
+    []
+  );
+
+  useEffect(() => {
+    if (!client) {
+      audioTranscriptionRemoteSignatureRef.current = undefined;
+      audioTranscriptionApplyingRemoteSignatureRef.current = undefined;
+      audioTranscriptionPendingSaveSignatureRef.current = undefined;
+      audioTranscriptionHydratedRef.current = false;
+      return;
+    }
+
+    const applyAccountData = (content?: ReturnType<typeof getSyncedAudioTranscriptionSettings>) => {
+      const remoteSignature = content
+        ? getAudioTranscriptionSettingsAccountDataSignature(content)
+        : undefined;
+      audioTranscriptionRemoteSignatureRef.current = remoteSignature;
+
+      const currentSettings = audioTranscriptionSettingsRef.current;
+      const nextSettings = applyAudioTranscriptionSettingsAccountData(currentSettings, content);
+      const currentSignature = getAudioTranscriptionSettingsAccountDataSignature(currentSettings);
+      const nextSignature = getAudioTranscriptionSettingsAccountDataSignature(nextSettings);
+
+      if (nextSignature !== currentSignature) {
+        audioTranscriptionApplyingRemoteSignatureRef.current =
+          remoteSignature ?? nextSignature;
+        setAudioTranscriptionSettings(nextSettings);
+        return;
+      }
+
+      audioTranscriptionApplyingRemoteSignatureRef.current = undefined;
+      audioTranscriptionHydratedRef.current = true;
+    };
+
+    applyAccountData(getSyncedAudioTranscriptionSettings(client));
+
+    const handleAccountData = (event: MatrixEvent) => {
+      if (event.getType() !== AUDIO_TRANSCRIPTION_ACCOUNT_DATA_EVENT_TYPE) {
+        return;
+      }
+
+      applyAccountData(event.getContent() as ReturnType<typeof getSyncedAudioTranscriptionSettings>);
+    };
+
+    client.on(ClientEvent.AccountData, handleAccountData);
+    return () => {
+      client.removeListener(ClientEvent.AccountData, handleAccountData);
+    };
+  }, [client]);
+
+  useEffect(() => {
+    if (
+      !client ||
+      !audioTranscriptionHydratedRef.current ||
+      audioTranscriptionApplyingRemoteSignatureRef.current
+    ) {
+      return;
+    }
+
+    const signature = getAudioTranscriptionSettingsAccountDataSignature(
+      audioTranscriptionSettings
+    );
+    if (
+      signature === audioTranscriptionRemoteSignatureRef.current ||
+      signature === audioTranscriptionPendingSaveSignatureRef.current
+    ) {
+      return;
+    }
+
+    if (
+      !audioTranscriptionRemoteSignatureRef.current &&
+      isDefaultAudioTranscriptionSettings(audioTranscriptionSettings)
+    ) {
+      return;
+    }
+
+    audioTranscriptionPendingSaveSignatureRef.current = signature;
+
+    void saveSyncedAudioTranscriptionSettings(client, audioTranscriptionSettings)
+      .then(() => {
+        audioTranscriptionRemoteSignatureRef.current = signature;
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (audioTranscriptionPendingSaveSignatureRef.current === signature) {
+          audioTranscriptionPendingSaveSignatureRef.current = undefined;
+        }
+      });
+  }, [audioTranscriptionSettings, client]);
 
   const roomBuckets = useMemo<Record<RoomListView, RoomSummary[]>>(() => {
     const joined = snapshot.rooms.filter((room) => room.membership === 'join');
@@ -2299,7 +3329,7 @@ export function App() {
       client && selectedRoomId
         ? getRoomInlineReadReceiptStates(client, selectedRoomId, selectedRoomMessages)
         : new Map<string, InlineReadReceiptState>(),
-    [client, selectedRoomId, selectedRoomMessages]
+    [client, selectedRoomId, selectedRoomMessages, selectedRoomReceiptTick]
   );
 
   const selectedForwardMessages = useMemo(
@@ -2338,6 +3368,17 @@ export function App() {
       sheet.message
     );
   }, [client, sheet, snapshot.version]);
+  const readReceiptInlineState = useMemo(() => {
+    if (!client || !readReceiptMessage || typeof sheet !== 'object' || !sheet || sheet.type !== 'readReceipts') {
+      return undefined;
+    }
+
+    return (
+      getRoomInlineReadReceiptStates(client, readReceiptMessage.roomId, getRoomMessages(client, readReceiptMessage.roomId)).get(
+        readReceiptMessage.id
+      ) ?? sheet.inlineState
+    );
+  }, [client, readReceiptMessage, selectedRoomReceiptTick, sheet, snapshot.version]);
 
   const userProfileMember = useMemo(() => {
     if (typeof sheet !== 'object' || !sheet || sheet.type !== 'userProfile') {
@@ -2400,11 +3441,20 @@ export function App() {
     const localItems = Object.entries(favoriteMessageIds)
       .flatMap(([roomId, ids]) => {
         const room = snapshot.rooms.find((item) => item.id === roomId);
-        if (!room) return [];
-        const messages = getRoomMessages(client, roomId);
-        return messages
-          .filter((message) => ids.includes(message.id))
-          .map((message) => ({ room, message }));
+        const messagesById = new Map(getRoomMessages(client, roomId).map((message) => [message.id, message]));
+
+        return ids.flatMap((id) => {
+          const storedSnapshot = favoriteMessageSnapshots[getFavoriteSnapshotKey(roomId, id)];
+          const fallbackRoom = room ?? (storedSnapshot ? buildFavoriteSnapshotRoomSummary(storedSnapshot) : undefined);
+          const liveMessage = messagesById.get(id);
+          if (liveMessage && fallbackRoom) {
+            return [{ room: fallbackRoom, message: liveMessage }];
+          }
+
+          if (!storedSnapshot) return [];
+
+          return [{ room: fallbackRoom ?? buildFavoriteSnapshotRoomSummary(storedSnapshot), message: storedSnapshot.message }];
+        });
       });
 
     const cinnyFavoritesRoom = cinnyFavoritesRoomId
@@ -2430,7 +3480,34 @@ export function App() {
         return true;
       })
       .sort((a, b) => (b.message.favoriteSource?.favoritedAt ?? b.message.timestamp) - (a.message.favoriteSource?.favoritedAt ?? a.message.timestamp));
-  }, [cinnyFavoritesRoomId, client, favoriteMessageIds, snapshot.rooms, snapshot.version]);
+  }, [cinnyFavoritesRoomId, client, favoriteMessageIds, favoriteMessageSnapshots, snapshot.rooms, snapshot.version]);
+
+  useEffect(() => {
+    if (!client) return;
+
+    setFavoriteMessageSnapshots((current) => {
+      let changed = false;
+      const nextSnapshots = { ...current };
+
+      Object.entries(favoriteMessageIds).forEach(([roomId, ids]) => {
+        const room = snapshot.rooms.find((item) => item.id === roomId);
+        const messagesById = new Map(getRoomMessages(client, roomId).map((message) => [message.id, message]));
+
+        ids.forEach((id) => {
+          const snapshotKey = getFavoriteSnapshotKey(roomId, id);
+          if (nextSnapshots[snapshotKey]) return;
+
+          const liveMessage = messagesById.get(id);
+          if (!liveMessage) return;
+
+          nextSnapshots[snapshotKey] = buildStoredFavoriteMessageSnapshot(liveMessage, room);
+          changed = true;
+        });
+      });
+
+      return changed ? nextSnapshots : current;
+    });
+  }, [client, favoriteMessageIds, snapshot.rooms, snapshot.version]);
 
   const localSearchResults = useMemo(() => {
     if (!client || roomQuery.trim().length < 2 || activeView === 'explore' || activeView === 'settings') {
@@ -2486,6 +3563,7 @@ export function App() {
   useEffect(() => {
     setSelectionMode(false);
     setSelectedMessageIds([]);
+    setComposerExpanded(false);
   }, [selectedRoomId]);
 
   useEffect(() => {
@@ -2586,12 +3664,54 @@ export function App() {
     });
   }, [client, session?.userId]);
 
+  useLayoutEffect(() => {
+    if (!selectedRoom) {
+      autoScrollToBottomRef.current = true;
+      suppressAutoLoadOlderRef.current = false;
+      initialRoomScrollRoomIdRef.current = undefined;
+      if (typeof initialRoomScrollFrameRef.current === 'number') {
+        window.cancelAnimationFrame(initialRoomScrollFrameRef.current);
+        initialRoomScrollFrameRef.current = undefined;
+      }
+      if (typeof initialRoomScrollSettleTimeoutRef.current === 'number') {
+        window.clearTimeout(initialRoomScrollSettleTimeoutRef.current);
+        initialRoomScrollSettleTimeoutRef.current = undefined;
+      }
+      const paginationAnchorFrameId = paginationAnchorRef.current?.animationFrameId;
+      if (typeof paginationAnchorFrameId === 'number') {
+        window.cancelAnimationFrame(paginationAnchorFrameId);
+      }
+      paginationAnchorRef.current = undefined;
+      return;
+    }
+
+    autoScrollToBottomRef.current = true;
+    suppressAutoLoadOlderRef.current = true;
+    initialRoomScrollRoomIdRef.current = selectedRoom.id;
+    if (typeof initialRoomScrollFrameRef.current === 'number') {
+      window.cancelAnimationFrame(initialRoomScrollFrameRef.current);
+      initialRoomScrollFrameRef.current = undefined;
+    }
+    if (typeof initialRoomScrollSettleTimeoutRef.current === 'number') {
+      window.clearTimeout(initialRoomScrollSettleTimeoutRef.current);
+      initialRoomScrollSettleTimeoutRef.current = undefined;
+    }
+    const paginationAnchorFrameId = paginationAnchorRef.current?.animationFrameId;
+    if (typeof paginationAnchorFrameId === 'number') {
+      window.cancelAnimationFrame(paginationAnchorFrameId);
+    }
+    paginationAnchorRef.current = undefined;
+  }, [selectedRoom?.id]);
+
   useEffect(() => {
     if (!selectedRoom) {
       setRoomProfileForm({ name: '', topic: '' });
       setComposerMode({ type: 'normal' });
       setMessageDraft('');
+      setComposerExpanded(false);
       setEmojiOpen(false);
+      setShowScrollToLatest(false);
+      composerBottomLockRef.current = false;
       return;
     }
 
@@ -2601,10 +3721,30 @@ export function App() {
     });
     setComposerMode({ type: 'normal' });
     setMessageDraft(roomDrafts[selectedRoom.id] ?? '');
+    setComposerExpanded(false);
     setEmojiOpen(false);
-    autoScrollToBottomRef.current = true;
-    paginationAnchorRef.current = undefined;
+    setShowScrollToLatest(false);
+    composerBottomLockRef.current = false;
   }, [selectedRoom?.id]);
+
+  const measureComposerTextarea = useCallback(() => {
+    const textarea = composerInputRef.current;
+    if (!textarea) return;
+
+    const previousHeight = textarea.style.height;
+    textarea.style.height = 'auto';
+    const measuredHeight = textarea.scrollHeight;
+    textarea.style.height = previousHeight;
+
+    const nextHeight = Math.max(composerCollapsedMinHeightPx, measuredHeight);
+    setComposerTextareaHeight((current) => (current === nextHeight ? current : nextHeight));
+    setComposerCanExpand(measuredHeight > composerCollapsedMaxHeightPx + 4);
+  }, []);
+
+  useLayoutEffect(() => {
+    measureComposerTextarea();
+  }, [composerExpanded, measureComposerTextarea, messageDraft, selectedRoomId]);
+
 
   useEffect(() => {
     if (!client || !selectedRoomId) return undefined;
@@ -2616,6 +3756,25 @@ export function App() {
   }, [client, selectedRoomId, snapshot.version]);
 
   useEffect(() => {
+    if (!client || !selectedRoomId) return undefined;
+
+    const room = client.getRoom(selectedRoomId);
+    if (!room) return undefined;
+
+    const handleReceiptRefresh = (_event?: MatrixEvent, eventRoom?: { roomId?: string }) => {
+      if (eventRoom?.roomId && eventRoom.roomId !== selectedRoomId) return;
+      setSelectedRoomReceiptTick((current) => current + 1);
+    };
+
+    room.on(RoomEvent.Receipt, handleReceiptRefresh);
+    room.on(RoomEvent.LocalEchoUpdated, handleReceiptRefresh);
+    return () => {
+      room.removeListener(RoomEvent.Receipt, handleReceiptRefresh);
+      room.removeListener(RoomEvent.LocalEchoUpdated, handleReceiptRefresh);
+    };
+  }, [client, selectedRoomId]);
+
+  useEffect(() => {
     if (!emojiOpen) return undefined;
 
     const handlePointerDown = (event: PointerEvent) => {
@@ -2623,6 +3782,7 @@ export function App() {
       if (!(target instanceof Node)) return;
       if (emojiTrayRef.current?.contains(target)) return;
       if (emojiToggleButtonRef.current?.contains(target)) return;
+
       setEmojiOpen(false);
     };
 
@@ -2660,25 +3820,266 @@ export function App() {
     selectedRoomId,
   ]);
 
-  useLayoutEffect(() => {
+  const restorePaginationAnchor = useCallback((roomId: string) => {
     const timeline = timelineRef.current;
     const anchor = paginationAnchorRef.current;
-    if (!timeline || !anchor || anchor.roomId !== selectedRoomId) return;
+    if (!timeline || !anchor || anchor.roomId !== roomId) return false;
+
+    if (anchor.messageId) {
+      const anchoredMessage = timeline.querySelector<HTMLElement>(
+        `[data-message-id="${CSS.escape(anchor.messageId)}"]`
+      );
+      if (anchoredMessage) {
+        const timelineTop = timeline.getBoundingClientRect().top;
+        const currentOffsetTop = anchoredMessage.getBoundingClientRect().top - timelineTop;
+        const expectedOffsetTop = anchor.messageOffsetTop ?? currentOffsetTop;
+        timeline.scrollTop += currentOffsetTop - expectedOffsetTop;
+        return true;
+      }
+    }
 
     timeline.scrollTop = anchor.scrollTop + (timeline.scrollHeight - anchor.scrollHeight);
-    paginationAnchorRef.current = undefined;
-  }, [selectedRoomId, selectedRoomMessages.length, snapshot.version]);
+    return true;
+  }, []);
+
+  const schedulePaginationAnchorStabilization = useCallback(
+    (roomId: string) => {
+      const anchor = paginationAnchorRef.current;
+      if (!anchor || anchor.roomId !== roomId || typeof anchor.animationFrameId === 'number') {
+        return;
+      }
+
+      const step = () => {
+        const currentAnchor = paginationAnchorRef.current;
+        if (!currentAnchor || currentAnchor.roomId !== roomId) return;
+
+        currentAnchor.animationFrameId = undefined;
+        restorePaginationAnchor(roomId);
+        currentAnchor.stabilizationFrames -= 1;
+
+        if (currentAnchor.stabilizationFrames <= 0) {
+          paginationAnchorRef.current = undefined;
+          return;
+        }
+
+        currentAnchor.animationFrameId = window.requestAnimationFrame(step);
+      };
+
+      anchor.animationFrameId = window.requestAnimationFrame(step);
+    },
+    [restorePaginationAnchor]
+  );
+
+  const settleInitialRoomScroll = useCallback(
+    (roomId: string) => {
+      if (typeof initialRoomScrollFrameRef.current === 'number') {
+        window.cancelAnimationFrame(initialRoomScrollFrameRef.current);
+        initialRoomScrollFrameRef.current = undefined;
+      }
+      if (typeof initialRoomScrollSettleTimeoutRef.current === 'number') {
+        window.clearTimeout(initialRoomScrollSettleTimeoutRef.current);
+        initialRoomScrollSettleTimeoutRef.current = undefined;
+      }
+
+      const timeline = timelineRef.current;
+      if (
+        !timeline ||
+        selectedRoomId !== roomId ||
+        pendingScrollEventId ||
+        paginationAnchorRef.current
+      ) {
+        return;
+      }
+
+      timeline.scrollTop = timeline.scrollHeight;
+      autoScrollToBottomRef.current = true;
+      setShowScrollToLatest(false);
+
+      initialRoomScrollFrameRef.current = window.requestAnimationFrame(() => {
+        const currentTimeline = timelineRef.current;
+        if (
+          !currentTimeline ||
+          selectedRoomId !== roomId ||
+          pendingScrollEventId ||
+          paginationAnchorRef.current
+        ) {
+          initialRoomScrollFrameRef.current = undefined;
+          return;
+        }
+
+        currentTimeline.scrollTop = currentTimeline.scrollHeight;
+        initialRoomScrollFrameRef.current = undefined;
+      });
+
+      initialRoomScrollSettleTimeoutRef.current = window.setTimeout(() => {
+        const currentTimeline = timelineRef.current;
+        if (
+          !currentTimeline ||
+          selectedRoomId !== roomId ||
+          pendingScrollEventId ||
+          paginationAnchorRef.current
+        ) {
+          initialRoomScrollSettleTimeoutRef.current = undefined;
+          return;
+        }
+
+        currentTimeline.scrollTop = currentTimeline.scrollHeight;
+        if (initialRoomScrollRoomIdRef.current === roomId) {
+          initialRoomScrollRoomIdRef.current = undefined;
+        }
+        suppressAutoLoadOlderRef.current = false;
+        initialRoomScrollSettleTimeoutRef.current = undefined;
+      }, 140);
+    },
+    [pendingScrollEventId, selectedRoomId]
+  );
+
+  useLayoutEffect(() => {
+    if (!selectedRoomId || initialRoomScrollRoomIdRef.current !== selectedRoomId) return;
+    settleInitialRoomScroll(selectedRoomId);
+  }, [selectedRoomId, selectedRoomMessages.length, settleInitialRoomScroll]);
+
+  const settlePinnedTimelineBottom = useCallback(() => {
+    const timeline = timelineRef.current;
+    if (!timeline || pendingScrollEventId || paginationAnchorRef.current) return;
+
+    autoScrollToBottomRef.current = true;
+    setShowScrollToLatest(false);
+    timeline.scrollTop = timeline.scrollHeight;
+
+    if (typeof pinnedTimelineFrameRef.current === 'number') {
+      window.cancelAnimationFrame(pinnedTimelineFrameRef.current);
+    }
+    pinnedTimelineFrameRef.current = window.requestAnimationFrame(() => {
+      const currentTimeline = timelineRef.current;
+      if (!currentTimeline || (!autoScrollToBottomRef.current && !composerBottomLockRef.current)) {
+        pinnedTimelineFrameRef.current = undefined;
+        return;
+      }
+
+      currentTimeline.scrollTop = currentTimeline.scrollHeight;
+      pinnedTimelineFrameRef.current = undefined;
+    });
+
+    if (typeof pinnedTimelineSettleTimeoutRef.current === 'number') {
+      window.clearTimeout(pinnedTimelineSettleTimeoutRef.current);
+    }
+    pinnedTimelineSettleTimeoutRef.current = window.setTimeout(() => {
+      const currentTimeline = timelineRef.current;
+      if (!currentTimeline || (!autoScrollToBottomRef.current && !composerBottomLockRef.current)) {
+        pinnedTimelineSettleTimeoutRef.current = undefined;
+        return;
+      }
+
+      currentTimeline.scrollTop = currentTimeline.scrollHeight;
+      composerBottomLockRef.current = false;
+      suppressAutoLoadOlderRef.current = false;
+      pinnedTimelineSettleTimeoutRef.current = undefined;
+    }, 180);
+  }, [pendingScrollEventId]);
+
+  useLayoutEffect(() => {
+    const handleResize = () => {
+      window.requestAnimationFrame(() => {
+        measureComposerTextarea();
+        if (autoScrollToBottomRef.current || composerBottomLockRef.current) {
+          settlePinnedTimelineBottom();
+        }
+      });
+    };
+
+    window.addEventListener('resize', handleResize);
+    window.visualViewport?.addEventListener('resize', handleResize);
+    return () => {
+      window.removeEventListener('resize', handleResize);
+      window.visualViewport?.removeEventListener('resize', handleResize);
+    };
+  }, [measureComposerTextarea, settlePinnedTimelineBottom]);
+
+  useLayoutEffect(() => {
+    if (!composerBottomLockRef.current) return;
+    settlePinnedTimelineBottom();
+  }, [composerExpanded, emojiOpen, settlePinnedTimelineBottom]);
+
+  useLayoutEffect(() => {
+    const anchor = paginationAnchorRef.current;
+    if (!selectedRoomId || !anchor || anchor.roomId !== selectedRoomId) return;
+
+    restorePaginationAnchor(selectedRoomId);
+    schedulePaginationAnchorStabilization(selectedRoomId);
+  }, [
+    restorePaginationAnchor,
+    schedulePaginationAnchorStabilization,
+    selectedRoomId,
+    selectedRoomMessages.length,
+    snapshot.version,
+  ]);
+
+  useLayoutEffect(() => {
+    const timeline = timelineRef.current;
+    if (!timeline || !selectedRoomId || typeof ResizeObserver === 'undefined') return;
+
+    const observer = new ResizeObserver(() => {
+      const anchor = paginationAnchorRef.current;
+      if (anchor?.roomId === selectedRoomId) {
+        restorePaginationAnchor(selectedRoomId);
+        schedulePaginationAnchorStabilization(selectedRoomId);
+        return;
+      }
+
+      if (initialRoomScrollRoomIdRef.current === selectedRoomId) {
+        settleInitialRoomScroll(selectedRoomId);
+        return;
+      }
+
+      if (autoScrollToBottomRef.current || composerBottomLockRef.current) {
+        settlePinnedTimelineBottom();
+      }
+    });
+
+    observer.observe(timeline);
+    return () => {
+      observer.disconnect();
+      if (typeof pinnedTimelineFrameRef.current === 'number') {
+        window.cancelAnimationFrame(pinnedTimelineFrameRef.current);
+        pinnedTimelineFrameRef.current = undefined;
+      }
+      if (typeof pinnedTimelineSettleTimeoutRef.current === 'number') {
+        window.clearTimeout(pinnedTimelineSettleTimeoutRef.current);
+        pinnedTimelineSettleTimeoutRef.current = undefined;
+      }
+    };
+  }, [
+    restorePaginationAnchor,
+    schedulePaginationAnchorStabilization,
+    selectedRoomId,
+    settlePinnedTimelineBottom,
+    settleInitialRoomScroll,
+  ]);
+
+  const scrollTimelineToBottom = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    const timeline = timelineRef.current;
+    if (!timeline) return;
+
+    autoScrollToBottomRef.current = true;
+    setShowScrollToLatest(false);
+    timeline.scrollTo({
+      top: timeline.scrollHeight,
+      behavior,
+    });
+    window.requestAnimationFrame(() => {
+      suppressAutoLoadOlderRef.current = false;
+    });
+  }, []);
 
   useEffect(() => {
     const timeline = timelineRef.current;
     if (!timeline || pendingScrollEventId || paginationAnchorRef.current) return;
     if (!autoScrollToBottomRef.current) return;
+    if (initialRoomScrollRoomIdRef.current === selectedRoomId) return;
 
-    timeline.scrollTo({
-      top: timeline.scrollHeight,
-      behavior: selectedRoomMessages.length > 0 ? 'smooth' : 'auto',
-    });
-  }, [pendingScrollEventId, selectedRoomId, selectedRoomMessages.length]);
+    scrollTimelineToBottom(selectedRoomMessages.length > 0 ? 'smooth' : 'auto');
+  }, [pendingScrollEventId, scrollTimelineToBottom, selectedRoomId, selectedRoomMessages.length]);
 
   useEffect(() => {
     if (!pendingScrollEventId) return;
@@ -2693,11 +4094,36 @@ export function App() {
     }
 
     target.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    if (typeof initialRoomScrollFrameRef.current === 'number') {
+      window.cancelAnimationFrame(initialRoomScrollFrameRef.current);
+      initialRoomScrollFrameRef.current = undefined;
+    }
+    if (typeof initialRoomScrollSettleTimeoutRef.current === 'number') {
+      window.clearTimeout(initialRoomScrollSettleTimeoutRef.current);
+      initialRoomScrollSettleTimeoutRef.current = undefined;
+    }
+    initialRoomScrollRoomIdRef.current = undefined;
+    suppressAutoLoadOlderRef.current = false;
     setHighlightedMessageId(pendingScrollEventId);
     const timeout = window.setTimeout(() => setHighlightedMessageId(undefined), 1800);
     setPendingScrollEventId(undefined);
     return () => window.clearTimeout(timeout);
   }, [pendingScrollEventId, selectedRoomMessages.length]);
+
+  useEffect(() => {
+    return () => {
+      if (typeof initialRoomScrollFrameRef.current === 'number') {
+        window.cancelAnimationFrame(initialRoomScrollFrameRef.current);
+      }
+      if (typeof initialRoomScrollSettleTimeoutRef.current === 'number') {
+        window.clearTimeout(initialRoomScrollSettleTimeoutRef.current);
+      }
+      const paginationAnchorFrameId = paginationAnchorRef.current?.animationFrameId;
+      if (typeof paginationAnchorFrameId === 'number') {
+        window.cancelAnimationFrame(paginationAnchorFrameId);
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (!editingMessageId) return;
@@ -2716,12 +4142,34 @@ export function App() {
   }, [favoriteMessageIds]);
 
   useEffect(() => {
+    saveFavoriteMessageSnapshots(favoriteMessageSnapshots);
+  }, [favoriteMessageSnapshots]);
+
+  useEffect(() => {
     saveRoomDrafts(roomDrafts);
   }, [roomDrafts]);
 
   useEffect(() => {
     savePreferences(preferences);
   }, [preferences]);
+
+  useEffect(() => {
+    saveAudioTranscriptionSettings(audioTranscriptionSettings);
+  }, [audioTranscriptionSettings]);
+
+  useEffect(() => {
+    audioTranscriptionSettingsRef.current = audioTranscriptionSettings;
+
+    const applyingSignature = audioTranscriptionApplyingRemoteSignatureRef.current;
+    if (
+      applyingSignature &&
+      getAudioTranscriptionSettingsAccountDataSignature(audioTranscriptionSettings) ===
+        applyingSignature
+    ) {
+      audioTranscriptionApplyingRemoteSignatureRef.current = undefined;
+      audioTranscriptionHydratedRef.current = true;
+    }
+  }, [audioTranscriptionSettings]);
 
   useEffect(() => {
     saveStringArray(exploreServerSourcesKey, exploreServers);
@@ -2735,12 +4183,34 @@ export function App() {
       refreshSnapshot();
       if (success) setNotice(success);
     } catch (err) {
+      if (isMatrixSessionExpiredError(err)) {
+        await handleSessionExpired(err, session);
+        return;
+      }
+
       setError(err instanceof Error ? err.message : String(err));
     }
   };
 
   const handleLogin = async (evt: FormEvent<HTMLFormElement>) => {
     evt.preventDefault();
+
+    if (!loginForm.baseUrl.trim()) {
+      setBootState('signedOut');
+      setError('请输入 Homeserver 地址。');
+      return;
+    }
+    if (!loginForm.username.trim()) {
+      setBootState('signedOut');
+      setError('请输入用户名或 Matrix ID。');
+      return;
+    }
+    if (!loginForm.password.trim()) {
+      setBootState('signedOut');
+      setError('请输入密码。');
+      return;
+    }
+
     setBootState('connecting');
     setError(undefined);
 
@@ -2750,12 +4220,13 @@ export function App() {
       await Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
       await connectSession(nextSession);
     } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setError(getReadableLoginError(err));
       setBootState('error');
     }
   };
 
   const handleLogout = async () => {
+    sessionExpiryHandledRef.current = false;
     stopRuntime();
     await clearStoredSession();
     setSession(undefined);
@@ -2874,6 +4345,7 @@ export function App() {
       }
 
       setComposerMode({ type: 'normal' });
+      setComposerExpanded(false);
       setEmojiOpen(false);
       setRoomDrafts((current) => {
         const next = { ...current };
@@ -2885,6 +4357,12 @@ export function App() {
     } catch (err) {
       setMessageDraft(body);
       setRoomDrafts((current) => ({ ...current, [selectedRoom.id]: body }));
+
+      if (isMatrixSessionExpiredError(err)) {
+        await handleSessionExpired(err, session);
+        return;
+      }
+
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);
@@ -2909,6 +4387,69 @@ export function App() {
       });
     });
   }, []);
+
+  const hideComposerKeyboard = useCallback(() => {
+    composerInputRef.current?.blur();
+    void CapacitorKeyboard.hide().catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    if (!composerExpanded) return;
+    focusComposerInput();
+  }, [composerExpanded, focusComposerInput]);
+
+  const requestComposerBottomLock = useCallback(() => {
+    const timeline = timelineRef.current;
+    if (!timeline) {
+      composerBottomLockRef.current = false;
+      return false;
+    }
+
+    const distanceToBottom = Math.max(
+      0,
+      timeline.scrollHeight - (timeline.scrollTop + timeline.clientHeight)
+    );
+    const shouldStick = distanceToBottom < timelinePinnedThresholdPx;
+    composerBottomLockRef.current = shouldStick;
+    if (shouldStick) {
+      autoScrollToBottomRef.current = true;
+      setShowScrollToLatest(false);
+    }
+    return shouldStick;
+  }, []);
+
+  const handleExpandComposer = useCallback(() => {
+    if (!composerCanExpand) return;
+    requestComposerBottomLock();
+    setEmojiOpen(false);
+    setComposerExpanded(true);
+  }, [composerCanExpand, requestComposerBottomLock]);
+
+  const handleCollapseComposer = useCallback(() => {
+    requestComposerBottomLock();
+    setComposerExpanded(false);
+    focusComposerInput();
+  }, [focusComposerInput, requestComposerBottomLock]);
+
+  const handleToggleComposerEmojiTray = useCallback(() => {
+    if (selectedRoom?.membership !== 'join') return;
+    requestComposerBottomLock();
+
+    if (emojiOpen) {
+      setEmojiOpen(false);
+      focusComposerInput();
+      return;
+    }
+
+    setEmojiOpen(true);
+    hideComposerKeyboard();
+  }, [
+    emojiOpen,
+    focusComposerInput,
+    hideComposerKeyboard,
+    requestComposerBottomLock,
+    selectedRoom?.membership,
+  ]);
 
   const handleDraftChange = (value: string) => {
     setMessageDraft(value);
@@ -2938,9 +4479,26 @@ export function App() {
 
   const handleLoadOlder = async () => {
     if (!client || !selectedRoom || loadingOlder) return;
+    setError(undefined);
     setLoadingOlder(true);
-    await runAction(() => paginateRoomMessages(client, selectedRoom.id), '已加载更早消息');
-    setLoadingOlder(false);
+    try {
+      const addedCount = await paginateRoomMessages(client, selectedRoom.id);
+      refreshSnapshot(client);
+      if (addedCount > 0) {
+        setNotice(`已加载 ${addedCount} 条更早消息`);
+      } else {
+        setNotice('已经没有更早消息了');
+      }
+    } catch (err) {
+      if (isMatrixSessionExpiredError(err)) {
+        await handleSessionExpired(err, session);
+        return;
+      }
+
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoadingOlder(false);
+    }
   };
 
   const loadOlderMessages = useCallback(async () => {
@@ -2948,10 +4506,26 @@ export function App() {
 
     const timeline = timelineRef.current;
     if (timeline) {
+      const timelineTop = timeline.getBoundingClientRect().top;
+      const visibleMessages = Array.from(
+        timeline.querySelectorAll<HTMLElement>('[data-message-id]')
+      ).filter((element) => {
+        const rect = element.getBoundingClientRect();
+        return rect.bottom > timelineTop + 4;
+      });
+      const visibleAnchorMessage =
+        visibleMessages.find((element) => element.getBoundingClientRect().top >= timelineTop + 4) ??
+        visibleMessages[0];
+      const anchorOffsetTop = visibleAnchorMessage
+        ? Math.max(0, visibleAnchorMessage.getBoundingClientRect().top - timelineTop)
+        : undefined;
       paginationAnchorRef.current = {
         roomId: selectedRoom.id,
         scrollTop: timeline.scrollTop,
         scrollHeight: timeline.scrollHeight,
+        messageId: visibleAnchorMessage?.dataset.messageId,
+        messageOffsetTop: anchorOffsetTop,
+        stabilizationFrames: 12,
       };
     }
 
@@ -2960,24 +4534,25 @@ export function App() {
     autoScrollToBottomRef.current = false;
 
     try {
-      await paginateRoomMessages(client, selectedRoom.id);
+      const addedCount = await paginateRoomMessages(client, selectedRoom.id);
       refreshSnapshot(client);
+      if (addedCount === 0) {
+        setNotice('已经没有更早消息了');
+      }
     } catch (err) {
+      const paginationAnchorFrameId = paginationAnchorRef.current?.animationFrameId;
+      if (typeof paginationAnchorFrameId === 'number') {
+        window.cancelAnimationFrame(paginationAnchorFrameId);
+      }
       paginationAnchorRef.current = undefined;
+
+      if (isMatrixSessionExpiredError(err)) {
+        await handleSessionExpired(err, session);
+        return;
+      }
+
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      window.requestAnimationFrame(() => {
-        const currentAnchor = paginationAnchorRef.current;
-        const currentTimeline = timelineRef.current;
-        if (
-          currentAnchor &&
-          currentTimeline &&
-          currentAnchor.roomId === selectedRoom.id &&
-          currentTimeline.scrollHeight === currentAnchor.scrollHeight
-        ) {
-          paginationAnchorRef.current = undefined;
-        }
-      });
       loadingOlderRef.current = false;
       setLoadingOlder(false);
     }
@@ -2987,24 +4562,55 @@ export function App() {
     const timeline = timelineRef.current;
     if (!timeline) return;
 
-    const distanceToBottom = timeline.scrollHeight - (timeline.scrollTop + timeline.clientHeight);
-    autoScrollToBottomRef.current = distanceToBottom < 84;
+    const distanceToBottom = Math.max(0, timeline.scrollHeight - (timeline.scrollTop + timeline.clientHeight));
+    const pinnedToBottom = distanceToBottom < timelinePinnedThresholdPx;
+    if (!(suppressAutoLoadOlderRef.current && autoScrollToBottomRef.current && !pinnedToBottom)) {
+      autoScrollToBottomRef.current = pinnedToBottom;
+    }
+    setShowScrollToLatest(distanceToBottom > scrollToLatestThresholdPx);
 
-    if (timeline.scrollTop <= 48 && !loadingOlderRef.current && !messageQuery.trim()) {
+    if (
+      timeline.scrollTop <= 48 &&
+      !loadingOlderRef.current &&
+      !messageQuery.trim() &&
+      !suppressAutoLoadOlderRef.current
+    ) {
       void loadOlderMessages();
     }
   }, [loadOlderMessages, messageQuery]);
 
   const handleCopyMessage = async (message: ChatMessage) => {
-    await navigator.clipboard?.writeText(message.body);
-    setNotice('消息已复制');
+    const copied = await copyTextToClipboard(
+      getReadableMessageBody(message.body || message.attachment?.name || '')
+    );
+    if (copied) {
+      setNotice('消息已复制');
+      return;
+    }
+
+    setError('当前环境没有拿到剪贴板写入权限，请检查系统复制权限后重试。');
   };
 
   const handleCopyMessageLink = async (message: ChatMessage) => {
     const room = snapshot.rooms.find((item) => item.id === message.roomId);
     if (!room) return;
-    await navigator.clipboard?.writeText(buildMatrixPermalink(room, message.id));
-    setNotice('消息链接已复制');
+    const copied = await copyTextToClipboard(buildMatrixPermalink(room, message.id));
+    if (copied) {
+      setNotice('消息链接已复制');
+      return;
+    }
+
+    setError('当前环境没有拿到剪贴板写入权限，请检查系统复制权限后重试。');
+  };
+
+  const handleCopyRoomLink = async (room: RoomSummary) => {
+    const copied = await copyTextToClipboard(buildMatrixPermalink(room));
+    if (copied) {
+      setNotice('房间链接已复制');
+      return;
+    }
+
+    setError('当前环境没有拿到剪贴板写入权限，请检查系统复制权限后重试。');
   };
 
   const handleTogglePinMessage = async (message: ChatMessage) => {
@@ -3047,8 +4653,8 @@ export function App() {
     setSheet({ type: 'messageInfo', message });
   };
 
-  const handleOpenReadReceipts = (message: ChatMessage) => {
-    setSheet({ type: 'readReceipts', message });
+  const handleOpenReadReceipts = (message: ChatMessage, inlineState?: InlineReadReceiptState) => {
+    setSheet({ type: 'readReceipts', message, inlineState });
   };
 
   const handleEditMessage = (message: ChatMessage) => {
@@ -3120,6 +4726,7 @@ export function App() {
       messageId: message.id,
       roomId: message.roomId,
       kind: message.attachment.kind,
+      mxcUrl: message.attachment.mxcUrl,
       url: message.attachment.url,
       authUrl: message.attachment.authUrl,
       previewEncryptedFile: message.attachment.previewEncryptedFile,
@@ -3129,6 +4736,7 @@ export function App() {
       encryptedFile: message.attachment.encryptedFile,
       name: message.attachment.name ?? message.body,
       mimeType: message.attachment.mimeType,
+      size: message.attachment.size,
       durationMs: message.attachment.durationMs,
       width: message.attachment.width,
       height: message.attachment.height,
@@ -3136,6 +4744,131 @@ export function App() {
       timestamp: message.timestamp,
     });
   };
+
+  const addImageToDefaultEmojiPack = useCallback(
+    async (image: {
+      mxcUrl?: string;
+      name?: string;
+      body?: string;
+      mimeType?: string;
+      width?: number;
+      height?: number;
+      size?: number;
+    }) => {
+      if (!client) return;
+      if (!image.mxcUrl) {
+        setError('这张图片当前没有可写入表情包的原始地址。');
+        return;
+      }
+      const { mxcUrl } = image;
+
+      await runAction(async () => {
+        const shortcode = await addImageToDefaultCustomEmojiPack(client, {
+          mxcUrl,
+          name: image.name,
+          body: image.body,
+          info: buildCustomEmojiInfoFromMedia(image),
+          usage: ['emoticon', 'sticker'],
+          preferredShortcode: image.name ?? image.body,
+        });
+        syncCustomEmojiState(client);
+        setNotice(`已加入默认表情和贴纸 :${shortcode}:`);
+      });
+    },
+    [client, runAction, syncCustomEmojiState]
+  );
+
+  const handleAddMessageImageToEmoji = useCallback(
+    (message: ChatMessage) => {
+      const attachment = message.attachment;
+      if (!attachment || attachment.kind !== 'image') return;
+
+      void addImageToDefaultEmojiPack({
+        mxcUrl: attachment.mxcUrl,
+        name: attachment.name ?? message.body,
+        body: attachment.name ?? message.body,
+        mimeType: attachment.mimeType,
+        width: attachment.width,
+        height: attachment.height,
+        size: attachment.size,
+      });
+    },
+    [addImageToDefaultEmojiPack]
+  );
+
+  const handleAddPreviewImageToEmoji = useCallback(
+    (media: RoomMediaItem) => {
+      if (media.kind !== 'image') return;
+
+      void addImageToDefaultEmojiPack({
+        mxcUrl: media.mxcUrl,
+        name: media.name,
+        body: media.name,
+        mimeType: media.mimeType,
+        width: media.width,
+        height: media.height,
+        size: media.size,
+      });
+    },
+    [addImageToDefaultEmojiPack]
+  );
+
+  const handleRequestPreviewNavigation = useCallback(
+    async (direction: 'prev' | 'next', media: RoomMediaItem): Promise<RoomMediaItem | undefined> => {
+      if (!client) return undefined;
+
+      const mediaLabel =
+        media.kind === 'image' ? '图片' : media.kind === 'video' ? '视频' : '附件';
+      const currentItems =
+        media.roomId === selectedRoomId ? roomMediaItems : getRoomMediaItems(client, media.roomId);
+      const previewableItems = getNavigableRoomMediaItems(currentItems, media.kind);
+      const currentIndex = previewableItems.findIndex((item) => item.messageId === media.messageId);
+      const step = direction === 'prev' ? -1 : 1;
+
+      if (currentIndex >= 0) {
+        const adjacentItem = previewableItems[currentIndex + step];
+        if (adjacentItem) {
+          return adjacentItem;
+        }
+      }
+
+      if (direction === 'next') {
+        setNotice(`已经是最新${mediaLabel}了`);
+        return undefined;
+      }
+
+      const oldestLoadedId = previewableItems[0]?.messageId;
+
+      try {
+        await paginateRoomMessages(client, media.roomId);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        return undefined;
+      }
+
+      const refreshedItems = getRoomMediaItems(client, media.roomId);
+      if (media.roomId === selectedRoomId) {
+        setRoomMediaItems(refreshedItems);
+      }
+      refreshSnapshot(client);
+
+      const refreshedPreviewableItems = getNavigableRoomMediaItems(refreshedItems, media.kind);
+      const refreshedIndex = refreshedPreviewableItems.findIndex((item) => item.messageId === media.messageId);
+      if (refreshedIndex > 0) {
+        return refreshedPreviewableItems[refreshedIndex - 1];
+      }
+
+      const loadedDifferentRange =
+        Boolean(oldestLoadedId) && refreshedPreviewableItems[0]?.messageId !== oldestLoadedId;
+      setNotice(
+        loadedDifferentRange
+          ? `已加载更早消息，但这段里没有更多${mediaLabel}`
+          : `更早消息里暂时没有更多${mediaLabel}`
+      );
+      return undefined;
+    },
+    [client, refreshSnapshot, roomMediaItems, selectedRoomId]
+  );
 
   const cancelMessageSelection = () => {
     setSelectionMode(false);
@@ -3208,9 +4941,13 @@ export function App() {
     handleDraftChange(nextDraft);
   };
 
-  const handlePickCustomEmoji = async (item: CustomEmojiItem) => {
+  const handlePickCustomEmoji = async (item: CustomEmojiItem, sourceTab?: EmojiTrayTab) => {
     if (!client || !selectedRoom || selectedRoom.membership !== 'join') return;
-    if (item.usage.includes('sticker')) {
+    const effectiveSourceTab =
+      sourceTab ??
+      (item.usage.includes('emoticon') ? 'emoji' : item.usage.includes('sticker') ? 'sticker' : 'emoji');
+
+    if (effectiveSourceTab === 'sticker') {
       await runAction(
         async () => {
           await sendStickerMessage(client, selectedRoom.id, item);
@@ -3402,19 +5139,57 @@ export function App() {
         message.attachment?.encryptedFile,
         message.attachment?.mimeType
       );
-      const text = await transcribeAudioBlobInBrowser(blob, (partialText, detail) => {
-        setAudioTranscriptions((current) => ({
-          ...current,
-          [message.id]: {
-            status: 'loading',
-            text: partialText || current[message.id]?.text,
-            detail,
-          },
-        }));
-      });
+      const useAihubmix = hasAihubmixAudioTranscription(audioTranscriptionSettings);
+      const result = useAihubmix
+        ? await (async () => {
+            setAudioTranscriptions((current) => ({
+              ...current,
+              [message.id]: {
+                status: 'loading',
+                text: current[message.id]?.text,
+                detail: '正在准备 AIHubMix 云端转写...',
+              },
+            }));
+
+            const result = await transcribeAudioWithAihubmixAdaptive(audioTranscriptionSettings, blob, {
+              durationMs: message.attachment?.durationMs,
+              filename: message.attachment?.name ?? 'voice-message.webm',
+              mimeType: message.attachment?.mimeType,
+              onProgress: (partialText, detail) => {
+                setAudioTranscriptions((current) => ({
+                  ...current,
+                  [message.id]: {
+                    status: 'loading',
+                    text: partialText || current[message.id]?.text,
+                    detail,
+                  },
+                }));
+              },
+            });
+
+            return result;
+          })()
+        : {
+            ...(await transcribeAudioBlobInBrowser(blob, (partialText, detail) => {
+              setAudioTranscriptions((current) => ({
+                ...current,
+                [message.id]: {
+                  status: 'loading',
+                  text: partialText || current[message.id]?.text,
+                  detail,
+                },
+              }));
+            })),
+            detail: '浏览器本地转写 · 短语音兜底',
+          };
+      const displayText = formatTranscriptionForDisplay(result.text, result.segments);
       setAudioTranscriptions((current) => ({
         ...current,
-        [message.id]: { status: 'success', text },
+        [message.id]: {
+          status: 'success',
+          text: displayText || result.text,
+          detail: result.detail,
+        },
       }));
     } catch (err) {
       setAudioTranscriptions((current) => ({
@@ -3568,13 +5343,23 @@ export function App() {
   };
 
   const handleCopyMember = async (member: RoomMemberSummary) => {
-    await navigator.clipboard?.writeText(member.id);
-    setNotice('成员 ID 已复制');
+    const copied = await copyTextToClipboard(member.id);
+    if (copied) {
+      setNotice('成员 ID 已复制');
+      return;
+    }
+
+    setError('当前环境没有拿到剪贴板写入权限，请检查系统复制权限后重试。');
   };
 
   const handleCopyMemberLink = async (member: RoomMemberSummary) => {
-    await navigator.clipboard?.writeText(buildUserPermalink(member.id));
-    setNotice('用户链接已复制');
+    const copied = await copyTextToClipboard(buildUserPermalink(member.id));
+    if (copied) {
+      setNotice('用户链接已复制');
+      return;
+    }
+
+    setError('当前环境没有拿到剪贴板写入权限，请检查系统复制权限后重试。');
   };
 
   const handleDirectMember = async (member: RoomMemberSummary) => {
@@ -3627,14 +5412,31 @@ export function App() {
   };
 
   const toggleFavoriteMessage = (message: ChatMessage) => {
+    const currentlyFavorite = favoriteMessageIds[message.roomId]?.includes(message.id) ?? false;
+    const room = snapshot.rooms.find((item) => item.id === message.roomId);
+    const snapshotKey = getFavoriteSnapshotKey(message.roomId, message.id);
+
     setFavoriteMessageIds((current) => {
       const roomFavorites = current[message.roomId] ?? [];
-      const nextRoomFavorites = roomFavorites.includes(message.id)
+      const nextRoomFavorites = currentlyFavorite
         ? roomFavorites.filter((id) => id !== message.id)
         : [...roomFavorites, message.id];
       return {
         ...current,
         [message.roomId]: nextRoomFavorites,
+      };
+    });
+
+    setFavoriteMessageSnapshots((current) => {
+      if (currentlyFavorite) {
+        const nextSnapshots = { ...current };
+        delete nextSnapshots[snapshotKey];
+        return nextSnapshots;
+      }
+
+      return {
+        ...current,
+        [snapshotKey]: buildStoredFavoriteMessageSnapshot(message, room),
       };
     });
   };
@@ -4073,6 +5875,20 @@ export function App() {
     activeView !== 'explore' &&
     activeView !== 'settings';
   const showPaneActions = showPaneSearch || showPaneCreate;
+  const showCollapsedExpandButton = composerCanExpand && !composerExpanded;
+  const showInlineComposerMic = !composerExpanded && !voiceRecording && !messageDraft.trim();
+  const composerSideRailClassName = [
+    'composer-side-rail',
+    showCollapsedExpandButton ? 'has-expand' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  const composerInputShellClassName = [
+    'composer-input-shell',
+    showInlineComposerMic ? 'has-mic' : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
 
   return (
     <main className={`app-frame mobile-${mobilePane} theme-${preferences.appearance} density-${preferences.density}`}>
@@ -4179,12 +5995,7 @@ export function App() {
               handleSelectRoom(roomId);
               setActiveView(room?.direct ? 'direct' : 'rooms');
             }}
-            onOpenMessage={(roomId, eventId) => {
-              const room = snapshot.rooms.find((item) => item.id === roomId);
-              handleSelectRoom(roomId);
-              setActiveView(room?.direct ? 'direct' : 'rooms');
-              setPendingScrollEventId(eventId);
-            }}
+            onCopyMessage={(message) => void handleCopyMessage(message)}
             onPreviewAttachment={handlePreviewAttachment}
             onToggleRoom={toggleFavoriteRoom}
             onToggleMessage={(message) => toggleFavoriteMessage(message)}
@@ -4251,12 +6062,15 @@ export function App() {
             ownProfile={ownProfile}
             profileForm={profileForm}
             preferences={preferences}
+            audioTranscriptionSettings={audioTranscriptionSettings}
+            audioTranscriptionSupportLabel={getAudioTranscriptionSupportLabel(audioTranscriptionSettings)}
             cryptoStatus={cryptoStatus}
             mediaAccessToken={session?.accessToken}
             onProfileChange={setProfileForm}
             onProfileSubmit={handleProfileSubmit}
             onAvatarSelected={handleProfileAvatarSelected}
             onPreferencesChange={setPreferences}
+            onAudioTranscriptionSettingsChange={handleAudioTranscriptionSettingsChange}
             onOpenSecurity={() => setSheet('security')}
             onOpenEmojiManager={() => setSheet('emojiManager')}
             onOpenFavorites={() => {
@@ -4274,8 +6088,10 @@ export function App() {
             onClearLocal={() => {
               window.localStorage.removeItem(favoriteRoomsKey);
               window.localStorage.removeItem(favoriteMessagesKey);
+              window.localStorage.removeItem(favoriteMessageSnapshotsKey);
               setFavoriteRoomIds([]);
               setFavoriteMessageIds({});
+              setFavoriteMessageSnapshots({});
               setNotice('本地偏好已清');
             }}
           />
@@ -4398,77 +6214,102 @@ export function App() {
               </div>
             )}
 
-            <div className="timeline" ref={timelineRef} onScroll={handleTimelineScroll}>
-              <button className="load-older" onClick={() => void loadOlderMessages()} disabled={loadingOlder}>
-                <History size={15} />
-                {loadingOlder ? '加载中...' : '加载更早消息'}
-              </button>
-              {selectedRoomMessages.length === 0 ? (
-                <EmptyState
-                  icon={<MessageCircle size={30} />}
-                  title={messageQuery ? '没有匹配消息' : '这里还没有消息'}
-                  copy={messageQuery ? '换一个关键词试试。' : '发出第一条消息，或者等待同步更多历史记录。'}
-                />
-              ) : (
-                selectedRoomMessages.map((message, index) => {
-                  const previousMessage = selectedRoomMessages[index - 1];
-                  const showDateSeparator =
-                    !previousMessage || getDayKey(previousMessage.timestamp) !== getDayKey(message.timestamp);
+            <div className="timeline-shell">
+              <div
+                key={selectedRoom.id}
+                className="timeline"
+                ref={timelineRef}
+                onScroll={handleTimelineScroll}
+              >
+                <button className="load-older" onClick={() => void loadOlderMessages()} disabled={loadingOlder}>
+                  <History size={15} />
+                  {loadingOlder ? '加载中...' : '加载更早消息'}
+                </button>
+                {selectedRoomMessages.length === 0 ? (
+                  <EmptyState
+                    icon={<MessageCircle size={30} />}
+                    title={messageQuery ? '没有匹配消息' : '这里还没有消息'}
+                    copy={messageQuery ? '换一个关键词试试。' : '发出第一条消息，或者等待同步更多历史记录。'}
+                  />
+                ) : (
+                  selectedRoomMessages.map((message, index) => {
+                    const previousMessage = selectedRoomMessages[index - 1];
+                    const showDateSeparator =
+                      !previousMessage || getDayKey(previousMessage.timestamp) !== getDayKey(message.timestamp);
 
-                  return (
-                    <Fragment key={message.id}>
-                      {showDateSeparator && <TimelineDateSeparator timestamp={message.timestamp} />}
-                      <MessageBubble
-                        message={message}
-                        favorite={favoriteMessageIds[message.roomId]?.includes(message.id) ?? false}
-                        highlighted={message.id === highlightedMessageId}
-                        selectionMode={selectionMode}
-                        selected={selectedMessageIds.includes(message.id)}
-                        forwardable={isForwardableMessage(message)}
-                        mediaAccessToken={session?.accessToken}
-                        members={roomMembers}
-                        currentUserProfile={ownProfile}
-                        readReceiptAvatarCount={preferences.readReceiptAvatarCount}
-                        inlineReadReceiptState={selectedRoomInlineReadReceiptStates.get(message.id)}
-                        audioTranscription={audioTranscriptions[message.id]}
-                        onToggleSelection={() => toggleMessageSelection(message)}
-                        onFavorite={() => toggleFavoriteMessage(message)}
-                        onReply={() => {
-                          setComposerMode({ type: 'reply', message });
-                          setMessageDraft('');
-                        }}
-                        onOpenReply={(eventId) => setPendingScrollEventId(eventId)}
-                        onInfo={() => handleOpenMessageInfo(message)}
-                        onEdit={() => handleEditMessage(message)}
-                        onRedact={() => handleRedactMessage(message)}
-                        onCopy={() => handleCopyMessage(message)}
-                        onCopyLink={() => handleCopyMessageLink(message)}
-                        onTogglePin={() => handleTogglePinMessage(message)}
-                        onForward={() => startForwardSelection(message)}
-                        onPreviewAttachment={() => handlePreviewAttachment(message)}
-                        onTranscribeAudio={() => handleTranscribeAudio(message)}
-                        onOpenUserProfile={() => handleOpenMessageSenderProfile(message)}
-                        onOpenMentionMember={openUserProfile}
-                        onMentionSender={() => handleMentionMessageSender(message)}
-                        onOpenReadReceipts={() => handleOpenReadReceipts(message)}
-                        editing={editingMessageId === message.id}
-                        editingDraft={editingMessageId === message.id ? editingMessageDraft : ''}
-                        savingEdit={savingInlineEdit && editingMessageId === message.id}
-                        onEditingDraftChange={setEditingMessageDraft}
-                        onCancelEdit={handleCancelInlineEdit}
-                        onSaveEdit={() => handleSaveInlineEdit(message)}
-                        onReact={(key) =>
-                          client &&
-                          runAction(() => sendReaction(client, message.roomId, message.id, key), '已更新回应')
-                        }
-                      />
-                    </Fragment>
-                  );
-                })
+                    return (
+                      <Fragment key={message.id}>
+                        {showDateSeparator && <TimelineDateSeparator timestamp={message.timestamp} />}
+                        <MessageBubble
+                          client={client}
+                          message={message}
+                          favorite={favoriteMessageIds[message.roomId]?.includes(message.id) ?? false}
+                          highlighted={message.id === highlightedMessageId}
+                          selectionMode={selectionMode}
+                          selected={selectedMessageIds.includes(message.id)}
+                          forwardable={isForwardableMessage(message)}
+                          mediaAccessToken={session?.accessToken}
+                          customEmojiItems={customEmojiItems}
+                          members={roomMembers}
+                          currentUserProfile={ownProfile}
+                          readReceiptAvatarCount={preferences.readReceiptAvatarCount}
+                          inlineReadReceiptState={selectedRoomInlineReadReceiptStates.get(message.id)}
+                          audioTranscription={audioTranscriptions[message.id]}
+                          onToggleSelection={() => toggleMessageSelection(message)}
+                          onFavorite={() => toggleFavoriteMessage(message)}
+                          onReply={() => {
+                            setComposerMode({ type: 'reply', message });
+                            setMessageDraft('');
+                          }}
+                          onOpenReply={(eventId) => setPendingScrollEventId(eventId)}
+                          onInfo={() => handleOpenMessageInfo(message)}
+                          onEdit={() => handleEditMessage(message)}
+                          onRedact={() => handleRedactMessage(message)}
+                          onCopy={() => handleCopyMessage(message)}
+                          onCopyLink={() => handleCopyMessageLink(message)}
+                          onTogglePin={() => handleTogglePinMessage(message)}
+                          onForward={() => startForwardSelection(message)}
+                          onPreviewAttachment={() => handlePreviewAttachment(message)}
+                          onAddImageToEmoji={() => handleAddMessageImageToEmoji(message)}
+                          onTranscribeAudio={() => handleTranscribeAudio(message)}
+                          onOpenUserProfile={() => handleOpenMessageSenderProfile(message)}
+                          onOpenMentionMember={openUserProfile}
+                          onMentionSender={() => handleMentionMessageSender(message)}
+                          onOpenReadReceipts={() =>
+                            handleOpenReadReceipts(message, selectedRoomInlineReadReceiptStates.get(message.id))
+                          }
+                          editing={editingMessageId === message.id}
+                          editingDraft={editingMessageId === message.id ? editingMessageDraft : ''}
+                          savingEdit={savingInlineEdit && editingMessageId === message.id}
+                          onEditingDraftChange={setEditingMessageDraft}
+                          onCancelEdit={handleCancelInlineEdit}
+                          onSaveEdit={() => handleSaveInlineEdit(message)}
+                          onReact={(key, shortcode) =>
+                            client &&
+                            runAction(
+                              () => sendReaction(client, message.roomId, message.id, key, shortcode),
+                              '已更新回应'
+                            )
+                          }
+                        />
+                      </Fragment>
+                    );
+                  })
+                )}
+              </div>
+              {showScrollToLatest && selectedRoomMessages.length > 0 && (
+                <button
+                  className="scroll-to-latest-button"
+                  type="button"
+                  onClick={() => scrollTimelineToBottom()}
+                  aria-label="回到底部最新消息"
+                >
+                  <ChevronDown size={20} />
+                </button>
               )}
             </div>
 
-            <form className="composer" onSubmit={handleSendMessage}>
+            <form className={composerExpanded ? 'composer expanded' : 'composer'} onSubmit={handleSendMessage}>
               {typingMembers.length > 0 && (
                 <div className="typing-line">
                   {typingMembers.slice(0, 3).join('')} 正在输入
@@ -4530,15 +6371,16 @@ export function App() {
                   onPick={handlePickMentionSuggestion}
                 />
               )}
-              {emojiOpen && selectedRoom.membership === 'join' && (
-                <div className="emoji-tray-shell" ref={emojiTrayRef}>
-                  <EnhancedEmojiTray
-                    emojis={composerEmojiOptions}
-                    customItems={customEmojiItems}
-                    accessToken={session?.accessToken}
-                    onPick={handleInsertEmoji}
-                    onPickCustom={handlePickCustomEmoji}
-                  />
+              {composerExpanded && (
+                <div className="composer-expanded-topbar">
+                  <button
+                    className="composer-collapse-button"
+                    type="button"
+                    onClick={handleCollapseComposer}
+                    aria-label="收起大输入框"
+                  >
+                    <ChevronDown size={16} />
+                  </button>
                 </div>
               )}
               <input
@@ -4587,49 +6429,85 @@ export function App() {
                 tabIndex={-1}
                 onChange={handleFileSelected}
               />
-              <div className="composer-tools" aria-label="输入工具">
-                <button
-                  className="icon-button"
-                  type="button"
-                  onClick={() => setAttachmentPickerOpen(true)}
-                  aria-label="发送附件"
-                  disabled={selectedRoom.membership !== 'join'}
-                >
-                  <FileUp size={19} />
-                </button>
-                <button
-                  ref={emojiToggleButtonRef}
-                  className={emojiOpen ? 'icon-button active' : 'icon-button'}
-                  type="button"
-                  onClick={() => setEmojiOpen((open) => !open)}
-                  aria-label="表情"
-                  disabled={selectedRoom.membership !== 'join'}
-                >
-                  <SmilePlus size={19} />
-                </button>
-                <button
-                  className={voiceRecording ? 'icon-button active recording' : 'icon-button'}
-                  type="button"
-                  onClick={handleToggleVoiceRecording}
-                  title={voiceRecording ? '录音中，请点击上方发送' : '录制语音'}
-                  aria-label={voiceRecording ? '语音录制中' : '录制语音'}
-                  disabled={selectedRoom.membership !== 'join' || voiceRecording}
-                >
-                  <Mic size={19} />
-                </button>
+              <div className="composer-input-row">
+                <div className={composerSideRailClassName}>
+                  {showCollapsedExpandButton && (
+                    <button
+                      className="composer-expand-button"
+                      type="button"
+                      onClick={handleExpandComposer}
+                      aria-label="展开大输入框"
+                      aria-expanded={composerExpanded}
+                    >
+                      <ExpandComposerIcon />
+                    </button>
+                  )}
+                  <div className="composer-tools" aria-label="输入工具">
+                    <button
+                      className="icon-button"
+                      type="button"
+                      onClick={() => setAttachmentPickerOpen(true)}
+                      aria-label="发送附件"
+                      disabled={selectedRoom.membership !== 'join'}
+                    >
+                      <FileUp size={19} />
+                    </button>
+                    <button
+                      ref={emojiToggleButtonRef}
+                      className={emojiOpen ? 'icon-button active' : 'icon-button'}
+                      type="button"
+                      onClick={handleToggleComposerEmojiTray}
+                      aria-label={emojiOpen ? '切换到键盘输入' : '打开表情托盘'}
+                      disabled={selectedRoom.membership !== 'join'}
+                    >
+                      {emojiOpen ? <KeyboardIcon size={19} /> : <SmilePlus size={19} />}
+                    </button>
+                  </div>
+                </div>
+                <div className={composerInputShellClassName}>
+                  <textarea
+                    ref={composerInputRef}
+                    value={messageDraft}
+                    rows={1}
+                    style={{ height: `${composerTextareaHeight}px` }}
+                    enterKeyHint="send"
+                    placeholder={selectedRoom.membership === 'join' ? '输入消息' : '需要先加入房间'}
+                    disabled={selectedRoom.membership !== 'join'}
+                    onFocus={() => {
+                      requestComposerBottomLock();
+                      if (emojiOpen) {
+                        setEmojiOpen(false);
+                      }
+                    }}
+                    onKeyDown={handleComposerKeyDown}
+                    onChange={(evt) => handleDraftChange(evt.target.value)}
+                  />
+                  {showInlineComposerMic && (
+                    <div className="composer-inline-actions">
+                      <button
+                        className="composer-inline-mic"
+                        type="button"
+                        onClick={handleToggleVoiceRecording}
+                        aria-label="录制语音"
+                        disabled={selectedRoom.membership !== 'join'}
+                      >
+                        <Mic size={18} />
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
-              <textarea
-                ref={composerInputRef}
-                value={messageDraft}
-                rows={1}
-                placeholder={selectedRoom.membership === 'join' ? '输入消息' : '需要先加入房间'}
-                disabled={selectedRoom.membership !== 'join'}
-                onKeyDown={handleComposerKeyDown}
-                onChange={(evt) => handleDraftChange(evt.target.value)}
-              />
-              <button className="send-button" type="submit" disabled={!messageDraft.trim() || sending}>
-                <Send size={19} />
-              </button>
+              {emojiOpen && selectedRoom.membership === 'join' && (
+                <div className="emoji-tray-shell" ref={emojiTrayRef}>
+                  <EnhancedEmojiTray
+                    emojis={composerEmojiOptions}
+                    customItems={customEmojiItems}
+                    accessToken={session?.accessToken}
+                    onPick={handleInsertEmoji}
+                    onPickCustom={handlePickCustomEmoji}
+                  />
+                </div>
+              )}
             </form>
           </>
         ) : (
@@ -4742,6 +6620,7 @@ export function App() {
           }
           onMentionMember={handleMentionMember}
           onCopyMember={handleCopyMember}
+          onCopyRoomLink={handleCopyRoomLink}
           onOpenMemberProfile={openUserProfile}
           onDirectMember={handleDirectMember}
           onKickMember={handleKickMember}
@@ -4794,10 +6673,12 @@ export function App() {
 
       {messageInfoMessage && (
         <MessageInfoSheet
+          client={client}
           message={messageInfoMessage}
           room={messageInfoRoom}
           members={roomMembers}
           mediaAccessToken={session?.accessToken}
+          customEmojiItems={customEmojiItems}
           favorite={favoriteMessageIds[messageInfoMessage.roomId]?.includes(messageInfoMessage.id) ?? false}
           onClose={() => setSheet(undefined)}
           onOpenMemberProfile={openUserProfile}
@@ -4813,10 +6694,14 @@ export function App() {
           onCopyLink={() => handleCopyMessageLink(messageInfoMessage)}
           onForward={() => startForwardSelection(messageInfoMessage)}
           onPreviewAttachment={() => handlePreviewAttachment(messageInfoMessage)}
+          onAddImageToEmoji={() => handleAddMessageImageToEmoji(messageInfoMessage)}
           onTranscribeAudio={() => handleTranscribeAudio(messageInfoMessage)}
-          onReact={(key) =>
+          onReact={(key, shortcode) =>
             client &&
-            runAction(() => sendReaction(client, messageInfoMessage.roomId, messageInfoMessage.id, key), '已更新回应')
+            runAction(
+              () => sendReaction(client, messageInfoMessage.roomId, messageInfoMessage.id, key, shortcode),
+              '已更新回应'
+            )
           }
           onRedact={() => handleRedactMessage(messageInfoMessage)}
         />
@@ -4825,6 +6710,7 @@ export function App() {
       {readReceiptMessage && (
         <ReadReceiptSheet
           message={readReceiptMessage}
+          inlineReadReceiptState={readReceiptInlineState}
           members={roomMembers}
           mediaAccessToken={session?.accessToken}
           onClose={() => setSheet(undefined)}
@@ -4838,6 +6724,12 @@ export function App() {
           items={roomMediaItems}
           mediaAccessToken={session?.accessToken}
           onSelect={setPreviewMedia}
+          onRequestNavigate={handleRequestPreviewNavigation}
+          onAddToEmoji={
+            previewMedia.kind === 'image' && previewMedia.mxcUrl
+              ? () => handleAddPreviewImageToEmoji(previewMedia)
+              : undefined
+          }
           onClose={() => setPreviewMedia(undefined)}
         />
       )}
@@ -4848,8 +6740,12 @@ export function App() {
 function LoadingScreen({ label }: { label: string }) {
   return (
     <main className="loading-screen">
-      <Sparkles className="pulse" size={34} />
-      <p>{label}</p>
+      <section className="loading-card">
+        <div className="loading-mark" aria-hidden="true">
+          <Sparkles size={26} />
+        </div>
+        <p>{label}</p>
+      </section>
     </main>
   );
 }
@@ -5058,7 +6954,7 @@ function RoomList({
               {favoriteRoomIds.includes(room.id) && <Star size={12} />}
               <span>
                 {roomDrafts[room.id]
-                  ? `草稿：{roomDrafts[room.id]}`
+                  ? `草稿：${roomDrafts[room.id]}`
                   : getReadableMessageBody(room.lastMessage)}
               </span>
             </span>
@@ -5127,6 +7023,14 @@ const getFavoriteMessageKindLabel = (message: ChatMessage): string => {
   return '附件';
 };
 
+const getFavoriteMessagePrimaryActionLabel = (message: ChatMessage): string => {
+  if (!message.attachment) return '复制收藏文字';
+  if (message.attachment.kind === 'image') return '打开收藏图片';
+  if (message.attachment.kind === 'video') return '打开收藏视频';
+  if (message.attachment.kind === 'audio') return '打开收藏音频';
+  return '打开收藏附件';
+};
+
 const matchesFavoriteDate = (timestamp: number, filter: FavoriteDateFilter): boolean => {
   if (filter === 'all') return true;
   if (!timestamp) return false;
@@ -5173,9 +7077,10 @@ function FavoriteAttachmentThumb({
   const previewSrc = attachment.authUrl ?? attachment.url ?? attachment.authDownloadUrl ?? attachment.downloadUrl;
   const fallbackSrc = attachment.url ?? attachment.downloadUrl;
   const label = getFavoriteMessageKindLabel(message);
+  const thumbClassName = `favorite-attachment-thumb favorite-attachment-thumb-${attachment.kind}`;
 
   return (
-    <button className="favorite-attachment-thumb" type="button" onClick={onPreview} aria-label={`预览${label}`}>
+    <button className={thumbClassName} type="button" onClick={onPreview} aria-label={`预览${label}`}>
       {attachment.kind === 'image' && previewSrc ? (
         <AuthenticatedImage
           src={previewSrc}
@@ -5186,23 +7091,26 @@ function FavoriteAttachmentThumb({
           alt={attachment.name ?? message.body}
         />
       ) : attachment.kind === 'video' && previewSrc ? (
-        <>
-          <CompactVideoPreview
-            previewSrc={previewSrc}
-            previewFallbackSrc={fallbackSrc}
-            accessToken={accessToken}
-            previewEncryptedFile={getPreviewEncryptedFile(attachment)}
-            previewMimeType={attachment.previewMimeType ?? attachment.mimeType}
-            src={attachment.authDownloadUrl ?? attachment.downloadUrl ?? attachment.authUrl ?? attachment.url}
-            fallbackSrc={attachment.downloadUrl ?? attachment.url}
-            encryptedFile={attachment.encryptedFile}
-            mimeType={attachment.mimeType}
-            label="视频封面暂不可预览"
-          />
-          <span>
-            <Play size={16} />
-          </span>
-        </>
+        <div className="favorite-attachment-thumb-media">
+          <div className="favorite-attachment-thumb-video-frame">
+            <CompactVideoPreview
+              className="favorite-attachment-thumb-video"
+              previewSrc={previewSrc}
+              previewFallbackSrc={fallbackSrc}
+              accessToken={accessToken}
+              previewEncryptedFile={getPreviewEncryptedFile(attachment)}
+              previewMimeType={attachment.previewMimeType ?? attachment.mimeType}
+              src={attachment.authDownloadUrl ?? attachment.downloadUrl ?? attachment.authUrl ?? attachment.url}
+              fallbackSrc={attachment.downloadUrl ?? attachment.url}
+              encryptedFile={attachment.encryptedFile}
+              mimeType={attachment.mimeType}
+              label="视频封面暂不可预览"
+            />
+            <span className="favorite-attachment-thumb-play">
+              <Play size={16} />
+            </span>
+          </div>
+        </div>
       ) : (
         <span>
           {attachment.kind === 'audio' ? <Volume2 size={18} /> : <FileUp size={18} />}
@@ -5220,7 +7128,7 @@ function FavoritesPanel({
   roomDrafts,
   mediaAccessToken,
   onOpenRoom,
-  onOpenMessage,
+  onCopyMessage,
   onPreviewAttachment,
   onToggleRoom,
   onToggleMessage,
@@ -5233,7 +7141,7 @@ function FavoritesPanel({
   roomDrafts: Record<string, string>;
   mediaAccessToken?: string;
   onOpenRoom: (roomId: string) => void;
-  onOpenMessage: (roomId: string, eventId: string) => void;
+  onCopyMessage: (message: ChatMessage) => void | Promise<void>;
   onPreviewAttachment: (message: ChatMessage) => void;
   onToggleRoom: (roomId: string) => void;
   onToggleMessage: (message: ChatMessage) => void;
@@ -5284,6 +7192,14 @@ function FavoritesPanel({
   const removeSelected = () => {
     selectedMessages.forEach(({ message }) => onToggleMessage(message));
     clearSelected();
+  };
+
+  const activateFavoriteMessage = (message: ChatMessage) => {
+    if (message.attachment) {
+      onPreviewAttachment(message);
+      return;
+    }
+    void onCopyMessage(message);
   };
 
   return (
@@ -5433,11 +7349,13 @@ function FavoritesPanel({
                   const displayRoomName = message.favoriteSource?.roomName ?? room.name;
                   const displaySender = message.favoriteSource?.senderName ?? message.senderName ?? message.sender ?? '未知成员';
                   const displayTimestamp = message.favoriteSource?.sourceTimestamp ?? message.timestamp;
-                  const openRoomId = message.favoriteSource?.roomId ?? room.id;
-                  const openEventId = message.favoriteSource?.eventId ?? message.id;
 
                   return (
-                    <article className="favorite-message-card" key={`${message.roomId}-${message.id}`}>
+                    <article
+                      className="favorite-message-card"
+                      data-kind={getFavoriteMessageKind(message)}
+                      key={`${message.roomId}-${message.id}`}
+                    >
                       {localFavorite ? (
                         <button
                           className={selectedIds.includes(message.id) ? 'favorite-check active' : 'favorite-check'}
@@ -5457,7 +7375,12 @@ function FavoritesPanel({
                         accessToken={mediaAccessToken}
                         onPreview={() => onPreviewAttachment(message)}
                       />
-                      <button className="favorite-message-main" type="button" onClick={() => onOpenMessage(openRoomId, openEventId)}>
+                      <button
+                        className="favorite-message-main"
+                        type="button"
+                        onClick={() => activateFavoriteMessage(message)}
+                        aria-label={getFavoriteMessagePrimaryActionLabel(message)}
+                      >
                         <span>
                           <strong>{displayRoomName}</strong>
                           <small>{displaySender} · {formatFullTime(displayTimestamp)}</small>
@@ -5589,7 +7512,7 @@ function EmojiTray({
   customItems: CustomEmojiItem[];
   accessToken?: string;
   onPick: (emoji: string) => void;
-  onPickCustom: (item: CustomEmojiItem) => void;
+  onPickCustom: (item: CustomEmojiItem, sourceTab?: EmojiTrayTab) => void;
 }) {
   const [query, setQuery] = useState('');
   const filteredCustomItems = useMemo(() => {
@@ -5640,7 +7563,16 @@ function EmojiTray({
                       key={item.id}
                       type="button"
                       title={`${item.packName} / ${item.shortcode}`}
-                      onClick={() => onPickCustom(item)}
+                      onClick={() =>
+                        onPickCustom(
+                          item,
+                          item.usage.includes('emoticon')
+                            ? 'emoji'
+                            : item.usage.includes('sticker')
+                              ? 'sticker'
+                              : 'emoji'
+                        )
+                      }
                     >
                       <AuthenticatedImage
                         src={item.authUrl ?? item.url}
@@ -5681,18 +7613,27 @@ function EnhancedEmojiTray({
   accessToken,
   onPick,
   onPickCustom,
+  allowStickers = true,
 }: {
   emojis: string[];
   customItems: CustomEmojiItem[];
   accessToken?: string;
   onPick: (emoji: string) => void;
-  onPickCustom: (item: CustomEmojiItem) => void;
+  onPickCustom: (item: CustomEmojiItem, sourceTab?: EmojiTrayTab) => void;
+  allowStickers?: boolean;
 }) {
   const [query, setQuery] = useState('');
   const [activeTab, setActiveTab] = useState<EmojiTrayTab>('emoji');
   const [activeEmojiCollectionId, setActiveEmojiCollectionId] = useState('recent');
   const [activeStickerCollectionId, setActiveStickerCollectionId] = useState<string>();
   const collectionStripRef = useRef<HTMLDivElement | null>(null);
+  const collectionDragStateRef = useRef<{
+    pointerId: number;
+    startX: number;
+    scrollLeft: number;
+    dragging: boolean;
+  }>();
+  const suppressCollectionClickRef = useRef(false);
   const [collectionStripState, setCollectionStripState] = useState({ canScrollLeft: false, canScrollRight: false });
 
   const filteredCustomItems = useMemo(() => {
@@ -5746,6 +7687,12 @@ function EnhancedEmojiTray({
   );
 
   useEffect(() => {
+    if (!allowStickers && activeTab === 'sticker') {
+      setActiveTab('emoji');
+    }
+  }, [activeTab, allowStickers]);
+
+  useEffect(() => {
     const availableIds = new Set(emojiCollections.map((collection) => collection.id));
     if (!availableIds.has(activeEmojiCollectionId)) {
       setActiveEmojiCollectionId(emojiCollections[0]?.id ?? 'recent');
@@ -5759,9 +7706,10 @@ function EnhancedEmojiTray({
     }
   }, [activeStickerCollectionId, stickerCollections]);
 
-  const activeCollections = activeTab === 'emoji' ? emojiCollections : stickerCollections;
+  const effectiveActiveTab = allowStickers ? activeTab : 'emoji';
+  const activeCollections = effectiveActiveTab === 'emoji' ? emojiCollections : stickerCollections;
   const activeCollectionId =
-    activeTab === 'emoji' ? activeEmojiCollectionId : activeStickerCollectionId;
+    effectiveActiveTab === 'emoji' ? activeEmojiCollectionId : activeStickerCollectionId;
   const activeCollection = activeCollections.find((collection) => collection.id === activeCollectionId);
   const activeCount = activeCollection?.items.length ?? 0;
 
@@ -5785,7 +7733,7 @@ function EnhancedEmojiTray({
   }, [activeCollections, activeCollectionId, activeTab, query, updateCollectionStripState]);
 
   const handlePickCollection = (collectionId: string) => {
-    if (activeTab === 'emoji') {
+    if (effectiveActiveTab === 'emoji') {
       setActiveEmojiCollectionId(collectionId);
       return;
     }
@@ -5813,6 +7761,62 @@ function EnhancedEmojiTray({
     updateCollectionStripState();
   };
 
+  const resetCollectionDrag = () => {
+    collectionDragStateRef.current = undefined;
+  };
+
+  const handleCollectionStripPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const strip = collectionStripRef.current;
+    if (!strip || event.button !== 0) return;
+
+    collectionDragStateRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      scrollLeft: strip.scrollLeft,
+      dragging: false,
+    };
+  };
+
+  const handleCollectionStripPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const strip = collectionStripRef.current;
+    const dragState = collectionDragStateRef.current;
+    if (!strip || !dragState || dragState.pointerId !== event.pointerId) return;
+
+    const deltaX = event.clientX - dragState.startX;
+    if (!dragState.dragging && Math.abs(deltaX) > 6) {
+      dragState.dragging = true;
+      suppressCollectionClickRef.current = true;
+    }
+    if (!dragState.dragging) return;
+
+    event.preventDefault();
+    strip.scrollLeft = dragState.scrollLeft - deltaX;
+    updateCollectionStripState();
+  };
+
+  const handleCollectionStripPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const dragState = collectionDragStateRef.current;
+    if (dragState && dragState.pointerId === event.pointerId && dragState.dragging) {
+      window.setTimeout(() => {
+        suppressCollectionClickRef.current = false;
+      }, 0);
+    }
+    resetCollectionDrag();
+  };
+
+  const handleCollectionButtonClick = (
+    event: ReactMouseEvent<HTMLButtonElement>,
+    collectionId: string
+  ) => {
+    if (suppressCollectionClickRef.current) {
+      event.preventDefault();
+      suppressCollectionClickRef.current = false;
+      return;
+    }
+
+    handlePickCollection(collectionId);
+  };
+
   const renderCollectionItems = () => {
     if (!activeCollection) {
       return <small className="emoji-empty">还没有同步到可用内容</small>;
@@ -5831,13 +7835,17 @@ function EnhancedEmojiTray({
     }
 
     return (
-      <div className={activeTab === 'sticker' ? 'sticker-grid sticker-panel-grid' : 'emoji-pack-grid'}>
+      <div
+        className={
+          effectiveActiveTab === 'sticker' ? 'sticker-grid sticker-panel-grid' : 'emoji-pack-grid'
+        }
+      >
         {activeCollection.items.map((item) => (
           <button
             key={item.id}
             type="button"
             title={`${item.packName} / ${item.shortcode}`}
-            onClick={() => onPickCustom(item)}
+            onClick={() => onPickCustom(item, effectiveActiveTab)}
           >
             <AuthenticatedImage
               src={item.authUrl ?? item.url}
@@ -5862,18 +7870,20 @@ function EnhancedEmojiTray({
         <div className="emoji-tray-tabs">
           <button
             type="button"
-            className={activeTab === 'emoji' ? 'active' : ''}
+            className={effectiveActiveTab === 'emoji' ? 'active' : ''}
             onClick={() => setActiveTab('emoji')}
           >
             表情
           </button>
-          <button
-            type="button"
-            className={activeTab === 'sticker' ? 'active' : ''}
-            onClick={() => setActiveTab('sticker')}
-          >
-            贴纸
-          </button>
+          {allowStickers && (
+            <button
+              type="button"
+              className={effectiveActiveTab === 'sticker' ? 'active' : ''}
+              onClick={() => setActiveTab('sticker')}
+            >
+              贴纸
+            </button>
+          )}
         </div>
         <small>{activeCount}</small>
       </div>
@@ -5883,7 +7893,7 @@ function EnhancedEmojiTray({
           <Search size={14} />
           <input
             value={query}
-            placeholder={activeTab === 'emoji' ? '搜索表情包或短码' : '搜索贴纸包或短码'}
+            placeholder={effectiveActiveTab === 'emoji' ? '搜索表情包或短码' : '搜索贴纸包或短码'}
             onChange={(evt) => setQuery(evt.target.value)}
           />
         </label>
@@ -5903,9 +7913,14 @@ function EnhancedEmojiTray({
           ref={collectionStripRef}
           className="emoji-collection-strip"
           role="tablist"
-          aria-label={activeTab === 'emoji' ? '表情分类' : '贴纸分类'}
+          aria-label={effectiveActiveTab === 'emoji' ? '表情分类' : '贴纸分类'}
           onScroll={updateCollectionStripState}
           onWheel={handleCollectionStripWheel}
+          onPointerDown={handleCollectionStripPointerDown}
+          onPointerMove={handleCollectionStripPointerMove}
+          onPointerUp={handleCollectionStripPointerUp}
+          onPointerCancel={resetCollectionDrag}
+          onPointerLeave={handleCollectionStripPointerUp}
         >
           {activeCollections.map((collection) => {
             const active = collection.id === activeCollectionId;
@@ -5916,7 +7931,7 @@ function EnhancedEmojiTray({
                 role="tab"
                 aria-selected={active}
                 className={active ? 'emoji-collection-button active' : 'emoji-collection-button'}
-                onClick={() => handlePickCollection(collection.id)}
+                onClick={(event) => handleCollectionButtonClick(event, collection.id)}
               >
                 <span className="emoji-collection-thumb-shell" aria-hidden="true">
                   {collection.kind === 'pack' && collection.cover ? (
@@ -5953,7 +7968,7 @@ function EnhancedEmojiTray({
 
       <div className="emoji-tray-section">
         <span>
-          {activeCollection?.name ?? (activeTab === 'emoji' ? '表情' : '贴纸')}
+          {activeCollection?.name ?? (effectiveActiveTab === 'emoji' ? '表情' : '贴纸')}
           {activeCount > 0 && <small>{activeCount}</small>}
         </span>
         {renderCollectionItems()}
@@ -6632,6 +8647,14 @@ function AudioPlayer({
     playbackRateOptions.find((option) => option.value === playbackRate)?.label ?? `${playbackRate}x`;
   const selectedVolumeLabel =
     volumeOptions.find((option) => option.value === volumeValue)?.label ?? `${Math.round(volumeValue * 100)}%`;
+  const transcriptionButtonLabel =
+    transcription?.status === 'loading'
+      ? '转写中'
+      : transcription?.status === 'success'
+        ? '重新转写'
+        : transcription?.status === 'error'
+          ? '重试转写'
+          : '转文字';
 
   useEffect(() => {
     setPlaying(false);
@@ -6718,42 +8741,60 @@ function AudioPlayer({
             onChange={handleSeek}
             aria-label="音频进度"
           />
-          <span>
-            {formatDuration(currentTime)} / {formatDuration(duration || (durationMs ?? 0) / 1000)}
+          <span className="audio-progress-time">
+            <span>{formatDuration(currentTime)}</span>
+            <span aria-hidden="true">/</span>
+            <span>{formatDuration(duration || (durationMs ?? 0) / 1000)}</span>
           </span>
         </div>
-        <button
-          className="audio-inline-trigger"
-          type="button"
-          aria-label="播放速度"
-          aria-expanded={pickerOpen === 'speed'}
-          onClick={() => setPickerOpen((current) => (current === 'speed' ? undefined : 'speed'))}
-        >
-          <RotateCw size={14} />
-          <span className="audio-inline-value">{selectedPlaybackRateLabel}</span>
-          <ChevronDown size={14} className={pickerOpen === 'speed' ? 'audio-inline-chevron open' : 'audio-inline-chevron'} />
-        </button>
-        <button
-          className="audio-inline-trigger"
-          type="button"
-          aria-label="音量"
-          aria-expanded={pickerOpen === 'volume'}
-          onClick={() => setPickerOpen((current) => (current === 'volume' ? undefined : 'volume'))}
-        >
-          {volumeValue === 0 ? <VolumeX size={14} /> : <Volume2 size={14} />}
-          <span className="audio-inline-value">{selectedVolumeLabel}</span>
-          <ChevronDown size={14} className={pickerOpen === 'volume' ? 'audio-inline-chevron open' : 'audio-inline-chevron'} />
-        </button>
+        <div className="audio-inline-controls">
+          <button
+            className="audio-inline-trigger"
+            type="button"
+            aria-label="播放速度"
+            aria-expanded={pickerOpen === 'speed'}
+            onClick={() => setPickerOpen((current) => (current === 'speed' ? undefined : 'speed'))}
+          >
+            <RotateCw size={14} />
+            <span className="audio-inline-value">{selectedPlaybackRateLabel}</span>
+            <ChevronDown
+              size={14}
+              className={pickerOpen === 'speed' ? 'audio-inline-chevron open' : 'audio-inline-chevron'}
+            />
+          </button>
+          <button
+            className="audio-inline-trigger"
+            type="button"
+            aria-label="音量"
+            aria-expanded={pickerOpen === 'volume'}
+            onClick={() => setPickerOpen((current) => (current === 'volume' ? undefined : 'volume'))}
+          >
+            {volumeValue === 0 ? <VolumeX size={14} /> : <Volume2 size={14} />}
+            <span className="audio-inline-value">{selectedVolumeLabel}</span>
+            <ChevronDown
+              size={14}
+              className={pickerOpen === 'volume' ? 'audio-inline-chevron open' : 'audio-inline-chevron'}
+            />
+          </button>
+        </div>
       </div>
       {audioError && <em className="audio-error">{audioError}</em>}
       {onTranscribe && (
-        <button className="audio-transcribe" type="button" onClick={onTranscribe}>
+        <button
+          className="audio-transcribe"
+          type="button"
+          onClick={onTranscribe}
+          disabled={transcription?.status === 'loading'}
+        >
           <Volume2 size={15} />
-          {transcription?.status === 'loading' ? '转写中' : transcription?.status === 'success' ? '已转写' : '转文字'}
+          {transcriptionButtonLabel}
         </button>
       )}
       {transcription && (
         <div className={transcription.status === 'error' ? 'audio-transcript error' : 'audio-transcript'}>
+          {transcription.detail && transcription.status !== 'loading' && (
+            <small className="audio-transcript-detail">{transcription.detail}</small>
+          )}
           {transcription.status === 'loading'
             ? `${transcription.detail ?? '正在读取并识别这条语音...'}${transcription.text ? ` ${transcription.text}` : ''}`
             : transcription.status === 'success'
@@ -6865,6 +8906,7 @@ function SecuritySheet({
           <span>
             <strong>无法解密时先恢复密钥</strong>
             <small>如果旧设备或 Element 已开启密钥备份，可以从安全存储或恢复密钥导入历史会话密钥</small>
+            <small>恢复历史密钥不等于设备已验证；“未验证”仍需要在另一台已登录设备上完成设备验证。</small>
           </span>
         </div>
 
@@ -7818,6 +9860,8 @@ function ForwardSheet({
 
 const messageGestureStopSelector = [
   '.message-actions',
+  '.reaction-picker-toggle',
+  '.reaction-picker-panel',
   '.message-select-toggle',
   '.avatar-button',
   '.message-sender-button',
@@ -7833,6 +9877,12 @@ const messageGestureStopSelector = [
 
 const shouldIgnoreMessageGesture = (target: EventTarget | null): boolean =>
   target instanceof HTMLElement && Boolean(target.closest(messageGestureStopSelector));
+
+type MessageSwipeAction = 'reply' | 'forward';
+
+const MESSAGE_SWIPE_TRIGGER_DISTANCE = 72;
+const MESSAGE_SWIPE_READY_DISTANCE = 56;
+const MESSAGE_SWIPE_MAX_OFFSET = 84;
 
 function MessageRichText({
   body,
@@ -7873,7 +9923,197 @@ function MessageRichText({
   return <div className={className} onClick={handleClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
+function MessageReactionKey({
+  reactionKey,
+  shortcode,
+  client,
+  accessToken,
+}: {
+  reactionKey: string;
+  shortcode?: string;
+  client?: MatrixClient;
+  accessToken?: string;
+}) {
+  const mediaSource = useMemo(() => {
+    if (!client || !reactionKey.startsWith('mxc://')) return undefined;
+
+    const authThumb = mxcToHttp(client, reactionKey, 48, 48, true);
+    const publicThumb = mxcToHttp(client, reactionKey, 48, 48);
+    const authFull = mxcToHttp(client, reactionKey, undefined, undefined, true);
+    const publicFull = mxcToHttp(client, reactionKey);
+
+    return {
+      src: authThumb ?? authFull ?? publicThumb ?? publicFull,
+      fallbackSrc: publicThumb ?? publicFull ?? authThumb ?? authFull,
+      retrySrcs: [
+        authFull,
+        publicFull,
+        ...buildMatrixMediaRetrySrcs(authThumb, publicThumb, authFull, publicFull),
+      ],
+    };
+  }, [client, reactionKey]);
+
+  if (mediaSource?.src || mediaSource?.fallbackSrc) {
+    return (
+      <AuthenticatedImage
+        className="reaction-key-image"
+        src={mediaSource.src}
+        fallbackSrc={mediaSource.fallbackSrc}
+        accessToken={accessToken}
+        retrySrcs={mediaSource.retrySrcs}
+        alt={shortcode ?? reactionKey}
+      />
+    );
+  }
+
+  if (isHttpLikeUrl(reactionKey)) {
+    return (
+      <img
+        className="reaction-key-image"
+        src={reactionKey}
+        alt={shortcode ?? reactionKey}
+        loading="lazy"
+        decoding="async"
+      />
+    );
+  }
+
+  return <span className="reaction-key-text">{reactionKey}</span>;
+}
+
+const formatReactionParticipants = (
+  reaction: {
+    key: string;
+    count: number;
+    reactors: Array<{ name: string }>;
+  }
+): string => {
+  if (reaction.reactors.length === 0) {
+    return `${reaction.count} 人`;
+  }
+
+  const names = reaction.reactors.map((reactor) => reactor.name).filter(Boolean);
+  if (names.length === 0) return `${reaction.count} 人`;
+  if (names.length <= 3) return names.join('、');
+  return `${names.slice(0, 3).join('、')} 等 ${reaction.count} 人`;
+};
+
+function MessageReactionButton({
+  reaction,
+  client,
+  accessToken,
+  active = false,
+  onClick,
+}: {
+  reaction: {
+    key: string;
+    count: number;
+    shortcode?: string;
+    reactors: Array<{ name: string }>;
+  };
+  client?: MatrixClient;
+  accessToken?: string;
+  active?: boolean;
+  onClick: () => void;
+}) {
+  const participantLabel = formatReactionParticipants(reaction);
+  const actionLabel =
+    reaction.shortcode && reaction.shortcode !== reaction.key
+      ? `${reaction.key}（:${reaction.shortcode}:）`
+      : reaction.key;
+
+  return (
+    <button
+      type="button"
+      className={active ? 'active' : ''}
+      onClick={onClick}
+      title={participantLabel}
+      aria-label={`${actionLabel}，${participantLabel}`}
+    >
+      <MessageReactionKey
+        reactionKey={reaction.key}
+        shortcode={reaction.shortcode}
+        client={client}
+        accessToken={accessToken}
+      />
+      <span className="reaction-count">{reaction.count}</span>
+    </button>
+  );
+}
+
+function MessageReactionPicker({
+  customItems,
+  accessToken,
+  onReact,
+  className,
+  panelClassName,
+}: {
+  customItems: CustomEmojiItem[];
+  accessToken?: string;
+  onReact: (key: string, shortcode?: string) => void;
+  className?: string;
+  panelClassName?: string;
+}) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const pickerRef = useRef<HTMLDivElement | null>(null);
+  const reactionEmojiItems = useMemo(
+    () => customItems.filter((item) => item.usage.includes('emoticon')),
+    [customItems]
+  );
+
+  useEffect(() => {
+    if (!pickerOpen) return undefined;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (pickerRef.current?.contains(event.target as Node)) return;
+      setPickerOpen(false);
+    };
+
+    window.addEventListener('pointerdown', handlePointerDown, true);
+    return () => window.removeEventListener('pointerdown', handlePointerDown, true);
+  }, [pickerOpen]);
+
+  const handleReact = (key: string, shortcode?: string) => {
+    onReact(key, shortcode);
+    setPickerOpen(false);
+  };
+
+  return (
+    <div ref={pickerRef} className={className ?? 'message-reaction-picker'}>
+      <div className="quick-reactions" aria-label="快速回应">
+        <button
+          type="button"
+          className={pickerOpen ? 'reaction-picker-toggle active' : 'reaction-picker-toggle'}
+          aria-label={pickerOpen ? '收起完整表情选择' : '打开完整表情选择'}
+          aria-expanded={pickerOpen}
+          onClick={() => setPickerOpen((open) => !open)}
+        >
+          <SmilePlus size={14} />
+        </button>
+        {quickReactionOptions.map((reaction) => (
+          <button key={reaction} type="button" onClick={() => handleReact(reaction)}>
+            {reaction}
+          </button>
+        ))}
+      </div>
+      {pickerOpen && (
+        <div className={panelClassName ?? 'reaction-picker-panel'}>
+          <EnhancedEmojiTray
+            emojis={composerEmojiOptions}
+            customItems={reactionEmojiItems}
+            accessToken={accessToken}
+            onPick={(emoji) => handleReact(emoji)}
+            onPickCustom={(item) => handleReact(item.mxcUrl, item.shortcode)}
+            allowStickers={false}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MessageBubble({
+  client,
   message,
   favorite,
   highlighted,
@@ -7881,6 +10121,7 @@ function MessageBubble({
   selected,
   forwardable,
   mediaAccessToken,
+  customEmojiItems,
   members,
   currentUserProfile,
   readReceiptAvatarCount,
@@ -7904,6 +10145,7 @@ function MessageBubble({
   onTogglePin,
   onForward,
   onPreviewAttachment,
+  onAddImageToEmoji,
   onTranscribeAudio,
   onOpenUserProfile,
   onOpenMentionMember,
@@ -7911,6 +10153,7 @@ function MessageBubble({
   onOpenReadReceipts,
   onReact,
 }: {
+  client?: MatrixClient;
   message: ChatMessage;
   favorite: boolean;
   highlighted: boolean;
@@ -7918,6 +10161,7 @@ function MessageBubble({
   selected: boolean;
   forwardable: boolean;
   mediaAccessToken?: string;
+  customEmojiItems: CustomEmojiItem[];
   members: RoomMemberSummary[];
   currentUserProfile?: OwnProfile;
   readReceiptAvatarCount: number;
@@ -7941,28 +10185,56 @@ function MessageBubble({
   onTogglePin: () => void;
   onForward: () => void;
   onPreviewAttachment: () => void;
+  onAddImageToEmoji?: () => void;
   onTranscribeAudio: () => void;
   onOpenUserProfile?: () => void;
   onOpenMentionMember?: (member: RoomMemberSummary) => void;
   onMentionSender?: () => void;
   onOpenReadReceipts: () => void;
-  onReact: (key: string) => void;
+  onReact: (key: string, shortcode?: string) => void;
 }) {
   const [actionsOpen, setActionsOpen] = useState(false);
   const [swipeOffset, setSwipeOffset] = useState(0);
   const articleRef = useRef<HTMLElement>(null);
+  const actionsRef = useRef<HTMLDivElement | null>(null);
+  const actionsScrollAnchorRef = useRef<{
+    timeline: HTMLElement;
+    articleTop: number;
+  } | null>(null);
   const gestureStateRef = useRef<{
     pointerId: number;
     startX: number;
     startY: number;
+    swipeAction?: MessageSwipeAction;
+    swipeEngaged: boolean;
     swipeReady: boolean;
     longPressTriggered: boolean;
   }>();
   const longPressTimerRef = useRef<number>();
   const skipNextClickRef = useRef(false);
+  const updateActionsOpen = useCallback((nextState: boolean | ((open: boolean) => boolean)) => {
+    const article = articleRef.current;
+    const timeline = article?.closest<HTMLElement>('.timeline');
+
+    actionsScrollAnchorRef.current =
+      article && timeline
+        ? {
+            timeline,
+            articleTop: article.getBoundingClientRect().top,
+          }
+        : null;
+
+    setActionsOpen(nextState);
+  }, []);
+  const closeActionsOpen = useCallback(() => {
+    updateActionsOpen(false);
+  }, [updateActionsOpen]);
+  const toggleActionsOpen = useCallback(() => {
+    updateActionsOpen((open) => !open);
+  }, [updateActionsOpen]);
   const runAndClose = (action: () => void) => {
     action();
-    setActionsOpen(false);
+    closeActionsOpen();
   };
   const clearLongPressTimer = () => {
     if (longPressTimerRef.current !== undefined) {
@@ -7976,6 +10248,7 @@ function MessageBubble({
     setSwipeOffset(0);
   };
   const attachment = message.attachment;
+  const audioAttachment = attachment?.kind === 'audio';
   const attachmentName = attachment?.name ?? message.body;
   const showBody = Boolean(
     message.body && (!attachment || message.body !== attachmentName)
@@ -8013,6 +10286,14 @@ function MessageBubble({
     message.mine && (receiptAvatarEntries.length > 0 || readReceiptOverflow > 0)
   );
   const showSenderLine = !message.mine && members.length > 2;
+  const messageTimeLabel = formatMessageTime(message.timestamp);
+  const messageFooterLabel = [
+    messageTimeLabel,
+    message.edited ? '已编辑' : undefined,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+  const showMessageFooter = Boolean(messageFooterLabel || (!editing && showReadReceiptIndicator));
   const messageDetailLabel = [
     formatFullTime(message.timestamp),
     message.edited ? '已编辑' : undefined,
@@ -8021,17 +10302,23 @@ function MessageBubble({
   ]
     .filter(Boolean)
     .join(' · ');
+  const swipeAction: MessageSwipeAction | undefined =
+    swipeOffset === 0 ? undefined : swipeOffset > 0 ? 'forward' : 'reply';
+  const swipeReady = Boolean(swipeAction && Math.abs(swipeOffset) >= MESSAGE_SWIPE_READY_DISTANCE);
+  const bubbleWrapStyle = swipeOffset
+    ? ({ transform: `translateX(${swipeOffset}px)` } as CSSProperties)
+    : undefined;
   const inlineEditTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   useEffect(() => {
     if (selectionMode) {
-      setActionsOpen(false);
+      closeActionsOpen();
     }
-  }, [selectionMode]);
+  }, [closeActionsOpen, selectionMode]);
 
   useEffect(() => {
     if (!editing) return;
-    setActionsOpen(false);
+    closeActionsOpen();
     window.requestAnimationFrame(() => {
       const textarea = inlineEditTextareaRef.current;
       if (!textarea) return;
@@ -8039,7 +10326,7 @@ function MessageBubble({
       const length = textarea.value.length;
       textarea.setSelectionRange(length, length);
     });
-  }, [editing]);
+  }, [closeActionsOpen, editing]);
 
   useLayoutEffect(() => {
     const textarea = inlineEditTextareaRef.current;
@@ -8048,17 +10335,85 @@ function MessageBubble({
     textarea.style.height = `${Math.max(textarea.scrollHeight, 148)}px`;
   }, [editing, editingDraft]);
 
+  useLayoutEffect(() => {
+    const anchor = actionsScrollAnchorRef.current;
+    const article = articleRef.current;
+    if (!anchor || !article) return;
+
+    const topDelta = article.getBoundingClientRect().top - anchor.articleTop;
+    if (Math.abs(topDelta) > 0.5) {
+      anchor.timeline.scrollTop += topDelta;
+    }
+
+    actionsScrollAnchorRef.current = null;
+  }, [actionsOpen]);
+
+  useLayoutEffect(() => {
+    const article = articleRef.current;
+    if (!article) return;
+
+    if (!actionsOpen || editing) {
+      article.style.removeProperty('--message-actions-height');
+      return;
+    }
+
+    const actions = actionsRef.current;
+    if (!actions) return;
+    let compensationFrame: number | undefined;
+
+    const updateActionsHeight = () => {
+      const timeline = article.closest<HTMLElement>('.timeline');
+      const previousTop = article.getBoundingClientRect().top;
+
+      article.style.setProperty(
+        '--message-actions-height',
+        `${Math.ceil(actions.getBoundingClientRect().height)}px`
+      );
+
+      if (!timeline) return;
+
+      if (compensationFrame !== undefined) {
+        window.cancelAnimationFrame(compensationFrame);
+      }
+
+      compensationFrame = window.requestAnimationFrame(() => {
+        compensationFrame = undefined;
+        const topDelta = article.getBoundingClientRect().top - previousTop;
+        if (Math.abs(topDelta) > 0.5) {
+          timeline.scrollTop += topDelta;
+        }
+      });
+    };
+
+    updateActionsHeight();
+
+    if (typeof ResizeObserver === 'undefined') {
+      return;
+    }
+
+    const observer = new ResizeObserver(() => {
+      updateActionsHeight();
+    });
+    observer.observe(actions);
+    return () => {
+      observer.disconnect();
+      if (compensationFrame !== undefined) {
+        window.cancelAnimationFrame(compensationFrame);
+      }
+    };
+  }, [actionsOpen, editing]);
+
   useEffect(() => {
     if (!actionsOpen) return;
 
     const handlePointerDown = (event: PointerEvent) => {
       if (articleRef.current?.contains(event.target as Node)) return;
-      setActionsOpen(false);
+      closeActionsOpen();
     };
 
     window.addEventListener('pointerdown', handlePointerDown);
     return () => window.removeEventListener('pointerdown', handlePointerDown);
-  }, [actionsOpen]);
+  }, [actionsOpen, closeActionsOpen]);
 
   useEffect(() => () => clearLongPressTimer(), []);
 
@@ -8069,6 +10424,7 @@ function MessageBubble({
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
+      swipeEngaged: false,
       swipeReady: false,
       longPressTriggered: false,
     };
@@ -8081,7 +10437,7 @@ function MessageBubble({
       gesture.longPressTriggered = true;
       skipNextClickRef.current = true;
       setSwipeOffset(0);
-      setActionsOpen(false);
+      closeActionsOpen();
       void Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
       onForward();
     }, 420);
@@ -8093,20 +10449,31 @@ function MessageBubble({
 
     const deltaX = event.clientX - gesture.startX;
     const deltaY = event.clientY - gesture.startY;
+    const absDeltaX = Math.abs(deltaX);
+    const absDeltaY = Math.abs(deltaY);
 
-    if (Math.abs(deltaY) > 18 && Math.abs(deltaY) >= Math.abs(deltaX)) {
+    if (absDeltaY > 18 && absDeltaY >= absDeltaX) {
       resetGesture();
       return;
     }
 
-    if (!forwardable || deltaX <= 0 || Math.abs(deltaX) < Math.abs(deltaY)) {
-      if (deltaX < -10) resetGesture();
+    if (absDeltaX < 10 || absDeltaX < absDeltaY) {
       return;
     }
 
     clearLongPressTimer();
-    gesture.swipeReady = deltaX > 70;
-    setSwipeOffset(Math.max(0, Math.min(deltaX, 78)));
+    gesture.swipeEngaged = true;
+
+    if (deltaX > 0 && !forwardable) {
+      gesture.swipeAction = undefined;
+      gesture.swipeReady = false;
+      setSwipeOffset(0);
+      return;
+    }
+
+    gesture.swipeAction = deltaX > 0 ? 'forward' : 'reply';
+    gesture.swipeReady = absDeltaX >= MESSAGE_SWIPE_TRIGGER_DISTANCE;
+    setSwipeOffset(Math.max(-MESSAGE_SWIPE_MAX_OFFSET, Math.min(deltaX, MESSAGE_SWIPE_MAX_OFFSET)));
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLElement>) => {
@@ -8116,11 +10483,18 @@ function MessageBubble({
       return;
     }
 
-    if (gesture.swipeReady && forwardable) {
+    if (gesture.swipeEngaged) {
       skipNextClickRef.current = true;
-      setActionsOpen(false);
+    }
+
+    if (gesture.swipeReady && gesture.swipeAction) {
+      closeActionsOpen();
       void Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
-      onForward();
+      if (gesture.swipeAction === 'reply') {
+        onReply();
+      } else if (forwardable) {
+        onForward();
+      }
     }
 
     resetGesture();
@@ -8142,7 +10516,7 @@ function MessageBubble({
   const handleContextMenu = (event: ReactMouseEvent<HTMLElement>) => {
     if (selectionMode || shouldIgnoreMessageGesture(event.target)) return;
     event.preventDefault();
-    setActionsOpen((open) => !open);
+    toggleActionsOpen();
   };
 
   const handleInlineEditorKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -8171,7 +10545,8 @@ function MessageBubble({
       ref={articleRef}
       className={`${message.mine ? 'message mine' : 'message'}${showSenderLine ? ' with-sender-line' : ''}${highlighted ? ' highlighted' : ''}${actionsOpen ? ' actions-open' : ''}${selectionMode ? ' selecting' : ''}${selected ? ' selected' : ''}${!forwardable ? ' not-forwardable' : ''}${editing ? ' editing' : ''}`}
       data-message-id={message.id}
-      data-swipe-ready={swipeOffset > 56}
+      data-swipe-action={swipeAction}
+      data-swipe-ready={swipeReady}
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
@@ -8180,7 +10555,6 @@ function MessageBubble({
       onClick={handleMessageClick}
       onContextMenu={handleContextMenu}
       title={messageDetailLabel}
-      style={swipeOffset > 0 ? { transform: `translateX(${swipeOffset}px)` } : undefined}
     >
       {selectionMode && (
         <button
@@ -8205,162 +10579,206 @@ function MessageBubble({
           small
         />
       )}
-      <div className="bubble-wrap">
-        {showSenderLine && (
-          <div className="message-meta">
-            {onOpenUserProfile && !selectionMode ? (
-              <button className="message-sender-button" type="button" onClick={onOpenUserProfile}>
-                {message.senderName ?? message.sender}
-              </button>
-            ) : (
-              <strong>{message.senderName ?? message.sender}</strong>
-            )}
-          </div>
-        )}
-        <div className={mediaOnlyBubble ? 'bubble bubble-media-only' : 'bubble'}>
-          {message.replyTo && (
-            <button className="reply-preview" onClick={() => onOpenReply(message.replyTo!.eventId)}>
-              <strong>{message.replyTo.senderName ?? '回复'}</strong>
-              <span>{getReadableMessageBody(message.replyTo.body)}</span>
-            </button>
-          )}
-          {attachment?.kind === 'image' && (attachmentPreviewSrc || attachmentFullSrc) && (
-            <button
-              className={stickerLikeImage ? 'message-media-button sticker' : 'message-media-button'}
-              type="button"
-              onClick={selectionMode ? onToggleSelection : onPreviewAttachment}
-              aria-label="预览图片"
-            >
-              <ProgressiveImagePreview
-                className={stickerLikeImage ? 'message-image sticker' : 'message-image'}
-                previewSrc={attachmentPreviewSrc}
-                previewFallbackSrc={attachmentPreviewFallbackSrc}
-                accessToken={mediaAccessToken}
-                previewEncryptedFile={attachmentPreviewEncryptedFile}
-                previewMimeType={attachment.previewMimeType ?? attachment.mimeType}
-                src={attachmentFullSrc}
-                fallbackSrc={attachmentFullFallbackSrc}
-                encryptedFile={attachment.encryptedFile}
-                mimeType={attachment.mimeType}
-                alt={attachmentName}
-                previewOnly
-              />
-            </button>
-          )}
-          {attachment?.kind === 'video' && attachmentPreviewSrc && (
-            <button
-              className="message-media-button"
-              type="button"
-              onClick={selectionMode ? onToggleSelection : onPreviewAttachment}
-              aria-label="预览视频"
-            >
-              <CompactVideoPreview
-                className="message-image"
-                previewSrc={attachmentPreviewSrc}
-                previewFallbackSrc={attachmentPreviewFallbackSrc}
-                accessToken={mediaAccessToken}
-                previewEncryptedFile={getPreviewEncryptedFile(attachment)}
-                previewMimeType={attachment.previewMimeType ?? attachment.mimeType}
-                src={attachmentFullSrc}
-                fallbackSrc={attachmentFullFallbackSrc}
-                encryptedFile={attachment.encryptedFile}
-                mimeType={attachment.mimeType}
-              />
-              <span className="media-play-indicator">
-                <Play size={18} />
-              </span>
-            </button>
-          )}
-          {attachment?.kind === 'audio' && attachment.url && (
-            <AudioPlayer
-              src={attachment.authDownloadUrl ?? attachment.authUrl ?? attachment.url}
-              fallbackSrc={attachment.downloadUrl ?? attachment.url}
-              accessToken={mediaAccessToken}
-              encryptedFile={attachment.encryptedFile}
-              mimeType={attachment.mimeType}
-              title={attachmentName}
-              durationMs={attachment.durationMs}
-              transcription={audioTranscription}
-              onTranscribe={onTranscribeAudio}
-            />
-          )}
-          {attachment?.kind === 'file' && (
-            <AttachmentLink
-              src={attachment.authDownloadUrl ?? attachment.authUrl ?? attachment.url}
-              fallbackSrc={attachment.downloadUrl ?? attachment.url}
-              accessToken={mediaAccessToken}
-              encryptedFile={attachment.encryptedFile}
-              mimeType={attachment.mimeType}
-              name={attachment.name ?? message.body}
-            />
-          )}
-          {editing ? (
-            <div className="message-inline-editor">
-              <textarea
-                ref={inlineEditTextareaRef}
-                value={editingDraft}
-                rows={6}
-                onChange={(event) => onEditingDraftChange(event.target.value)}
-                onKeyDown={handleInlineEditorKeyDown}
-                placeholder="编辑消息"
-                disabled={savingEdit}
-              />
-              <div className="message-inline-editor-actions">
-                <button
-                  type="button"
-                  className="primary-button compact"
-                  onClick={onSaveEdit}
-                  disabled={savingEdit || !editingDraft.trim()}
-                >
-                  {savingEdit ? '保存中...' : '保存'}
+      <span className="message-swipe-indicator message-swipe-indicator-forward" aria-hidden="true">
+        <Forward size={14} />
+        <span>转发</span>
+      </span>
+      <span className="message-swipe-indicator message-swipe-indicator-reply" aria-hidden="true">
+        <Reply size={14} />
+        <span>回复</span>
+      </span>
+      <div className="message-body-shell">
+        <div
+          className={audioAttachment ? 'bubble-wrap bubble-wrap-audio' : 'bubble-wrap'}
+          style={bubbleWrapStyle}
+        >
+          {showSenderLine && (
+            <div className="message-meta">
+              {onOpenUserProfile && !selectionMode ? (
+                <button className="message-sender-button" type="button" onClick={onOpenUserProfile}>
+                  {message.senderName ?? message.sender}
                 </button>
-                <button
-                  type="button"
-                  className="secondary-button compact"
-                  onClick={onCancelEdit}
-                  disabled={savingEdit}
-                >
-                  取消
-                </button>
-              </div>
-            </div>
-          ) : showBody ? (
-            <MessageRichText
-              body={message.body}
-              forwardContent={message.forwardContent}
-              members={members}
-              onOpenMember={onOpenMentionMember}
-            />
-          ) : null}
-        </div>
-        {showReadReceiptIndicator && !editing && (
-          <button
-            type="button"
-            className="message-read-receipts message-read-receipts-button"
-            aria-label="查看消息已读详情"
-            onClick={onOpenReadReceipts}
-          >
-            <div className="message-read-receipt-stack">
-              {receiptAvatarEntries.map((reader) => (
-                <span
-                  key={reader.key}
-                  className="message-read-receipt-avatar"
-                  title={reader.name}
-                >
-                  <Avatar
-                    name={reader.name}
-                    src={reader.avatarUrl}
-                    accessToken={mediaAccessToken}
-                    small
-                  />
-                </span>
-              ))}
-              {readReceiptOverflow > 0 && (
-                <span className="message-read-receipt-more">+{readReceiptOverflow}</span>
+              ) : (
+                <strong>{message.senderName ?? message.sender}</strong>
               )}
             </div>
-          </button>
-        )}
+          )}
+          <div
+            className={
+              mediaOnlyBubble
+                ? 'bubble bubble-media-only'
+                : audioAttachment
+                  ? 'bubble bubble-audio'
+                  : 'bubble'
+            }
+          >
+            {message.replyTo && (
+              <button className="reply-preview" onClick={() => onOpenReply(message.replyTo!.eventId)}>
+                <strong>{message.replyTo.senderName ?? '回复'}</strong>
+                <span>{getReadableMessageBody(message.replyTo.body)}</span>
+              </button>
+            )}
+            {attachment?.kind === 'image' && (attachmentPreviewSrc || attachmentFullSrc) && (
+              <button
+                className={stickerLikeImage ? 'message-media-button sticker' : 'message-media-button'}
+                type="button"
+                onClick={selectionMode ? onToggleSelection : onPreviewAttachment}
+                aria-label="预览图片"
+              >
+                <ProgressiveImagePreview
+                  className={stickerLikeImage ? 'message-image sticker' : 'message-image'}
+                  previewSrc={attachmentPreviewSrc}
+                  previewFallbackSrc={attachmentPreviewFallbackSrc}
+                  accessToken={mediaAccessToken}
+                  previewEncryptedFile={attachmentPreviewEncryptedFile}
+                  previewMimeType={attachment.previewMimeType ?? attachment.mimeType}
+                  src={attachmentFullSrc}
+                  fallbackSrc={attachmentFullFallbackSrc}
+                  encryptedFile={attachment.encryptedFile}
+                  mimeType={attachment.mimeType}
+                  alt={attachmentName}
+                  previewOnly
+                />
+              </button>
+            )}
+            {attachment?.kind === 'video' && attachmentPreviewSrc && (
+              <button
+                className="message-media-button"
+                type="button"
+                onClick={selectionMode ? onToggleSelection : onPreviewAttachment}
+                aria-label="预览视频"
+              >
+                <CompactVideoPreview
+                  className="message-image"
+                  previewSrc={attachmentPreviewSrc}
+                  previewFallbackSrc={attachmentPreviewFallbackSrc}
+                  accessToken={mediaAccessToken}
+                  previewEncryptedFile={getPreviewEncryptedFile(attachment)}
+                  previewMimeType={attachment.previewMimeType ?? attachment.mimeType}
+                  src={attachmentFullSrc}
+                  fallbackSrc={attachmentFullFallbackSrc}
+                  encryptedFile={attachment.encryptedFile}
+                  mimeType={attachment.mimeType}
+                />
+                <span className="media-play-indicator">
+                  <Play size={18} />
+                </span>
+              </button>
+            )}
+            {attachment?.kind === 'audio' && attachment.url && (
+              <AudioPlayer
+                src={attachment.authDownloadUrl ?? attachment.authUrl ?? attachment.url}
+                fallbackSrc={attachment.downloadUrl ?? attachment.url}
+                accessToken={mediaAccessToken}
+                encryptedFile={attachment.encryptedFile}
+                mimeType={attachment.mimeType}
+                title={attachmentName}
+                durationMs={attachment.durationMs}
+                transcription={audioTranscription}
+                onTranscribe={onTranscribeAudio}
+              />
+            )}
+            {attachment?.kind === 'file' && (
+              <AttachmentLink
+                src={attachment.authDownloadUrl ?? attachment.authUrl ?? attachment.url}
+                fallbackSrc={attachment.downloadUrl ?? attachment.url}
+                accessToken={mediaAccessToken}
+                encryptedFile={attachment.encryptedFile}
+                mimeType={attachment.mimeType}
+                name={attachment.name ?? message.body}
+              />
+            )}
+            {editing ? (
+              <div className="message-inline-editor">
+                <textarea
+                  ref={inlineEditTextareaRef}
+                  value={editingDraft}
+                  rows={6}
+                  onChange={(event) => onEditingDraftChange(event.target.value)}
+                  onKeyDown={handleInlineEditorKeyDown}
+                  placeholder="编辑消息"
+                  disabled={savingEdit}
+                />
+                <div className="message-inline-editor-actions">
+                  <button
+                    type="button"
+                    className="primary-button compact"
+                    onClick={onSaveEdit}
+                    disabled={savingEdit || !editingDraft.trim()}
+                  >
+                    {savingEdit ? '保存中...' : '保存'}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button compact"
+                    onClick={onCancelEdit}
+                    disabled={savingEdit}
+                  >
+                    取消
+                  </button>
+                </div>
+              </div>
+            ) : showBody ? (
+              <MessageRichText
+                body={message.body}
+                forwardContent={message.forwardContent}
+                members={members}
+                onOpenMember={onOpenMentionMember}
+              />
+            ) : null}
+          </div>
+          {showMessageFooter && (
+            <div className={`message-footer${showReadReceiptIndicator && !editing ? ' has-receipts' : ''}`}>
+              {messageFooterLabel && (
+                <span className="message-time" aria-label={`发送时间 ${messageDetailLabel}`}>
+                  {messageFooterLabel}
+                </span>
+              )}
+              {showReadReceiptIndicator && !editing && (
+                <button
+                  type="button"
+                  className="message-read-receipts message-read-receipts-button"
+                  aria-label="查看消息已读详情"
+                  onClick={onOpenReadReceipts}
+                >
+                  <div className="message-read-receipt-stack">
+                    {receiptAvatarEntries.map((reader) => (
+                      <span
+                        key={reader.key}
+                        className="message-read-receipt-avatar"
+                        title={reader.name}
+                      >
+                        <Avatar
+                          name={reader.name}
+                          src={reader.avatarUrl}
+                          accessToken={mediaAccessToken}
+                          small
+                        />
+                      </span>
+                    ))}
+                    {readReceiptOverflow > 0 && (
+                      <span className="message-read-receipt-more">+{readReceiptOverflow}</span>
+                    )}
+                  </div>
+                </button>
+              )}
+            </div>
+          )}
+          {!editing && message.reactions.length > 0 && (
+            <div className="message-reaction-row" aria-label="消息回应">
+              {message.reactions.map((reaction) => (
+                <MessageReactionButton
+                  key={reaction.key}
+                  reaction={reaction}
+                  client={client}
+                  accessToken={mediaAccessToken}
+                  active={reaction.reactedByMe}
+                  onClick={() => onReact(reaction.key, reaction.shortcode)}
+                />
+              ))}
+            </div>
+          )}
+        </div>
         {!editing && (
           <>
             <button
@@ -8368,11 +10786,11 @@ function MessageBubble({
               type="button"
               aria-label={actionsOpen ? '收起消息操作' : '更多消息操作'}
               aria-expanded={actionsOpen}
-              onClick={() => setActionsOpen((open) => !open)}
+              onClick={toggleActionsOpen}
             >
               <MoreHorizontal size={17} />
             </button>
-            <div className="message-actions">
+            <div ref={actionsRef} className="message-actions">
               <button onClick={() => runAndClose(onReply)}>
                 <Reply size={14} />
                 回复
@@ -8387,14 +10805,6 @@ function MessageBubble({
                   编辑
                 </button>
               )}
-              <div className="quick-reactions" aria-label="快速回">
-                <SmilePlus size={14} />
-                {quickReactionOptions.map((reaction) => (
-                  <button key={reaction} onClick={() => runAndClose(() => onReact(reaction))}>
-                    {reaction}
-                  </button>
-                ))}
-              </div>
               <button className={favorite ? 'active' : ''} onClick={() => runAndClose(onFavorite)}>
                 <Star size={14} />
                 收藏
@@ -8417,6 +10827,12 @@ function MessageBubble({
                   预览
                 </button>
               )}
+              {message.attachment?.kind === 'image' && message.attachment.mxcUrl && onAddImageToEmoji && (
+                <button onClick={() => runAndClose(onAddImageToEmoji)}>
+                  <SmilePlus size={14} />
+                  加到表情
+                </button>
+              )}
               {message.attachment?.kind === 'audio' && (
                 <button onClick={() => runAndClose(onTranscribeAudio)}>
                   <Volume2 size={14} />
@@ -8434,14 +10850,22 @@ function MessageBubble({
                 </button>
               )}
               {message.reactions.map((reaction) => (
-                <button
+                <MessageReactionButton
                   key={reaction.key}
-                  className={reaction.reactedByMe ? 'active' : ''}
-                  onClick={() => runAndClose(() => onReact(reaction.key))}
-                >
-                  {reaction.key} {reaction.count}
-                </button>
+                  reaction={reaction}
+                  client={client}
+                  accessToken={mediaAccessToken}
+                  active={reaction.reactedByMe}
+                  onClick={() => runAndClose(() => onReact(reaction.key, reaction.shortcode))}
+                />
               ))}
+              <MessageReactionPicker
+                className="message-reaction-picker message-reaction-picker-actions"
+                panelClassName="reaction-picker-panel reaction-picker-panel-actions"
+                customItems={customEmojiItems}
+                accessToken={mediaAccessToken}
+                onReact={(key, shortcode) => runAndClose(() => onReact(key, shortcode))}
+              />
             </div>
           </>
         )}
@@ -8667,10 +11091,12 @@ function NewConversationSheet({
 }
 
 function MessageInfoSheet({
+  client,
   message,
   room,
   members,
   mediaAccessToken,
+  customEmojiItems,
   favorite,
   onClose,
   onOpenMemberProfile,
@@ -8682,14 +11108,17 @@ function MessageInfoSheet({
   onCopyLink,
   onForward,
   onPreviewAttachment,
+  onAddImageToEmoji,
   onTranscribeAudio,
   onReact,
   onRedact,
 }: {
+  client?: MatrixClient;
   message: ChatMessage;
   room?: RoomSummary;
   members: RoomMemberSummary[];
   mediaAccessToken?: string;
+  customEmojiItems: CustomEmojiItem[];
   favorite: boolean;
   onClose: () => void;
   onOpenMemberProfile: (member: RoomMemberSummary) => void;
@@ -8701,8 +11130,9 @@ function MessageInfoSheet({
   onCopyLink: () => void;
   onForward: () => void;
   onPreviewAttachment: () => void;
+  onAddImageToEmoji?: () => void;
   onTranscribeAudio: () => void;
-  onReact: (key: string) => void;
+  onReact: (key: string, shortcode?: string) => void;
   onRedact: () => void;
 }) {
   const ownReadReceiptSummary = getOwnMessageReadReceiptSummary(message, members);
@@ -8758,23 +11188,42 @@ function MessageInfoSheet({
             <span>回应</span>
             <strong>{message.reactions.reduce((count, reaction) => count + reaction.count, 0)}</strong>
           </div>
-          <div className="reaction-picker">
-            {quickReactionOptions.map((reaction) => (
-              <button key={reaction} onClick={() => onReact(reaction)}>
-                {reaction}
-              </button>
-            ))}
-          </div>
+          <MessageReactionPicker
+            className="message-reaction-picker message-reaction-picker-sheet"
+            panelClassName="reaction-picker-panel reaction-picker-panel-sheet"
+            customItems={customEmojiItems}
+            accessToken={mediaAccessToken}
+            onReact={onReact}
+          />
           {message.reactions.length > 0 && (
-            <div className="reaction-list">
+            <div className="reaction-detail-list">
               {message.reactions.map((reaction) => (
-                <button
-                  key={reaction.key}
-                  className={reaction.reactedByMe ? 'active' : ''}
-                  onClick={() => onReact(reaction.key)}
-                >
-                  {reaction.key} {reaction.count}
-                </button>
+                <div key={reaction.key} className="reaction-detail-row">
+                  <MessageReactionButton
+                    reaction={reaction}
+                    client={client}
+                    accessToken={mediaAccessToken}
+                    active={reaction.reactedByMe}
+                    onClick={() => onReact(reaction.key, reaction.shortcode)}
+                  />
+                  <div className="reaction-detail-members">
+                    {reaction.reactors.length > 0 ? (
+                      reaction.reactors.map((reactor) => (
+                        <span key={`${reaction.key}-${reactor.userId}`} className="reaction-detail-member">
+                          <Avatar
+                            name={reactor.name}
+                            src={reactor.avatarUrl}
+                            accessToken={mediaAccessToken}
+                            small
+                          />
+                          <small>{reactor.name}</small>
+                        </span>
+                      ))
+                    ) : (
+                      <small className="reaction-detail-empty">还没有拿到回应成员明细</small>
+                    )}
+                  </div>
+                </div>
               ))}
             </div>
           )}
@@ -8873,6 +11322,12 @@ function MessageInfoSheet({
               预览附件
             </button>
           )}
+          {message.attachment?.kind === 'image' && message.attachment.mxcUrl && onAddImageToEmoji && (
+            <button onClick={onAddImageToEmoji}>
+              <SmilePlus size={16} />
+              加到表情
+            </button>
+          )}
           {message.attachment?.kind === 'audio' && (
             <button onClick={onTranscribeAudio}>
               <Volume2 size={16} />
@@ -8892,18 +11347,21 @@ function MessageInfoSheet({
 
 function ReadReceiptSheet({
   message,
+  inlineReadReceiptState,
   members,
   mediaAccessToken,
   onClose,
   onOpenMemberProfile,
 }: {
   message: ChatMessage;
+  inlineReadReceiptState?: InlineReadReceiptState;
   members: RoomMemberSummary[];
   mediaAccessToken?: string;
   onClose: () => void;
   onOpenMemberProfile: (member: RoomMemberSummary) => void;
 }) {
-  const ownReadReceiptSummary = getOwnMessageReadReceiptSummary(message, members);
+  const effectiveReadReceipts = getEffectiveMessageReadReceipts(message, inlineReadReceiptState);
+  const ownReadReceiptSummary = getOwnMessageReadReceiptSummary(message, members, effectiveReadReceipts);
   const title =
     ownReadReceiptSummary?.totalCount === 1
       ? formatOwnMessageReadReceiptSummary(ownReadReceiptSummary)
@@ -8919,13 +11377,13 @@ function ReadReceiptSheet({
           </button>
         </header>
 
-        {message.readReceipts.length === 0 ? (
+        {effectiveReadReceipts.length === 0 ? (
           <p className="digest-empty">
             {ownReadReceiptSummary?.totalCount === 1 ? '对方暂未读到这条消息。' : '暂时还没有已读回执。'}
           </p>
         ) : (
           <div className="receipt-sheet-list">
-            {message.readReceipts.map((reader) => (
+            {effectiveReadReceipts.map((reader) => (
               <button
                 key={reader.userId}
                 className="receipt-sheet-row"
@@ -9137,6 +11595,7 @@ function RoomInfoSheet({
   onUnpinMessage,
   onMentionMember,
   onCopyMember,
+  onCopyRoomLink,
   onOpenMemberProfile,
   onDirectMember,
   onKickMember,
@@ -9163,6 +11622,7 @@ function RoomInfoSheet({
   onUnpinMessage: (eventId: string) => void;
   onMentionMember: (member: RoomMemberSummary) => void;
   onCopyMember: (member: RoomMemberSummary) => void;
+  onCopyRoomLink: (room: RoomSummary) => void;
   onOpenMemberProfile: (member: RoomMemberSummary) => void;
   onDirectMember: (member: RoomMemberSummary) => void;
   onKickMember: (member: RoomMemberSummary) => void;
@@ -9261,7 +11721,9 @@ function RoomInfoSheet({
             <Bell size={17} />
             {room.muted ? '取消静音' : '静音'}
           </button>
-          <button onClick={() => navigator.clipboard?.writeText(buildMatrixPermalink(room))}>
+          <button
+            onClick={() => void onCopyRoomLink(room)}
+          >
             <Copy size={17} />
             复制链接
           </button>
@@ -9533,12 +11995,16 @@ function EnhancedMediaPreview({
   items,
   mediaAccessToken,
   onSelect,
+  onRequestNavigate,
+  onAddToEmoji,
   onClose,
 }: {
   media: RoomMediaItem;
   items: RoomMediaItem[];
   mediaAccessToken?: string;
   onSelect: (media: RoomMediaItem) => void;
+  onRequestNavigate?: (direction: 'prev' | 'next', media: RoomMediaItem) => Promise<RoomMediaItem | undefined>;
+  onAddToEmoji?: () => void;
   onClose: () => void;
 }) {
   const previewSrc =
@@ -9572,7 +12038,10 @@ function EnhancedMediaPreview({
   const [fitMode, setFitMode] = useState<'fit' | 'actual'>('fit');
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
   const [draggingPreview, setDraggingPreview] = useState(false);
+  const [navigationPendingDirection, setNavigationPendingDirection] = useState<'prev' | 'next'>();
+  const [swipeOffsetX, setSwipeOffsetX] = useState(0);
   const stageRef = useRef<HTMLDivElement | null>(null);
+  const previewPointerPositionsRef = useRef<Map<number, { x: number; y: number }>>(new Map());
   const previewDragRef = useRef<{
     pointerId: number;
     startX: number;
@@ -9580,13 +12049,19 @@ function EnhancedMediaPreview({
     startPanX: number;
     startPanY: number;
   }>();
+  const previewPinchRef = useRef<{
+    pointerIds: [number, number];
+    startDistance: number;
+    startZoom: number;
+    startPan: { x: number; y: number };
+  }>();
+  const previewSwipeRef = useRef<{
+    pointerId: number;
+    startX: number;
+    startY: number;
+  }>();
   const previewableItems = useMemo(
-    () =>
-      items.filter(
-        (item) =>
-          item.kind === media.kind &&
-          Boolean(item.authDownloadUrl ?? item.authUrl ?? item.downloadUrl ?? item.url)
-      ),
+    () => getNavigableRoomMediaItems(items, media.kind),
     [items, media.kind]
   );
   const activeIndex = useMemo(
@@ -9595,6 +12070,8 @@ function EnhancedMediaPreview({
   );
   const canPrev = activeIndex > 0;
   const canNext = activeIndex >= 0 && activeIndex < previewableItems.length - 1;
+  const showPrevControl = activeIndex >= 0 && (canPrev || Boolean(onRequestNavigate));
+  const showNextControl = activeIndex >= 0 && (canNext || Boolean(onRequestNavigate));
   const directPreviewHref =
     media.encryptedFile
       ? undefined
@@ -9612,31 +12089,94 @@ function EnhancedMediaPreview({
         media.downloadUrl ??
         media.authUrl ??
         media.url;
-  const draggableImage = media.kind === 'image' && fitMode === 'actual' && zoom > 1;
-  const getPanBounds = useCallback(() => {
-    if (!draggableImage) return { maxX: 0, maxY: 0 };
+  const resetImageViewport = useCallback(() => {
+    setZoom(1);
+    setFitMode('fit');
+    setPanOffset({ x: 0, y: 0 });
+    setDraggingPreview(false);
+    setSwipeOffsetX(0);
+    previewDragRef.current = undefined;
+    previewPinchRef.current = undefined;
+    previewSwipeRef.current = undefined;
+    previewPointerPositionsRef.current.clear();
+  }, []);
+  const getVisiblePreviewImage = useCallback(() => {
+    const stage = stageRef.current;
+    if (!stage) return null;
+
+    return stage.querySelector('.progressive-media-layer.full.ready, .progressive-media-layer.preview') as
+      | HTMLImageElement
+      | null;
+  }, []);
+  const getMinimumPreviewZoom = useCallback(() => {
+    if (media.kind !== 'image') return 1;
+
+    const stage = stageRef.current;
+    const visibleImage = getVisiblePreviewImage();
+    if (!stage || !visibleImage) return 1;
+
+    const naturalWidth = visibleImage.naturalWidth || visibleImage.clientWidth;
+    const naturalHeight = visibleImage.naturalHeight || visibleImage.clientHeight;
+    if (!naturalWidth || !naturalHeight) return 1;
+
+    const widthScale = stage.clientWidth / naturalWidth;
+    const heightScale = stage.clientHeight / naturalHeight;
+    return Math.min(1, Math.min(widthScale || 1, heightScale || 1));
+  }, [getVisiblePreviewImage, media.kind]);
+  const minimumPreviewZoom = media.kind === 'image' ? getMinimumPreviewZoom() : 1;
+  const draggableImage =
+    media.kind === 'image' &&
+    fitMode === 'actual' &&
+    zoom > minimumPreviewZoom * previewSnapToFitZoomThreshold;
+  const imageSwipeEnabled = media.kind === 'image' && fitMode === 'fit' && activeIndex >= 0;
+  const getStageRelativePoint = useCallback((clientX: number, clientY: number) => {
+    const stage = stageRef.current;
+    if (!stage) return { x: 0, y: 0 };
+
+    const rect = stage.getBoundingClientRect();
+    return {
+      x: clientX - (rect.left + rect.width / 2),
+      y: clientY - (rect.top + rect.height / 2),
+    };
+  }, []);
+  const clampPreviewZoom = useCallback(
+    (value: number, allowRubberBand = false) => {
+      const minZoom = getMinimumPreviewZoom();
+      const lowerBound = allowRubberBand ? minZoom * 0.82 : minZoom;
+      const upperBound = allowRubberBand ? previewMaxZoom * 1.08 : previewMaxZoom;
+      return Math.max(lowerBound, Math.min(upperBound, Number(value.toFixed(3))));
+    },
+    [getMinimumPreviewZoom]
+  );
+  const getPanBounds = useCallback((options?: { fitMode?: 'fit' | 'actual'; rotation?: number; zoom?: number }) => {
+    const targetFitMode = options?.fitMode ?? fitMode;
+    const targetRotation = options?.rotation ?? rotation;
+    const targetZoom =
+      options?.zoom ?? (targetFitMode === 'fit' ? getMinimumPreviewZoom() : zoom);
+    if (media.kind !== 'image' || targetFitMode !== 'actual') return { maxX: 0, maxY: 0 };
 
     const stage = stageRef.current;
     if (!stage) return { maxX: 0, maxY: 0 };
 
-    const visibleImage = stage.querySelector('.progressive-media-layer.full.ready, .progressive-media-layer.preview') as
-      | HTMLImageElement
-      | null;
-    const baseWidth = visibleImage?.clientWidth ?? 0;
-    const baseHeight = visibleImage?.clientHeight ?? 0;
+    const visibleImage = getVisiblePreviewImage();
+    const baseWidth = visibleImage?.naturalWidth || visibleImage?.clientWidth || 0;
+    const baseHeight = visibleImage?.naturalHeight || visibleImage?.clientHeight || 0;
     if (!baseWidth || !baseHeight) return { maxX: 0, maxY: 0 };
 
-    const quarterTurns = ((Math.round(rotation / 90) % 4) + 4) % 4;
+    const quarterTurns = ((Math.round(targetRotation / 90) % 4) + 4) % 4;
     const rotated = quarterTurns % 2 === 1;
-    const scaledWidth = (rotated ? baseHeight : baseWidth) * zoom;
-    const scaledHeight = (rotated ? baseWidth : baseHeight) * zoom;
+    const scaledWidth = (rotated ? baseHeight : baseWidth) * targetZoom;
+    const scaledHeight = (rotated ? baseWidth : baseHeight) * targetZoom;
     const maxX = Math.max(0, (scaledWidth - stage.clientWidth) / 2);
     const maxY = Math.max(0, (scaledHeight - stage.clientHeight) / 2);
     return { maxX, maxY };
-  }, [draggableImage, rotation, zoom]);
+  }, [fitMode, getMinimumPreviewZoom, getVisiblePreviewImage, media.kind, rotation, zoom]);
   const clampPanOffset = useCallback(
-    (nextOffset: { x: number; y: number }) => {
-      const { maxX, maxY } = getPanBounds();
+    (
+      nextOffset: { x: number; y: number },
+      options?: { fitMode?: 'fit' | 'actual'; rotation?: number; zoom?: number }
+    ) => {
+      const { maxX, maxY } = getPanBounds(options);
       return {
         x: Math.max(-maxX, Math.min(maxX, nextOffset.x)),
         y: Math.max(-maxY, Math.min(maxY, nextOffset.y)),
@@ -9644,12 +12184,104 @@ function EnhancedMediaPreview({
     },
     [getPanBounds]
   );
+  const applyPreviewZoom = useCallback(
+    (
+      targetZoom: number,
+      options: {
+        focalPoint?: { x: number; y: number };
+        baseZoom?: number;
+        basePan?: { x: number; y: number };
+        allowRubberBand?: boolean;
+        snapToFit?: boolean;
+      } = {}
+    ) => {
+      if (media.kind !== 'image') return;
+
+      const minZoom = getMinimumPreviewZoom();
+      const nextZoom = clampPreviewZoom(targetZoom, Boolean(options.allowRubberBand));
+      const shouldSnapToFit =
+        options.snapToFit !== false && nextZoom <= minZoom * previewSnapToFitZoomThreshold;
+
+      if (shouldSnapToFit) {
+        setFitMode('fit');
+        setZoom(minZoom);
+        setPanOffset({ x: 0, y: 0 });
+        return;
+      }
+
+      const baseZoom = options.baseZoom ?? (fitMode === 'fit' ? minZoom : zoom);
+      const basePan = options.basePan ?? (fitMode === 'fit' ? { x: 0, y: 0 } : panOffset);
+      let nextPan = basePan;
+      if (options.focalPoint) {
+        const ratio = nextZoom / Math.max(baseZoom, 0.001);
+        nextPan = {
+          x: options.focalPoint.x - ratio * (options.focalPoint.x - basePan.x),
+          y: options.focalPoint.y - ratio * (options.focalPoint.y - basePan.y),
+        };
+      }
+
+      setFitMode('actual');
+      setZoom(nextZoom);
+      setPanOffset(clampPanOffset(nextPan, { fitMode: 'actual', zoom: nextZoom }));
+    },
+    [clampPanOffset, clampPreviewZoom, fitMode, getMinimumPreviewZoom, media.kind, panOffset, zoom]
+  );
+  const finalizeImageGestureViewport = useCallback(() => {
+    if (media.kind !== 'image') return;
+
+    const minZoom = getMinimumPreviewZoom();
+    setZoom((currentZoom) => {
+      const nextZoom = clampPreviewZoom(currentZoom);
+      if (nextZoom <= minZoom * previewSnapToFitZoomThreshold) {
+        setFitMode('fit');
+        setPanOffset({ x: 0, y: 0 });
+        return minZoom;
+      }
+
+      setFitMode('actual');
+      setPanOffset((currentPan) =>
+        clampPanOffset(currentPan, { fitMode: 'actual', zoom: nextZoom })
+      );
+      return nextZoom;
+    });
+  }, [clampPanOffset, clampPreviewZoom, getMinimumPreviewZoom, media.kind]);
   const previewStageStyle = {
     ['--preview-zoom' as string]: String(fitMode === 'actual' ? zoom : 1),
     ['--preview-rotate' as string]: `${rotation}deg`,
     ['--preview-pan-x' as string]: `${fitMode === 'actual' ? panOffset.x : 0}px`,
     ['--preview-pan-y' as string]: `${fitMode === 'actual' ? panOffset.y : 0}px`,
   } as CSSProperties;
+  const swipePreviewEnabled = media.kind !== 'image' && activeIndex >= 0;
+  const previewContentStyle = swipeOffsetX
+    ? ({ transform: `translateX(${swipeOffsetX}px)` } as CSSProperties)
+    : undefined;
+  const previewZoomPercent = Math.round(
+    ((fitMode === 'fit' ? minimumPreviewZoom : zoom) / Math.max(minimumPreviewZoom, 0.001)) * 100
+  );
+
+  const navigatePreview = useCallback(
+    async (direction: 'prev' | 'next') => {
+      const step = direction === 'prev' ? -1 : 1;
+      const localItem = activeIndex >= 0 ? previewableItems[activeIndex + step] : undefined;
+      if (localItem) {
+        onSelect(localItem);
+        return;
+      }
+      if (!onRequestNavigate || navigationPendingDirection) return;
+
+      setNavigationPendingDirection(direction);
+      try {
+        const requestedItem = await onRequestNavigate(direction, media);
+        if (requestedItem) {
+          onSelect(requestedItem);
+        }
+      } finally {
+        setNavigationPendingDirection(undefined);
+        setSwipeOffsetX(0);
+      }
+    },
+    [activeIndex, media, navigationPendingDirection, onRequestNavigate, onSelect, previewableItems]
+  );
 
   useEffect(() => {
     setZoom(1);
@@ -9657,7 +12289,12 @@ function EnhancedMediaPreview({
     setFitMode('fit');
     setPanOffset({ x: 0, y: 0 });
     setDraggingPreview(false);
+    setNavigationPendingDirection(undefined);
+    setSwipeOffsetX(0);
+    previewPointerPositionsRef.current.clear();
     previewDragRef.current = undefined;
+    previewPinchRef.current = undefined;
+    previewSwipeRef.current = undefined;
   }, [media.messageId]);
 
   useLayoutEffect(() => {
@@ -9679,76 +12316,311 @@ function EnhancedMediaPreview({
         onClose();
         return;
       }
-      if (event.key === 'ArrowLeft' && canPrev) {
-        onSelect(previewableItems[activeIndex - 1]);
+      if (event.key === 'ArrowLeft' && showPrevControl) {
+        event.preventDefault();
+        void navigatePreview('prev');
       }
-      if (event.key === 'ArrowRight' && canNext) {
-        onSelect(previewableItems[activeIndex + 1]);
+      if (event.key === 'ArrowRight' && showNextControl) {
+        event.preventDefault();
+        void navigatePreview('next');
       }
     };
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [activeIndex, canNext, canPrev, onClose, onSelect, previewableItems]);
+  }, [navigatePreview, onClose, showNextControl, showPrevControl]);
 
-  const handleZoom = (delta: number) => {
-    setFitMode('actual');
-    setZoom((current) => {
-      const nextZoom = Math.max(1, Math.min(4, Number((current + delta).toFixed(2))));
-      if (nextZoom <= 1) {
-        setPanOffset({ x: 0, y: 0 });
-      }
-      return nextZoom;
-    });
-  };
+  const handleZoom = useCallback(
+    (delta: number) => {
+      if (media.kind !== 'image') return;
+
+      const baseZoom = fitMode === 'fit' ? minimumPreviewZoom : zoom;
+      applyPreviewZoom(baseZoom + delta);
+    },
+    [applyPreviewZoom, fitMode, media.kind, minimumPreviewZoom, zoom]
+  );
 
   const handleWheelZoom = (event: ReactWheelEvent<HTMLDivElement>) => {
     if (media.kind !== 'image') return;
     event.preventDefault();
-    handleZoom(event.deltaY < 0 ? 0.2 : -0.2);
+    applyPreviewZoom(
+      (fitMode === 'fit' ? minimumPreviewZoom : zoom) + (event.deltaY < 0 ? 0.2 : -0.2),
+      {
+        focalPoint: getStageRelativePoint(event.clientX, event.clientY),
+      }
+    );
   };
+
+  const handlePreviewStageDoubleClick = (event: ReactMouseEvent<HTMLDivElement>) => {
+    if (media.kind !== 'image') return;
+
+    event.preventDefault();
+    const focalPoint = getStageRelativePoint(event.clientX, event.clientY);
+    if (fitMode === 'fit') {
+      applyPreviewZoom(Math.min(previewMaxZoom, Math.max(minimumPreviewZoom * 2.2, 1)), {
+        focalPoint,
+      });
+      return;
+    }
+
+    resetImageViewport();
+  };
+
+  const handleToggleFitMode = () => {
+    if (fitMode === 'fit') {
+      setFitMode('actual');
+      setZoom(1);
+      return;
+    }
+
+    resetImageViewport();
+  };
+
+  const releasePreviewPointerCapture = useCallback((target: EventTarget | null, pointerId: number) => {
+    if (!target || !('releasePointerCapture' in target)) return;
+
+    try {
+      (target as HTMLDivElement).releasePointerCapture(pointerId);
+    } catch {
+      // Pointer capture can already be released by the browser.
+    }
+  }, []);
 
   const stopPreviewDrag = useCallback((pointerId?: number, target?: EventTarget | null) => {
     const gesture = previewDragRef.current;
     if (!gesture || (pointerId !== undefined && gesture.pointerId !== pointerId)) return;
 
-    if (target && 'releasePointerCapture' in target) {
-      try {
-        (target as HTMLDivElement).releasePointerCapture(gesture.pointerId);
-      } catch {
-        // Pointer capture can already be released by the browser.
-      }
-    }
-
+    releasePreviewPointerCapture(target ?? null, gesture.pointerId);
     previewDragRef.current = undefined;
     setDraggingPreview(false);
-  }, []);
+  }, [releasePreviewPointerCapture]);
 
-  const handlePreviewPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (!draggableImage || event.button !== 0) return;
+  const resetPreviewSwipe = useCallback((pointerId?: number, target?: EventTarget | null) => {
+    const gesture = previewSwipeRef.current;
+    if (!gesture || (pointerId !== undefined && gesture.pointerId !== pointerId)) return;
 
-    previewDragRef.current = {
+    releasePreviewPointerCapture(target ?? null, gesture.pointerId);
+    previewSwipeRef.current = undefined;
+    setSwipeOffsetX(0);
+  }, [releasePreviewPointerCapture]);
+
+  const handlePreviewStagePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (media.kind !== 'image' || event.button !== 0) return;
+
+    previewPointerPositionsRef.current.set(event.pointerId, {
+      x: event.clientX,
+      y: event.clientY,
+    });
+    event.currentTarget.setPointerCapture(event.pointerId);
+
+    const trackedPointers = Array.from(previewPointerPositionsRef.current.entries());
+    if (trackedPointers.length >= 2) {
+      const [firstPointer, secondPointer] = trackedPointers.slice(0, 2);
+      const startZoom = fitMode === 'fit' ? minimumPreviewZoom : zoom;
+      const startPan = fitMode === 'fit' ? { x: 0, y: 0 } : panOffset;
+      const midpointClientX = (firstPointer[1].x + secondPointer[1].x) / 2;
+      const midpointClientY = (firstPointer[1].y + secondPointer[1].y) / 2;
+
+      previewPinchRef.current = {
+        pointerIds: [firstPointer[0], secondPointer[0]],
+        startDistance: Math.hypot(
+          secondPointer[1].x - firstPointer[1].x,
+          secondPointer[1].y - firstPointer[1].y
+        ),
+        startZoom,
+        startPan,
+      };
+      previewDragRef.current = undefined;
+      previewSwipeRef.current = undefined;
+      setSwipeOffsetX(0);
+      setDraggingPreview(true);
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
+    if (draggableImage) {
+      previewDragRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+        startPanX: panOffset.x,
+        startPanY: panOffset.y,
+      };
+      setDraggingPreview(true);
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
+    if (imageSwipeEnabled) {
+      previewSwipeRef.current = {
+        pointerId: event.pointerId,
+        startX: event.clientX,
+        startY: event.clientY,
+      };
+      setDraggingPreview(false);
+      event.stopPropagation();
+    }
+  };
+
+  const handlePreviewStagePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (media.kind !== 'image') return;
+
+    if (previewPointerPositionsRef.current.has(event.pointerId)) {
+      previewPointerPositionsRef.current.set(event.pointerId, {
+        x: event.clientX,
+        y: event.clientY,
+      });
+    }
+
+    const pinch = previewPinchRef.current;
+    if (pinch && pinch.pointerIds.includes(event.pointerId)) {
+      const firstPointer = previewPointerPositionsRef.current.get(pinch.pointerIds[0]);
+      const secondPointer = previewPointerPositionsRef.current.get(pinch.pointerIds[1]);
+      if (!firstPointer || !secondPointer) return;
+
+      const midpointClientX = (firstPointer.x + secondPointer.x) / 2;
+      const midpointClientY = (firstPointer.y + secondPointer.y) / 2;
+      const nextDistance = Math.hypot(secondPointer.x - firstPointer.x, secondPointer.y - firstPointer.y);
+      const nextZoom = pinch.startZoom * (nextDistance / Math.max(pinch.startDistance, 1));
+
+      applyPreviewZoom(nextZoom, {
+        focalPoint: getStageRelativePoint(midpointClientX, midpointClientY),
+        baseZoom: pinch.startZoom,
+        basePan: pinch.startPan,
+        allowRubberBand: true,
+        snapToFit: false,
+      });
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
+    const gesture = previewDragRef.current;
+    if (gesture && gesture.pointerId === event.pointerId && draggableImage) {
+      const nextOffset = clampPanOffset({
+        x: gesture.startPanX + (event.clientX - gesture.startX),
+        y: gesture.startPanY + (event.clientY - gesture.startY),
+      });
+      setPanOffset(nextOffset);
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
+    const swipeGesture = previewSwipeRef.current;
+    if (!swipeGesture || swipeGesture.pointerId !== event.pointerId || !imageSwipeEnabled) {
+      return;
+    }
+
+    const deltaX = event.clientX - swipeGesture.startX;
+    const deltaY = event.clientY - swipeGesture.startY;
+    if (Math.abs(deltaY) > Math.abs(deltaX) * 1.15 && Math.abs(deltaY) > 18) {
+      resetPreviewSwipe(event.pointerId, event.currentTarget);
+      return;
+    }
+    if (Math.abs(deltaX) <= Math.abs(deltaY)) return;
+
+    setSwipeOffsetX(Math.max(-160, Math.min(160, deltaX)));
+    event.preventDefault();
+    event.stopPropagation();
+  };
+
+  const handlePreviewStagePointerEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (media.kind !== 'image') return;
+
+    const pinch = previewPinchRef.current;
+    if (pinch && pinch.pointerIds.includes(event.pointerId)) {
+      pinch.pointerIds.forEach((pointerId) => {
+        previewPointerPositionsRef.current.delete(pointerId);
+        releasePreviewPointerCapture(event.currentTarget, pointerId);
+      });
+      previewPinchRef.current = undefined;
+      previewDragRef.current = undefined;
+      previewSwipeRef.current = undefined;
+      setDraggingPreview(false);
+      finalizeImageGestureViewport();
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+
+    previewPointerPositionsRef.current.delete(event.pointerId);
+
+    if (previewDragRef.current?.pointerId === event.pointerId) {
+      stopPreviewDrag(event.pointerId, event.currentTarget);
+      event.stopPropagation();
+      return;
+    }
+
+    const swipeGesture = previewSwipeRef.current;
+    if (swipeGesture && swipeGesture.pointerId === event.pointerId) {
+      const deltaX = event.clientX - swipeGesture.startX;
+      const deltaY = event.clientY - swipeGesture.startY;
+      const shouldNavigate = Math.abs(deltaX) >= 72 && Math.abs(deltaX) > Math.abs(deltaY) * 1.1;
+      if (shouldNavigate) {
+        void navigatePreview(deltaX > 0 ? 'prev' : 'next');
+      }
+
+      resetPreviewSwipe(event.pointerId, event.currentTarget);
+      event.stopPropagation();
+      return;
+    }
+
+    releasePreviewPointerCapture(event.currentTarget, event.pointerId);
+  };
+
+  const handlePreviewBodyPointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (!swipePreviewEnabled || event.button !== 0 || draggingPreview) return;
+    if (
+      event.target instanceof HTMLElement &&
+      event.target.closest('button, a, input, textarea, video, audio')
+    ) {
+      return;
+    }
+
+    previewSwipeRef.current = {
       pointerId: event.pointerId,
       startX: event.clientX,
       startY: event.clientY,
-      startPanX: panOffset.x,
-      startPanY: panOffset.y,
     };
     event.currentTarget.setPointerCapture(event.pointerId);
-    setDraggingPreview(true);
+  };
+
+  const handlePreviewBodyPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = previewSwipeRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId || !swipePreviewEnabled || draggingPreview) {
+      return;
+    }
+
+    const deltaX = event.clientX - gesture.startX;
+    const deltaY = event.clientY - gesture.startY;
+    if (Math.abs(deltaY) > Math.abs(deltaX) * 1.15 && Math.abs(deltaY) > 18) {
+      resetPreviewSwipe(event.pointerId, event.currentTarget);
+      return;
+    }
+    if (Math.abs(deltaX) <= Math.abs(deltaY)) return;
+
+    setSwipeOffsetX(Math.max(-160, Math.min(160, deltaX)));
     event.preventDefault();
   };
 
-  const handlePreviewPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const gesture = previewDragRef.current;
-    if (!gesture || gesture.pointerId !== event.pointerId || !draggableImage) return;
+  const handlePreviewBodyPointerUp = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const gesture = previewSwipeRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) {
+      resetPreviewSwipe(event.pointerId, event.currentTarget);
+      return;
+    }
 
-    const nextOffset = clampPanOffset({
-      x: gesture.startPanX + (event.clientX - gesture.startX),
-      y: gesture.startPanY + (event.clientY - gesture.startY),
-    });
-    setPanOffset(nextOffset);
-    event.preventDefault();
+    const deltaX = event.clientX - gesture.startX;
+    const deltaY = event.clientY - gesture.startY;
+    const shouldNavigate = Math.abs(deltaX) >= 72 && Math.abs(deltaX) > Math.abs(deltaY) * 1.1;
+    if (shouldNavigate) {
+      void navigatePreview(deltaX > 0 ? 'prev' : 'next');
+    }
+
+    resetPreviewSwipe(event.pointerId, event.currentTarget);
   };
 
   return (
@@ -9764,9 +12636,20 @@ function EnhancedMediaPreview({
           </span>
           <div className="media-preview-header-actions">
             {directPreviewHref && (
-              <a className="icon-button" href={directPreviewHref} target="_blank" rel="noreferrer" aria-label="打开原图或原文件">
+              <a
+                className="icon-button"
+                href={directPreviewHref}
+                target="_blank"
+                rel="noreferrer"
+                aria-label="打开原图或原文件"
+              >
                 <FolderOpen size={18} />
               </a>
+            )}
+            {media.kind === 'image' && onAddToEmoji && (
+              <button className="icon-button" type="button" onClick={onAddToEmoji} aria-label="加入默认表情">
+                <SmilePlus size={18} />
+              </button>
             )}
             <button className="icon-button" onClick={onClose} aria-label="关闭预览">
               <X size={20} />
@@ -9776,13 +12659,13 @@ function EnhancedMediaPreview({
         {media.kind === 'image' && (
           <div className="media-preview-toolbar">
             <div className="media-preview-toolbar-group">
-              <button type="button" onClick={() => handleZoom(-0.25)} disabled={zoom <= 1}>
+              <button type="button" onClick={() => handleZoom(-0.25)} disabled={fitMode === 'fit'}>
                 -
               </button>
-              <button type="button" onClick={() => setFitMode((current) => (current === 'fit' ? 'actual' : 'fit'))}>
+              <button type="button" onClick={handleToggleFitMode}>
                 {fitMode === 'fit' ? '1:1' : '适应'}
               </button>
-              <button type="button" onClick={() => handleZoom(0.25)} disabled={zoom >= 4}>
+              <button type="button" onClick={() => handleZoom(0.25)} disabled={fitMode === 'actual' && zoom >= previewMaxZoom}>
                 +
               </button>
               <button
@@ -9804,38 +12687,66 @@ function EnhancedMediaPreview({
                 <RotateCw size={15} />
               </button>
             </div>
-            <small>{fitMode === 'fit' ? '适应屏幕' : `${Math.round(zoom * 100)}%`}</small>
+            <small>{fitMode === 'fit' ? '适应屏幕' : `${previewZoomPercent}%`}</small>
           </div>
         )}
-        <div className="media-preview-body" onWheel={handleWheelZoom}>
-          {canPrev && (
+        <div
+          className="media-preview-body"
+          onWheel={handleWheelZoom}
+          onPointerDown={handlePreviewBodyPointerDown}
+          onPointerMove={handlePreviewBodyPointerMove}
+          onPointerUp={handlePreviewBodyPointerUp}
+          onPointerCancel={(event) => resetPreviewSwipe(event.pointerId, event.currentTarget)}
+        >
+          {showPrevControl && (
             <button
               className="media-preview-nav prev"
               type="button"
-              onClick={() => onSelect(previewableItems[activeIndex - 1])}
+              onClick={() => void navigatePreview('prev')}
               aria-label="上一"
+              disabled={navigationPendingDirection === 'prev'}
             >
               <ChevronLeft size={20} />
             </button>
           )}
-          {media.kind === 'image' && (previewSrc || fullSrc) ? (
-            <div
-              ref={stageRef}
-              className={
-                fitMode === 'fit'
-                  ? 'media-preview-stage fit'
-                  : draggingPreview
-                    ? 'media-preview-stage actual dragging'
-                    : 'media-preview-stage actual'
-              }
-              style={previewStageStyle}
-              onPointerDown={handlePreviewPointerDown}
-              onPointerMove={handlePreviewPointerMove}
-              onPointerUp={(event) => stopPreviewDrag(event.pointerId, event.currentTarget)}
-              onPointerCancel={(event) => stopPreviewDrag(event.pointerId, event.currentTarget)}
-            >
-              <ProgressiveImagePreview
-                className={fitMode === 'fit' ? 'media-preview-image' : 'media-preview-image zoomed'}
+          <div
+            className={swipeOffsetX !== 0 ? 'media-preview-content swiping' : 'media-preview-content'}
+            style={previewContentStyle}
+          >
+            {media.kind === 'image' && (previewSrc || fullSrc) ? (
+              <div
+                ref={stageRef}
+                className={
+                  fitMode === 'fit'
+                    ? 'media-preview-stage fit'
+                    : draggingPreview
+                      ? 'media-preview-stage actual dragging'
+                      : 'media-preview-stage actual'
+                }
+                style={previewStageStyle}
+                onPointerDown={handlePreviewStagePointerDown}
+                onPointerMove={handlePreviewStagePointerMove}
+                onPointerUp={handlePreviewStagePointerEnd}
+                onPointerCancel={handlePreviewStagePointerEnd}
+                onDoubleClick={handlePreviewStageDoubleClick}
+              >
+                <ProgressiveImagePreview
+                  className={fitMode === 'fit' ? 'media-preview-image' : 'media-preview-image zoomed'}
+                  previewSrc={previewSrc}
+                  previewFallbackSrc={previewFallbackSrc}
+                  previewEncryptedFile={previewEncryptedFile}
+                  previewMimeType={previewMimeType}
+                  src={fullSrc}
+                  fallbackSrc={fullFallbackSrc}
+                  accessToken={mediaAccessToken}
+                  encryptedFile={fullEncryptedFile}
+                  mimeType={fullMimeType}
+                  alt={media.name}
+                />
+              </div>
+            ) : media.kind === 'video' && (previewSrc || fullSrc) ? (
+              <ProgressiveVideoPreview
+                className="media-preview-video"
                 previewSrc={previewSrc}
                 previewFallbackSrc={previewFallbackSrc}
                 previewEncryptedFile={previewEncryptedFile}
@@ -9845,55 +12756,42 @@ function EnhancedMediaPreview({
                 accessToken={mediaAccessToken}
                 encryptedFile={fullEncryptedFile}
                 mimeType={fullMimeType}
-                alt={media.name}
               />
-            </div>
-          ) : media.kind === 'video' && (previewSrc || fullSrc) ? (
-            <ProgressiveVideoPreview
-              className="media-preview-video"
-              previewSrc={previewSrc}
-              previewFallbackSrc={previewFallbackSrc}
-              previewEncryptedFile={previewEncryptedFile}
-              previewMimeType={previewMimeType}
-              src={fullSrc}
-              fallbackSrc={fullFallbackSrc}
-              accessToken={mediaAccessToken}
-              encryptedFile={fullEncryptedFile}
-              mimeType={fullMimeType}
-            />
-          ) : media.kind === 'audio' && fullSrc ? (
-            <AudioPlayer
-              src={fullSrc}
-              fallbackSrc={fullFallbackSrc}
-              accessToken={mediaAccessToken}
-              encryptedFile={media.encryptedFile}
-              mimeType={media.mimeType}
-              title={media.name}
-              durationMs={media.durationMs}
-            />
-          ) : fullSrc ? (
-            <AttachmentLink
-              src={fullSrc}
-              fallbackSrc={fullFallbackSrc}
-              accessToken={mediaAccessToken}
-              encryptedFile={media.encryptedFile}
-              mimeType={media.mimeType}
-              name={media.name}
-            />
-          ) : media.url ? (
-            <a className="secondary-button" href={media.url} target="_blank" rel="noreferrer">
-              <Eye size={18} />
-              打开文件
-            </a>
-          ) : (
-            <p>这个附件没有可预览的地址</p>
-          )}
-          {canNext && (
+            ) : media.kind === 'audio' && fullSrc ? (
+              <AudioPlayer
+                src={fullSrc}
+                fallbackSrc={fullFallbackSrc}
+                accessToken={mediaAccessToken}
+                encryptedFile={media.encryptedFile}
+                mimeType={media.mimeType}
+                title={media.name}
+                durationMs={media.durationMs}
+              />
+            ) : fullSrc ? (
+              <AttachmentLink
+                src={fullSrc}
+                fallbackSrc={fullFallbackSrc}
+                accessToken={mediaAccessToken}
+                encryptedFile={media.encryptedFile}
+                mimeType={media.mimeType}
+                name={media.name}
+              />
+            ) : media.url ? (
+              <a className="secondary-button" href={media.url} target="_blank" rel="noreferrer">
+                <Eye size={18} />
+                打开文件
+              </a>
+            ) : (
+              <p>这个附件没有可预览的地址</p>
+            )}
+          </div>
+          {showNextControl && (
             <button
               className="media-preview-nav next"
               type="button"
-              onClick={() => onSelect(previewableItems[activeIndex + 1])}
+              onClick={() => void navigatePreview('next')}
               aria-label="下一"
+              disabled={navigationPendingDirection === 'next'}
             >
               <ChevronRight size={20} />
             </button>
@@ -10864,6 +13762,8 @@ function SettingsPanel({
   ownProfile,
   profileForm,
   preferences,
+  audioTranscriptionSettings,
+  audioTranscriptionSupportLabel,
   cryptoStatus,
   mediaAccessToken,
   onLogout,
@@ -10871,6 +13771,7 @@ function SettingsPanel({
   onProfileSubmit,
   onAvatarSelected,
   onPreferencesChange,
+  onAudioTranscriptionSettingsChange,
   onOpenSecurity,
   onOpenEmojiManager,
   onOpenFavorites,
@@ -10886,6 +13787,8 @@ function SettingsPanel({
   ownProfile?: OwnProfile;
   profileForm: { displayName: string };
   preferences: AppPreferences;
+  audioTranscriptionSettings: AudioTranscriptionSettings;
+  audioTranscriptionSupportLabel: string;
   cryptoStatus: CryptoStatus;
   mediaAccessToken?: string;
   onLogout: () => void;
@@ -10893,6 +13796,7 @@ function SettingsPanel({
   onProfileSubmit: (evt: FormEvent<HTMLFormElement>) => void;
   onAvatarSelected: (file: File) => void;
   onPreferencesChange: (value: AppPreferences) => void;
+  onAudioTranscriptionSettingsChange: (value: AudioTranscriptionSettings) => void;
   onOpenSecurity: () => void;
   onOpenEmojiManager: () => void;
   onOpenFavorites: () => void;
@@ -11091,6 +13995,61 @@ function SettingsPanel({
             <small>{exploreSourceCount > 0 ? `${exploreSourceCount} 个已保存来源` : '添加导航站、网页和服务器源'}</small>
           </span>
         </button>
+      </section>
+
+      <section className="settings-section">
+        <div className="section-title">
+          <span>语音转文字</span>
+        </div>
+        <div className="settings-item">
+          <Volume2 size={19} />
+          <span>
+            <strong>
+              {hasAihubmixAudioTranscription(audioTranscriptionSettings)
+                ? 'AIHubMix 云端转写已启用'
+                : canTranscribeAudioInBrowser()
+                  ? '当前仅保留浏览器短语音兜底'
+                  : '请先配置 AIHubMix 云端转写'}
+            </strong>
+            <small>{audioTranscriptionSupportLabel}</small>
+          </span>
+        </div>
+        <label className="settings-field">
+          <span>AIHubMix API Key</span>
+          <input
+            type="password"
+            value={audioTranscriptionSettings.apiKey}
+            placeholder="留空则不启用云端转写"
+            autoCapitalize="none"
+            autoCorrect="off"
+            autoComplete="off"
+            onChange={(evt) =>
+              onAudioTranscriptionSettingsChange({
+                ...audioTranscriptionSettings,
+                apiKey: evt.target.value,
+              })
+            }
+          />
+        </label>
+        <label className="settings-field">
+          <span>服务地址</span>
+          <input
+            value={audioTranscriptionSettings.baseUrl}
+            placeholder={defaultAudioTranscriptionSettings.baseUrl}
+            autoCapitalize="none"
+            autoCorrect="off"
+            autoComplete="off"
+            onChange={(evt) =>
+              onAudioTranscriptionSettingsChange({
+                ...audioTranscriptionSettings,
+                baseUrl: evt.target.value,
+              })
+            }
+          />
+        </label>
+        <p className="settings-helper">
+          这份配置会保留在本机，同时在登录后同步到当前账号。没填 API Key 时，Web 预览只会在受支持的桌面 Chrome 里兜底短语音；长语音和 iOS 真机都建议直接使用 AIHubMix。
+        </p>
       </section>
 
       <section className="settings-section">
