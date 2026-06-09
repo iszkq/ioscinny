@@ -11785,6 +11785,7 @@ function MessageBubble({
   }>();
   const skipNextClickRef = useRef(false);
   const longPressTimerRef = useRef<number>();
+  const suppressActionOpenRef = useRef(false);
   const updateActionsOpen = useCallback((nextState: boolean | ((open: boolean) => boolean)) => {
     const article = articleRef.current;
     const timeline = article?.closest<HTMLElement>('.timeline');
@@ -11819,6 +11820,11 @@ function MessageBubble({
     clearLongPressTimer();
     gestureStateRef.current = undefined;
     setSwipeOffset(0);
+  };
+  const hasAnotherMessageActionsOpen = () => {
+    const currentArticle = articleRef.current;
+    const openArticle = document.querySelector<HTMLElement>('.message.actions-open');
+    return Boolean(openArticle && openArticle !== currentArticle);
   };
   const attachment = message.attachment;
   const audioAttachment = attachment?.kind === 'audio';
@@ -11998,7 +12004,7 @@ function MessageBubble({
     if (!actionsOpen) return;
 
     const handlePointerDown = (event: PointerEvent) => {
-      if (articleRef.current?.contains(event.target as Node)) return;
+      if (actionsRef.current?.contains(event.target as Node)) return;
       closeActionsOpen();
     };
 
@@ -12015,6 +12021,13 @@ function MessageBubble({
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLElement>) => {
     if (selectionMode || event.button !== 0 || shouldIgnoreMessageGesture(event.target)) return;
+    if (hasAnotherMessageActionsOpen()) {
+      suppressActionOpenRef.current = true;
+      resetGesture();
+      return;
+    }
+
+    suppressActionOpenRef.current = false;
 
     gestureStateRef.current = {
       pointerId: event.pointerId,
@@ -12036,6 +12049,8 @@ function MessageBubble({
   };
 
   const handlePointerMove = (event: ReactPointerEvent<HTMLElement>) => {
+    if (suppressActionOpenRef.current) return;
+
     const gesture = gestureStateRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) return;
     if (gesture.longPressTriggered) return;
@@ -12075,6 +12090,12 @@ function MessageBubble({
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLElement>) => {
+    if (suppressActionOpenRef.current) {
+      suppressActionOpenRef.current = false;
+      resetGesture();
+      return;
+    }
+
     const gesture = gestureStateRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) {
       resetGesture();
@@ -12117,6 +12138,10 @@ function MessageBubble({
   const handleContextMenu = (event: ReactMouseEvent<HTMLElement>) => {
     if (selectionMode || shouldIgnoreMessageGesture(event.target)) return;
     event.preventDefault();
+    if (hasAnotherMessageActionsOpen()) {
+      suppressActionOpenRef.current = false;
+      return;
+    }
     openActionsOpen();
   };
 
@@ -12151,7 +12176,10 @@ function MessageBubble({
       onPointerDown={handlePointerDown}
       onPointerMove={handlePointerMove}
       onPointerUp={handlePointerUp}
-      onPointerCancel={resetGesture}
+      onPointerCancel={() => {
+        suppressActionOpenRef.current = false;
+        resetGesture();
+      }}
       onClickCapture={handleMessageClickCapture}
       onClick={handleMessageClick}
       onContextMenu={handleContextMenu}
