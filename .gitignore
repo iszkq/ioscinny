@@ -5,6 +5,7 @@ ios/
 android/
 build/
 artifacts/
+*.tsbuildinfo
 *.log
 .DS_Store
 .env

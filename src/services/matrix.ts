@@ -12,8 +12,15 @@ import {
   RoomMember,
   SyncState,
 } from 'matrix-js-sdk';
+import {
+  ConditionKind,
+  PushRuleActionName,
+  PushRuleKind,
+  TweakName,
+} from 'matrix-js-sdk/lib/@types/PushRules.js';
 import { deriveRecoveryKeyFromPassphrase } from 'matrix-js-sdk/lib/crypto-api/key-passphrase.js';
 import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/recovery-key.js';
+import { MatrixEventEvent } from 'matrix-js-sdk/lib/models/event.js';
 
 import { matrixFetch, matrixRequestError } from './nativeFetch';
 import type { StoredMatrixSession } from './sessionStore';
@@ -25,6 +32,7 @@ export type LoginInput = {
 };
 
 export type RoomMembership = 'join' | 'invite' | 'leave' | 'ban' | 'knock' | string;
+export type RoomNotificationMode = 'default' | 'all' | 'mentions' | 'mute';
 
 export type RoomSummary = {
   id: string;
@@ -34,6 +42,7 @@ export type RoomSummary = {
   avatarUrl?: string;
   parentSpaceIds: string[];
   encrypted: boolean;
+  notificationMode: RoomNotificationMode;
   muted: boolean;
   direct: boolean;
   space: boolean;
@@ -297,6 +306,11 @@ export type CryptoStatus = {
   backupVersion?: string | null;
   backupTrusted?: boolean;
   backupMatchesDecryptionKey?: boolean;
+  crossSigningReady?: boolean;
+  crossSigningPrivateKeysInSecretStorage?: boolean;
+  currentDeviceVerified?: boolean;
+  currentDeviceCrossSigned?: boolean;
+  currentDeviceLocallyVerified?: boolean;
 };
 
 export type KeyRestoreProgress = {
@@ -309,6 +323,17 @@ export type KeyRestoreProgress = {
 export type KeyRestoreResult = {
   total: number;
   imported: number;
+};
+
+export type CurrentDeviceVerificationResult = {
+  attempted: boolean;
+  crossSigningReady?: boolean;
+  crossSigningPrivateKeysInSecretStorage?: boolean;
+  currentDeviceVerified?: boolean;
+  currentDeviceCrossSigned?: boolean;
+  currentDeviceLocallyVerified?: boolean;
+  signedCurrentDevice?: boolean;
+  skippedReason?: 'crypto-unavailable' | 'missing-device-id' | 'no-cross-signing-private-keys';
 };
 
 export type MatrixRuntime = {
@@ -962,6 +987,38 @@ const getRelationType = (content: Record<string, unknown>): string | undefined =
   return (relation as Record<string, unknown>).rel_type as string | undefined;
 };
 
+const suppressedRedactedRelationEventIds = new Set<string>();
+const suppressedRedactedRelationEvents = new WeakSet<MatrixEvent>();
+const watchedRelationRedactionEventIds = new Set<string>();
+
+const suppressRedactedRelationEvent = (event: MatrixEvent): void => {
+  suppressedRedactedRelationEvents.add(event);
+  const eventId = event.getId();
+  if (eventId) suppressedRedactedRelationEventIds.add(eventId);
+};
+
+const suppressRedactedRelationEventId = (eventId?: string): void => {
+  if (eventId) suppressedRedactedRelationEventIds.add(eventId);
+};
+
+const watchRelationRedaction = (event: MatrixEvent): void => {
+  const eventId = event.getId();
+  if (eventId && watchedRelationRedactionEventIds.has(eventId)) return;
+  if (eventId) watchedRelationRedactionEventIds.add(eventId);
+
+  event.once(MatrixEventEvent.BeforeRedaction, (redactedEvent) => {
+    suppressRedactedRelationEvent(redactedEvent);
+    const redactedEventId = redactedEvent.getId();
+    if (redactedEventId) watchedRelationRedactionEventIds.delete(redactedEventId);
+  });
+};
+
+const isSuppressedRedactedRelationEvent = (event: MatrixEvent): boolean => {
+  if (suppressedRedactedRelationEvents.has(event)) return true;
+  const eventId = event.getId();
+  return Boolean(eventId && suppressedRedactedRelationEventIds.has(eventId));
+};
+
 const getReplyEventId = (content: Record<string, unknown>): string | undefined => {
   const relation = content['m.relates_to'];
   if (!relation || typeof relation !== 'object') return undefined;
@@ -1546,7 +1603,10 @@ const eventToChatMessage = (
   const eventType = getEventType(event);
   const content = getEventContent(event);
   const relationType = getRelationType(content);
-  if (relationType === 'm.replace' || relationType === 'm.annotation') return undefined;
+  if (eventType === 'm.reaction' || relationType === 'm.replace' || relationType === 'm.annotation') {
+    watchRelationRedaction(event);
+    return undefined;
+  }
 
   const pinnedEventIds = getRoomPinnedEventIds(room);
   const sender = event.getSender() ?? undefined;
@@ -1578,6 +1638,8 @@ const eventToChatMessage = (
   };
 
   if (event.isRedacted?.()) {
+    if (isSuppressedRedactedRelationEvent(event)) return undefined;
+
     return {
       ...baseMessage,
       kind: 'system',
@@ -1846,23 +1908,65 @@ const getSpaceParentMap = (rooms: Room[]): Map<string, string[]> => {
   return parentMap;
 };
 
-const isMutedAction = (actions: unknown): boolean =>
-  Array.isArray(actions) && (actions.length === 0 || actions[0] === 'dont_notify');
+type RoomPushRule = {
+  rule_id?: string;
+  actions?: unknown;
+  conditions?: Array<Record<string, unknown>>;
+  enabled?: boolean;
+};
 
-const getRoomMuted = (client: MatrixClient, roomId: string): boolean => {
+type RoomPushRules = {
+  global?: Partial<Record<PushRuleKind, RoomPushRule[]>>;
+};
+
+const ROOM_NOTIFICATION_SOUND_ACTION = {
+  set_tweak: TweakName.Sound,
+  value: 'default',
+} as const;
+
+const getClientPushRules = (client: MatrixClient): RoomPushRules | undefined => {
+  const clientRules = (client as unknown as { pushRules?: RoomPushRules }).pushRules;
+  if (clientRules) return clientRules;
+  return getAccountDataContent(client, 'm.push_rules') as RoomPushRules | undefined;
+};
+
+const getPushRuleSet = (
+  pushRules: RoomPushRules | undefined,
+  kind: PushRuleKind
+): RoomPushRule[] => pushRules?.global?.[kind] ?? [];
+
+const findRoomRule = (
+  pushRules: RoomPushRules | undefined,
+  kind: PushRuleKind,
+  roomId: string
+): RoomPushRule | undefined =>
+  getPushRuleSet(pushRules, kind).find((rule) => rule.rule_id === roomId);
+
+const isDontNotifyAction = (actions: unknown): boolean =>
+  Array.isArray(actions) &&
+  (actions.length === 0 || actions.includes(PushRuleActionName.DontNotify));
+
+const isNotifyAction = (actions: unknown): boolean =>
+  Array.isArray(actions) && actions.includes(PushRuleActionName.Notify);
+
+const getRoomNotificationMode = (client: MatrixClient, roomId: string): RoomNotificationMode => {
   try {
-    const directRule = (client as unknown as {
-      getRoomPushRule?: (scope: string, targetRoomId: string) => { actions?: unknown } | undefined;
-    }).getRoomPushRule?.('global', roomId);
-    if (directRule) return isMutedAction(directRule.actions);
+    const pushRules = getClientPushRules(client);
+    const overrideRule = findRoomRule(pushRules, PushRuleKind.Override, roomId);
+    if (overrideRule?.enabled !== false && isDontNotifyAction(overrideRule?.actions)) {
+      return 'mute';
+    }
 
-    const pushRules = getAccountDataContent(client, 'm.push_rules') as
-      | { global?: { override?: Array<{ rule_id?: string; actions?: unknown }> } }
-      | undefined;
-    const overrideRule = pushRules?.global?.override?.find((rule) => rule.rule_id === roomId);
-    return overrideRule ? isMutedAction(overrideRule.actions) : false;
+    const directRule = (client as unknown as {
+      getRoomPushRule?: (scope: string, targetRoomId: string) => RoomPushRule | undefined;
+    }).getRoomPushRule?.('global', roomId);
+    const roomRule = directRule ?? findRoomRule(pushRules, PushRuleKind.RoomSpecific, roomId);
+
+    if (roomRule?.enabled !== false && isDontNotifyAction(roomRule?.actions)) return 'mentions';
+    if (roomRule?.enabled !== false && isNotifyAction(roomRule?.actions)) return 'all';
+    return 'default';
   } catch {
-    return false;
+    return 'default';
   }
 };
 
@@ -1880,6 +1984,7 @@ const roomToSummary = (
   const membership = room.getMyMembership();
   const direct = directRoomIds.has(room.roomId) || isDirectInvite(room, client.getUserId());
   const lastMessage = getLastMessagePreview(client, room);
+  const notificationMode = getRoomNotificationMode(client, room.roomId);
   const unreadInfo =
     membership === 'join'
       ? getUnreadInfo(client, room)
@@ -1896,7 +2001,8 @@ const roomToSummary = (
     avatarUrl: getRoomAvatarUrl(client, room, direct),
     parentSpaceIds,
     encrypted: room.hasEncryptionStateEvent(),
-    muted: getRoomMuted(client, room.roomId),
+    notificationMode,
+    muted: notificationMode === 'mute',
     direct,
     space: room.isSpaceRoom(),
     membership,
@@ -3356,6 +3462,30 @@ const getCryptoApi = (client: MatrixClient) => {
   if (!crypto) throw new Error('当前 Matrix 客户端还没有启用端到端加密。');
   return crypto as unknown as {
     isSecretStorageReady: () => Promise<boolean>;
+    isCrossSigningReady: () => Promise<boolean>;
+    getCrossSigningStatus: () => Promise<{
+      publicKeysOnDevice: boolean;
+      privateKeysInSecretStorage: boolean;
+      privateKeysCachedLocally: {
+        masterKey: boolean;
+        selfSigningKey: boolean;
+        userSigningKey: boolean;
+      };
+    }>;
+    bootstrapCrossSigning: (opts: { setupNewCrossSigning?: boolean }) => Promise<void>;
+    crossSignDevice: (deviceId: string) => Promise<void>;
+    getUserDeviceInfo: (userIds: string[], downloadUncached?: boolean) => Promise<unknown>;
+    userHasCrossSigningKeys: (userId?: string, downloadUncached?: boolean) => Promise<boolean>;
+    getDeviceVerificationStatus: (
+      userId: string,
+      deviceId: string
+    ) => Promise<{
+      signedByOwner: boolean;
+      crossSigningVerified: boolean;
+      localVerified: boolean;
+      isVerified: () => boolean;
+    } | null>;
+    setTrustCrossSignedDevices: (value: boolean) => void;
     getActiveSessionBackupVersion: () => Promise<string | null>;
     getKeyBackupInfo: () => Promise<{ version?: string } | null>;
     checkKeyBackupAndEnable: () => Promise<
@@ -3376,20 +3506,62 @@ const getCryptoApi = (client: MatrixClient) => {
   };
 };
 
+const hasAllPrivateCrossSigningKeys = (status: {
+  privateKeysCachedLocally: {
+    masterKey: boolean;
+    selfSigningKey: boolean;
+    userSigningKey: boolean;
+  };
+}): boolean =>
+  status.privateKeysCachedLocally.masterKey &&
+  status.privateKeysCachedLocally.selfSigningKey &&
+  status.privateKeysCachedLocally.userSigningKey;
+
+const getOwnDeviceVerificationSummary = async (
+  client: MatrixClient,
+  api: ReturnType<typeof getCryptoApi>
+): Promise<
+  Pick<
+    CurrentDeviceVerificationResult,
+    'currentDeviceVerified' | 'currentDeviceCrossSigned' | 'currentDeviceLocallyVerified'
+  >
+> => {
+  const userId = client.getUserId();
+  const deviceId = client.getDeviceId();
+  if (!userId || !deviceId) return {};
+
+  const status = await api.getDeviceVerificationStatus(userId, deviceId).catch(() => null);
+  if (!status) return {};
+
+  return {
+    currentDeviceVerified: status.isVerified(),
+    currentDeviceCrossSigned: status.crossSigningVerified || status.signedByOwner,
+    currentDeviceLocallyVerified: status.localVerified,
+  };
+};
+
 export async function getCryptoStatus(client: MatrixClient): Promise<CryptoStatus> {
   const crypto = client.getCrypto();
   if (!crypto) return { cryptoReady: false };
 
   const api = getCryptoApi(client);
-  const [secretStorageReady, activeBackupVersion, backupInfo, backupCheck] = await Promise.allSettled([
-    api.isSecretStorageReady(),
-    api.getActiveSessionBackupVersion(),
-    api.getKeyBackupInfo(),
-    api.checkKeyBackupAndEnable(),
-  ]);
+  const userId = client.getUserId();
+  const [secretStorageReady, activeBackupVersion, backupInfo, backupCheck, crossSigningReady, crossSigningStatus] =
+    await Promise.allSettled([
+      api.isSecretStorageReady(),
+      api.getActiveSessionBackupVersion(),
+      api.getKeyBackupInfo(),
+      api.checkKeyBackupAndEnable(),
+      api.isCrossSigningReady(),
+      api
+        .userHasCrossSigningKeys(userId ?? undefined, true)
+        .catch(() => false)
+        .then(() => api.getCrossSigningStatus()),
+    ]);
 
   const checkedBackup = backupCheck.status === 'fulfilled' ? backupCheck.value : null;
   const serverBackup = backupInfo.status === 'fulfilled' ? backupInfo.value : null;
+  const ownDeviceTrust = await getOwnDeviceVerificationSummary(client, api);
 
   return {
     cryptoReady: true,
@@ -3400,6 +3572,77 @@ export async function getCryptoStatus(client: MatrixClient): Promise<CryptoStatu
     backupVersion: checkedBackup?.backupInfo?.version ?? serverBackup?.version ?? null,
     backupTrusted: checkedBackup?.trustInfo?.trusted,
     backupMatchesDecryptionKey: checkedBackup?.trustInfo?.matchesDecryptionKey,
+    crossSigningReady:
+      crossSigningReady.status === 'fulfilled' ? crossSigningReady.value : undefined,
+    crossSigningPrivateKeysInSecretStorage:
+      crossSigningStatus.status === 'fulfilled'
+        ? crossSigningStatus.value.privateKeysInSecretStorage
+        : undefined,
+    ...ownDeviceTrust,
+  };
+}
+
+export async function verifyCurrentDeviceFromSecretStorage(
+  client: MatrixClient
+): Promise<CurrentDeviceVerificationResult> {
+  const crypto = client.getCrypto();
+  if (!crypto) {
+    return {
+      attempted: false,
+      skippedReason: 'crypto-unavailable',
+      crossSigningReady: false,
+    };
+  }
+
+  const api = getCryptoApi(client);
+  const userId = client.getUserId();
+  const deviceId = client.getDeviceId();
+  if (!userId || !deviceId) {
+    return {
+      attempted: false,
+      skippedReason: 'missing-device-id',
+      crossSigningReady: await api.isCrossSigningReady().catch(() => false),
+    };
+  }
+
+  api.setTrustCrossSignedDevices(true);
+  await api.userHasCrossSigningKeys(userId, true).catch(() => false);
+  await api.getUserDeviceInfo([userId], true).catch(() => undefined);
+
+  const crossSigningStatus = await api.getCrossSigningStatus();
+  const privateKeysAvailable =
+    crossSigningStatus.privateKeysInSecretStorage || hasAllPrivateCrossSigningKeys(crossSigningStatus);
+
+  if (!privateKeysAvailable) {
+    return {
+      attempted: false,
+      skippedReason: 'no-cross-signing-private-keys',
+      crossSigningReady: await api.isCrossSigningReady().catch(() => false),
+      crossSigningPrivateKeysInSecretStorage: crossSigningStatus.privateKeysInSecretStorage,
+      ...(await getOwnDeviceVerificationSummary(client, api)),
+    };
+  }
+
+  await api.bootstrapCrossSigning({ setupNewCrossSigning: false });
+  await api.userHasCrossSigningKeys(userId, true).catch(() => false);
+  await api.getUserDeviceInfo([userId], true).catch(() => undefined);
+
+  const before = await getOwnDeviceVerificationSummary(client, api);
+  let signedCurrentDevice = false;
+  if (!before.currentDeviceCrossSigned) {
+    await api.crossSignDevice(deviceId);
+    signedCurrentDevice = true;
+  }
+
+  await api.getUserDeviceInfo([userId], true).catch(() => undefined);
+  const after = await getOwnDeviceVerificationSummary(client, api);
+
+  return {
+    attempted: true,
+    signedCurrentDevice,
+    crossSigningReady: await api.isCrossSigningReady().catch(() => false),
+    crossSigningPrivateKeysInSecretStorage: (await api.getCrossSigningStatus()).privateKeysInSecretStorage,
+    ...after,
   };
 }
 
@@ -3632,9 +3875,75 @@ export async function setRoomMuted(
   roomId: string,
   muted: boolean
 ): Promise<void> {
-  await (client as unknown as {
-    setRoomMutePushRule: (scope: string, targetRoomId: string, mute: boolean) => Promise<unknown>;
-  }).setRoomMutePushRule('global', roomId, muted);
+  await setRoomNotificationMode(client, roomId, muted ? 'mute' : 'default');
+}
+
+const getRoomNotificationPushRuleApi = (client: MatrixClient) =>
+  client as unknown as {
+    addPushRule: (
+      scope: string,
+      kind: PushRuleKind,
+      ruleId: string,
+      body: {
+        actions: unknown[];
+        conditions?: Array<Record<string, unknown>>;
+      }
+    ) => Promise<unknown>;
+    deletePushRule: (scope: string, kind: PushRuleKind, ruleId: string) => Promise<unknown>;
+    getPushRules?: () => Promise<RoomPushRules>;
+  };
+
+const refreshRoomNotificationPushRules = async (client: MatrixClient): Promise<void> => {
+  const api = getRoomNotificationPushRuleApi(client);
+  const nextRules = await api.getPushRules?.();
+  if (nextRules) {
+    (client as unknown as { pushRules?: RoomPushRules }).pushRules = nextRules;
+  }
+};
+
+const deleteRoomNotificationRuleIfPresent = async (
+  client: MatrixClient,
+  pushRules: RoomPushRules | undefined,
+  kind: PushRuleKind,
+  roomId: string
+): Promise<void> => {
+  if (!findRoomRule(pushRules, kind, roomId)) return;
+  await getRoomNotificationPushRuleApi(client).deletePushRule('global', kind, roomId);
+};
+
+export async function setRoomNotificationMode(
+  client: MatrixClient,
+  roomId: string,
+  mode: RoomNotificationMode
+): Promise<void> {
+  const api = getRoomNotificationPushRuleApi(client);
+  const pushRules = getClientPushRules(client);
+
+  await deleteRoomNotificationRuleIfPresent(client, pushRules, PushRuleKind.Override, roomId);
+  await deleteRoomNotificationRuleIfPresent(client, pushRules, PushRuleKind.RoomSpecific, roomId);
+
+  if (mode === 'all') {
+    await api.addPushRule('global', PushRuleKind.RoomSpecific, roomId, {
+      actions: [PushRuleActionName.Notify, ROOM_NOTIFICATION_SOUND_ACTION],
+    });
+  } else if (mode === 'mentions') {
+    await api.addPushRule('global', PushRuleKind.RoomSpecific, roomId, {
+      actions: [PushRuleActionName.DontNotify],
+    });
+  } else if (mode === 'mute') {
+    await api.addPushRule('global', PushRuleKind.Override, roomId, {
+      actions: [PushRuleActionName.DontNotify],
+      conditions: [
+        {
+          kind: ConditionKind.EventMatch,
+          key: 'room_id',
+          value: roomId,
+        },
+      ],
+    });
+  }
+
+  await refreshRoomNotificationPushRules(client);
 }
 
 export async function setMessagePinned(
@@ -3850,6 +4159,7 @@ export async function sendReaction(
   const ownReactionEventId = room ? getOwnReactionEventId(client, room, eventId, key) : undefined;
 
   if (ownReactionEventId) {
+    suppressRedactedRelationEventId(ownReactionEventId);
     await (client as unknown as {
       redactEvent: (targetRoomId: string, targetEventId: string) => Promise<unknown>;
     }).redactEvent(roomId, ownReactionEventId);

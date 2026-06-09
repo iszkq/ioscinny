@@ -77,6 +77,7 @@ import {
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
   ReactNode,
+  TouchEvent as ReactTouchEvent,
   WheelEvent as ReactWheelEvent,
   useCallback,
   useEffect,
@@ -101,6 +102,7 @@ import {
   createDirectRoom,
   createGroupRoom,
   createMatrixRuntime,
+  CurrentDeviceVerificationResult,
   deleteCustomEmojiPack,
   deleteCustomEmojiPackItems,
   editTextMessage,
@@ -141,6 +143,7 @@ import {
   redactMessage,
   rejectInvite,
   reorderCustomEmojiPack,
+  RoomNotificationMode,
   RoomMediaItem,
   RoomMemberSummary,
   RoomSummary,
@@ -154,7 +157,8 @@ import {
   sendStickerMessage,
   sendTextMessage,
   setMessagePinned,
-  setRoomMuted,
+  setRoomNotificationMode,
+  verifyCurrentDeviceFromSecretStorage,
   restoreKeyBackupFromSecretStorage,
   restoreKeyBackupWithPassphrase,
   moveCustomEmojiPackItems,
@@ -310,6 +314,19 @@ const AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC = 75;
 const AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_COOLDOWN_MS = 120;
 const AIHUBMIX_CHUNKING_MIN_DURATION_SEC = 90;
 const MAX_RECOGNITION_RESTARTS_PER_SEGMENT = 2;
+const roomNotificationOptions: RoomNotificationMode[] = ['default', 'all', 'mentions', 'mute'];
+const roomNotificationLabels: Record<RoomNotificationMode, string> = {
+  default: '默认',
+  all: '所有消息',
+  mentions: '提及与关键词',
+  mute: '静音',
+};
+const roomNotificationNotices: Record<RoomNotificationMode, string> = {
+  default: '已跟随账号默认通知',
+  all: '已提醒所有消息',
+  mentions: '已仅提醒提及与关键词',
+  mute: '已静音',
+};
 const quickReactionOptions = ['👍', '❤️', '😀', '🎉', '😖', '✅'];
 const composerEmojiOptions = [
   '😺',
@@ -538,6 +555,12 @@ const viewIcon = (view: PrimaryView): ReactNode => {
     default:
       return <Circle size={20} />;
   }
+};
+
+const roomNotificationIcon = (mode: RoomNotificationMode, size = 16): ReactNode => {
+  if (mode === 'mentions') return <AtSign size={size} />;
+  if (mode === 'mute') return <VolumeX size={size} />;
+  return <Bell size={size} />;
 };
 
 const formatTime = (ts: number): string => {
@@ -1037,6 +1060,30 @@ const getReadableKeyRestoreError = (err: unknown): string => {
     return '当前账号没有可用的服务端密钥备份，或这台设备还没有信任该备份';
   }
   return message;
+};
+
+const getCurrentDeviceVerificationCopy = (result: CurrentDeviceVerificationResult): string => {
+  if (result.currentDeviceCrossSigned) {
+    return result.signedCurrentDevice ? '当前设备已用恢复密钥完成交叉签名' : '当前设备已完成交叉签名';
+  }
+
+  if (result.currentDeviceVerified) {
+    return '当前设备仅在本机被信任；其它客户端仍可能显示未验证，需要交叉签名后才会同步可信状态';
+  }
+
+  if (result.skippedReason === 'no-cross-signing-private-keys') {
+    return '当前设备仍未验证：安全存储里没有可用的交叉签名私钥，需要从另一台已验证设备发起设备验证';
+  }
+
+  if (result.skippedReason === 'missing-device-id') {
+    return '当前设备仍未验证：客户端没有读取到本机设备 ID';
+  }
+
+  if (result.skippedReason === 'crypto-unavailable') {
+    return '当前设备仍未验证：端到端加密还没有启用';
+  }
+
+  return '当前设备验证状态未改变，请稍后刷新其它设备的会话列表';
 };
 
 const getReadableSpeechError = (code?: string): string => {
@@ -2484,6 +2531,7 @@ const buildFavoriteSnapshotRoomSummary = (snapshot: StoredFavoriteMessageSnapsho
   avatarUrl: snapshot.roomAvatarUrl,
   parentSpaceIds: [],
   encrypted: snapshot.roomEncrypted,
+  notificationMode: 'default',
   muted: false,
   direct: snapshot.roomDirect,
   space: snapshot.roomSpace,
@@ -2684,6 +2732,10 @@ const timelinePinnedThresholdPx = 84;
 const scrollToLatestThresholdPx = 180;
 const previewSnapToFitZoomThreshold = 1.05;
 const previewMaxZoom = 4;
+const previewToolbarZoomFactor = 1.12;
+const previewWheelZoomSensitivity = 0.0012;
+const iosEdgeBackGestureZonePx = 28;
+const iosBackGestureTriggerPx = 72;
 const composerCollapsedMinHeightPx = 42;
 const composerCollapsedMaxHeightPx = 96;
 const composerAttachmentInputIds = {
@@ -2804,6 +2856,18 @@ export function App() {
   >(undefined);
   const sheetRef = useRef<Sheet>(undefined);
   const mobilePaneRef = useRef<MobilePane>('list');
+  const previewMediaRef = useRef<RoomMediaItem | undefined>(undefined);
+  const activeViewRef = useRef<PrimaryView>('home');
+  const previousActiveViewRef = useRef<PrimaryView>('home');
+  const iosEdgeBackGestureRef = useRef<
+    | {
+        identifier: number;
+        startX: number;
+        startY: number;
+        engaged: boolean;
+      }
+    | undefined
+  >(undefined);
   const autoReadKeyRef = useRef<string>();
   const typingTimeoutRef = useRef<number | undefined>(undefined);
   const [bootState, setBootState] = useState<BootState>('booting');
@@ -2898,10 +2962,40 @@ export function App() {
   const audioTranscriptionHydratedRef = useRef(false);
 
   const currentUserServer = serverFromUserId(session?.userId);
+  const isIosPlatform = Capacitor.getPlatform() === 'ios';
   const selectedExploreSource = useMemo(
     () => exploreSources.find((source) => source.id === selectedExploreSourceId) ?? exploreSources[0],
     [exploreSources, selectedExploreSourceId]
   );
+
+  const canPerformEdgeBackNavigation = useCallback(() => {
+    if (previewMediaRef.current) return true;
+    if (sheetRef.current) return true;
+    if (mobilePaneRef.current === 'chat') return true;
+    return activeViewRef.current !== 'home';
+  }, []);
+
+  const performEdgeBackNavigation = useCallback(() => {
+    if (previewMediaRef.current) {
+      setPreviewMedia(undefined);
+      return true;
+    }
+    if (sheetRef.current) {
+      setSheet(undefined);
+      return true;
+    }
+    if (mobilePaneRef.current === 'chat') {
+      setMobilePane('list');
+      return true;
+    }
+    if (activeViewRef.current !== 'home') {
+      const previousView = previousActiveViewRef.current;
+      setActiveView(previousView !== activeViewRef.current ? previousView : 'home');
+      setMobilePane('list');
+      return true;
+    }
+    return false;
+  }, []);
 
   useEffect(() => {
     sheetRef.current = sheet;
@@ -2910,6 +3004,17 @@ export function App() {
   useEffect(() => {
     mobilePaneRef.current = mobilePane;
   }, [mobilePane]);
+
+  useEffect(() => {
+    previewMediaRef.current = previewMedia;
+  }, [previewMedia]);
+
+  useEffect(() => {
+    if (activeViewRef.current !== activeView) {
+      previousActiveViewRef.current = activeViewRef.current;
+      activeViewRef.current = activeView;
+    }
+  }, [activeView]);
 
   useEffect(() => {
     return () => {
@@ -3088,14 +3193,7 @@ export function App() {
       });
 
     const backButton = CapacitorApp.addListener('backButton', ({ canGoBack }) => {
-      if (sheetRef.current) {
-        setSheet(undefined);
-        return;
-      }
-      if (mobilePaneRef.current === 'chat') {
-        setMobilePane('list');
-        return;
-      }
+      if (performEdgeBackNavigation()) return;
       if (canGoBack) {
         window.history.back();
       }
@@ -3106,7 +3204,7 @@ export function App() {
       stopRuntime();
       void backButton.then((listener) => listener.remove());
     };
-  }, [connectSession, stopRuntime]);
+  }, [connectSession, performEdgeBackNavigation, stopRuntime]);
 
   const handleAudioTranscriptionSettingsChange = useCallback(
     (value: AudioTranscriptionSettings) => {
@@ -4613,6 +4711,17 @@ export function App() {
     setError('当前环境没有拿到剪贴板写入权限，请检查系统复制权限后重试。');
   };
 
+  const handleSetRoomNotificationMode = async (
+    room: RoomSummary,
+    mode: RoomNotificationMode
+  ) => {
+    if (!client || room.notificationMode === mode) return;
+    await runAction(
+      () => setRoomNotificationMode(client, room.id, mode),
+      roomNotificationNotices[mode]
+    );
+  };
+
   const handleTogglePinMessage = async (message: ChatMessage) => {
     if (!client) return;
     await runAction(
@@ -5203,6 +5312,42 @@ export function App() {
     }
   };
 
+  const runCurrentDeviceVerification = async () => {
+    if (!client) return undefined;
+    const result = await verifyCurrentDeviceFromSecretStorage(client);
+    await refreshCryptoStatus(client);
+    refreshSnapshot(client);
+    return result;
+  };
+
+  const handleVerifyCurrentDevice = async () => {
+    if (!client) return;
+    setKeyRestoreProgress('正在验证当前设备...');
+    setKeyRestoreMessage(undefined);
+    setError(undefined);
+    try {
+      const result = await runCurrentDeviceVerification();
+      const message = result
+        ? getCurrentDeviceVerificationCopy(result)
+        : '当前设备验证状态未改变';
+      setKeyRestoreProgress('');
+      setKeyRestoreMessage({
+        type: result?.currentDeviceVerified ? 'success' : 'error',
+        text: message,
+      });
+      if (result?.currentDeviceVerified) {
+        setNotice(message);
+      } else {
+        setError(message);
+      }
+    } catch (err) {
+      setKeyRestoreProgress('');
+      const message = getReadableKeyRestoreError(err);
+      setKeyRestoreMessage({ type: 'error', text: message });
+      setError(message);
+    }
+  };
+
   const handleRestoreFromSecretStorage = async () => {
     if (!client) return;
     setKeyRestoreProgress('正在从安全存储读取密钥备份...');
@@ -5214,14 +5359,18 @@ export function App() {
           `正在恢复密钥 ${progress.successes ?? 0}/${progress.total ?? '?'}`
         );
       });
-      setNotice(`密钥恢复完成：导入 ${result.imported}/${result.total}`);
+      setKeyRestoreProgress('正在验证当前设备...');
+      const verificationResult = await runCurrentDeviceVerification().catch(() => undefined);
+      const verificationCopy = verificationResult
+        ? `；${getCurrentDeviceVerificationCopy(verificationResult)}`
+        : '；当前设备验证未完成，请稍后手动点“验证当前设备”';
+      const message = `密钥恢复完成：导入 ${result.imported}/${result.total}${verificationCopy}`;
+      setNotice(message);
       setKeyRestoreMessage({
         type: 'success',
-        text: `密钥恢复完成：导入 ${result.imported}/${result.total}`,
+        text: message,
       });
       setKeyRestoreProgress('');
-      await refreshCryptoStatus(client);
-      refreshSnapshot(client);
     } catch (err) {
       setKeyRestoreProgress('');
       const message = getReadableKeyRestoreError(err);
@@ -5241,15 +5390,19 @@ export function App() {
           `正在恢复密钥 ${progress.successes ?? 0}/${progress.total ?? '?'}`
         );
       });
-      setNotice(`密钥恢复完成：导入 ${result.imported}/${result.total}`);
+      setKeyRestoreProgress('正在验证当前设备...');
+      const verificationResult = await runCurrentDeviceVerification().catch(() => undefined);
+      const verificationCopy = verificationResult
+        ? `；${getCurrentDeviceVerificationCopy(verificationResult)}`
+        : '；当前设备验证未完成，请稍后手动点“验证当前设备”';
+      const message = `密钥恢复完成：导入 ${result.imported}/${result.total}${verificationCopy}`;
+      setNotice(message);
       setKeyRestoreMessage({
         type: 'success',
-        text: `密钥恢复完成：导入 ${result.imported}/${result.total}`,
+        text: message,
       });
       setRecoveryPassphrase('');
       setKeyRestoreProgress('');
-      await refreshCryptoStatus(client);
-      refreshSnapshot(client);
     } catch (err) {
       setKeyRestoreProgress('');
       const message = getReadableKeyRestoreError(err);
@@ -5890,8 +6043,70 @@ export function App() {
     .filter(Boolean)
     .join(' ');
 
+  const handleAppTouchStart = (event: ReactTouchEvent<HTMLElement>) => {
+    if (!isIosPlatform || window.innerWidth >= 960) return;
+    if (event.touches.length !== 1 || !canPerformEdgeBackNavigation()) return;
+
+    const touch = event.touches[0];
+    if (!touch || touch.clientX > iosEdgeBackGestureZonePx) return;
+
+    iosEdgeBackGestureRef.current = {
+      identifier: touch.identifier,
+      startX: touch.clientX,
+      startY: touch.clientY,
+      engaged: false,
+    };
+  };
+
+  const handleAppTouchMove = (event: ReactTouchEvent<HTMLElement>) => {
+    const gesture = iosEdgeBackGestureRef.current;
+    if (!gesture) return;
+
+    const touch = Array.from(event.touches).find((item) => item.identifier === gesture.identifier);
+    if (!touch) {
+      iosEdgeBackGestureRef.current = undefined;
+      return;
+    }
+
+    const deltaX = touch.clientX - gesture.startX;
+    const deltaY = touch.clientY - gesture.startY;
+    if (deltaX <= 0) return;
+    if (Math.abs(deltaY) > Math.abs(deltaX) * 1.15 && Math.abs(deltaY) > 14) {
+      iosEdgeBackGestureRef.current = undefined;
+      return;
+    }
+    if (deltaX < 14 && !gesture.engaged) return;
+
+    gesture.engaged = true;
+    event.preventDefault();
+  };
+
+  const handleAppTouchEnd = (event: ReactTouchEvent<HTMLElement>) => {
+    const gesture = iosEdgeBackGestureRef.current;
+    iosEdgeBackGestureRef.current = undefined;
+    if (!gesture) return;
+
+    const touch = Array.from(event.changedTouches).find((item) => item.identifier === gesture.identifier);
+    if (!touch) return;
+
+    const deltaX = touch.clientX - gesture.startX;
+    const deltaY = touch.clientY - gesture.startY;
+    if (deltaX >= iosBackGestureTriggerPx && Math.abs(deltaX) > Math.abs(deltaY) * 1.1) {
+      event.preventDefault();
+      performEdgeBackNavigation();
+    }
+  };
+
   return (
-    <main className={`app-frame mobile-${mobilePane} theme-${preferences.appearance} density-${preferences.density}`}>
+    <main
+      className={`app-frame mobile-${mobilePane} theme-${preferences.appearance} density-${preferences.density}`}
+      onTouchStart={handleAppTouchStart}
+      onTouchMove={handleAppTouchMove}
+      onTouchEnd={handleAppTouchEnd}
+      onTouchCancel={() => {
+        iosEdgeBackGestureRef.current = undefined;
+      }}
+    >
       <aside className="rail">
         <div className="rail-brand">
           <Sparkles size={22} />
@@ -5968,6 +6183,7 @@ export function App() {
                 onReject={(roomId) =>
                   client && runAction(() => rejectInvite(client, roomId), '已拒绝邀请')
                 }
+                onSetNotificationMode={(room, mode) => void handleSetRoomNotificationMode(room, mode)}
               />
               {localSearchResults.length > 0 && (
                 <LocalSearchDigest
@@ -6548,6 +6764,7 @@ export function App() {
           progress={keyRestoreProgress}
           message={keyRestoreMessage}
           onPassphraseChange={setRecoveryPassphrase}
+          onVerifyCurrentDevice={handleVerifyCurrentDevice}
           onRestoreFromSecretStorage={handleRestoreFromSecretStorage}
           onRestoreWithPassphrase={handleRestoreWithPassphrase}
           onClose={() => setSheet(undefined)}
@@ -6625,13 +6842,7 @@ export function App() {
           onDirectMember={handleDirectMember}
           onKickMember={handleKickMember}
           onBanMember={handleBanMember}
-          onToggleMute={() =>
-            client &&
-            runAction(
-              () => setRoomMuted(client, selectedRoom.id, !selectedRoom.muted),
-              selectedRoom.muted ? '已取消静音' : '已静音'
-            )
-          }
+          onSetNotificationMode={(mode) => void handleSetRoomNotificationMode(selectedRoom, mode)}
           onFavorite={() => toggleFavoriteRoom(selectedRoom.id)}
           onLeave={() =>
             client &&
@@ -6913,6 +7124,7 @@ function RoomList({
   onSelectRoom,
   onAccept,
   onReject,
+  onSetNotificationMode,
 }: {
   rooms: RoomSummary[];
   selectedRoomId?: string;
@@ -6922,7 +7134,73 @@ function RoomList({
   onSelectRoom: (roomId: string) => void;
   onAccept: (roomId: string) => void;
   onReject: (roomId: string) => void;
+  onSetNotificationMode: (room: RoomSummary, mode: RoomNotificationMode) => void;
 }) {
+  const [notificationMenuRoomId, setNotificationMenuRoomId] = useState<string>();
+  const longPressTimerRef = useRef<number>();
+  const longPressTriggeredRef = useRef(false);
+
+  useEffect(() => {
+    if (!notificationMenuRoomId) return undefined;
+
+    const closeMenu = () => {
+      setNotificationMenuRoomId(undefined);
+    };
+
+    window.addEventListener('click', closeMenu);
+    return () => window.removeEventListener('click', closeMenu);
+  }, [notificationMenuRoomId]);
+
+  useEffect(
+    () => () => {
+      if (typeof longPressTimerRef.current === 'number') {
+        window.clearTimeout(longPressTimerRef.current);
+      }
+    },
+    []
+  );
+
+  const closeNotificationMenu = () => {
+    setNotificationMenuRoomId(undefined);
+  };
+
+  const clearLongPressTimer = () => {
+    if (typeof longPressTimerRef.current === 'number') {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = undefined;
+    }
+  };
+
+  const startRoomLongPress = (room: RoomSummary) => {
+    if (room.membership === 'invite') return;
+    clearLongPressTimer();
+    longPressTriggeredRef.current = false;
+    longPressTimerRef.current = window.setTimeout(() => {
+      longPressTriggeredRef.current = true;
+      setNotificationMenuRoomId(room.id);
+    }, 520);
+  };
+
+  const finishRoomPress = () => {
+    clearLongPressTimer();
+  };
+
+  const handleRoomClick = (event: ReactMouseEvent<HTMLDivElement>, roomId: string) => {
+    if (longPressTriggeredRef.current) {
+      event.preventDefault();
+      event.stopPropagation();
+      longPressTriggeredRef.current = false;
+      return;
+    }
+    onSelectRoom(roomId);
+  };
+
+  const handleRowKeyDown = (event: KeyboardEvent<HTMLDivElement>, roomId: string) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    onSelectRoom(roomId);
+  };
+
   if (rooms.length === 0) {
     return (
       <EmptyState
@@ -6936,55 +7214,97 @@ function RoomList({
 
   return (
     <div className="room-list">
-      {rooms.map((room) => (
-        <button
-          key={room.id}
-          className={selectedRoomId === room.id ? 'room-row active' : 'room-row'}
-          onClick={() => onSelectRoom(room.id)}
-        >
-          <Avatar name={room.name} src={room.avatarUrl} accessToken={mediaAccessToken} />
-          <span className="room-row-main">
-            <span className="room-row-title">
-              <strong>{room.name}</strong>
-              <span>{formatTime(room.lastTs)}</span>
-            </span>
-            <span className="room-row-sub">
-              {room.encrypted && <Lock size={12} />}
-              {room.muted && <Bell size={12} />}
-              {favoriteRoomIds.includes(room.id) && <Star size={12} />}
-              <span>
-                {roomDrafts[room.id]
-                  ? `草稿：${roomDrafts[room.id]}`
-                  : getReadableMessageBody(room.lastMessage)}
+      {rooms.map((room) => {
+        const notificationMenuOpen = notificationMenuRoomId === room.id;
+
+        return (
+          <div
+            key={room.id}
+            className={selectedRoomId === room.id ? 'room-row active' : 'room-row'}
+            role="button"
+            tabIndex={0}
+            onClick={(event) => handleRoomClick(event, room.id)}
+            onContextMenu={(event) => {
+              if (room.membership === 'invite') return;
+              event.preventDefault();
+              event.stopPropagation();
+              setNotificationMenuRoomId(room.id);
+            }}
+            onKeyDown={(event) => handleRowKeyDown(event, room.id)}
+            onPointerDown={() => startRoomLongPress(room)}
+            onPointerLeave={finishRoomPress}
+            onPointerCancel={finishRoomPress}
+            onPointerUp={finishRoomPress}
+          >
+            <Avatar name={room.name} src={room.avatarUrl} accessToken={mediaAccessToken} />
+            <span className="room-row-main">
+              <span className="room-row-title">
+                <strong>{room.name}</strong>
+                <span>{formatTime(room.lastTs)}</span>
+              </span>
+              <span className="room-row-sub">
+                {room.encrypted && <Lock size={12} />}
+                {favoriteRoomIds.includes(room.id) && <Star size={12} />}
+                <span>
+                  {roomDrafts[room.id]
+                    ? `草稿：${roomDrafts[room.id]}`
+                    : getReadableMessageBody(room.lastMessage)}
+                </span>
               </span>
             </span>
-          </span>
-          {room.membership === 'invite' ? (
-            <span className="invite-actions">
-              <span
-                className="mini-action"
-                onClick={(evt) => {
-                  evt.stopPropagation();
-                  onAccept(room.id);
-                }}
-              >
-                <Check size={14} />
+            {room.membership === 'invite' ? (
+              <span className="invite-actions">
+                <button
+                  type="button"
+                  className="mini-action"
+                  onClick={(evt) => {
+                    evt.stopPropagation();
+                    onAccept(room.id);
+                  }}
+                  aria-label="接受邀请"
+                >
+                  <Check size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="mini-action danger"
+                  onClick={(evt) => {
+                    evt.stopPropagation();
+                    onReject(room.id);
+                  }}
+                  aria-label="拒绝邀请"
+                >
+                  <X size={14} />
+                </button>
               </span>
-              <span
-                className="mini-action danger"
-                onClick={(evt) => {
-                  evt.stopPropagation();
-                  onReject(room.id);
-                }}
-              >
-                <X size={14} />
-              </span>
-            </span>
-          ) : (
-            room.unread > 0 && <span className={room.highlight > 0 ? 'unread hot' : 'unread'}>{room.unread}</span>
-          )}
-        </button>
-      ))}
+            ) : (
+              room.unread > 0 && (
+                <span className={room.highlight > 0 ? 'unread hot' : 'unread'}>{room.unread}</span>
+              )
+            )}
+
+            {notificationMenuOpen && room.membership !== 'invite' && (
+              <div className="room-notification-popover" onClick={(evt) => evt.stopPropagation()}>
+                {roomNotificationOptions.map((mode) => (
+                  <button
+                    key={mode}
+                    type="button"
+                    className={room.notificationMode === mode ? 'active' : ''}
+                    onClick={() => {
+                      onSetNotificationMode(room, mode);
+                      closeNotificationMenu();
+                    }}
+                  >
+                    {roomNotificationIcon(mode, 18)}
+                    <span>{roomNotificationLabels[mode]}</span>
+                    {room.notificationMode === mode && <Check size={15} />}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -8850,6 +9170,7 @@ function SecuritySheet({
   progress,
   message,
   onPassphraseChange,
+  onVerifyCurrentDevice,
   onRestoreFromSecretStorage,
   onRestoreWithPassphrase,
   onClose,
@@ -8859,6 +9180,7 @@ function SecuritySheet({
   progress: string;
   message?: { type: 'success' | 'error'; text: string };
   onPassphraseChange: (value: string) => void;
+  onVerifyCurrentDevice: () => void | Promise<void>;
   onRestoreFromSecretStorage: () => void | Promise<void>;
   onRestoreWithPassphrase: () => void | Promise<void>;
   onClose: () => void;
@@ -8868,6 +9190,24 @@ function SecuritySheet({
     if (value === undefined) return '未知';
     return value ? '正常' : '需要处理';
   };
+  const deviceTrustLabel =
+    status.currentDeviceVerified === undefined
+      ? '未知'
+      : status.currentDeviceCrossSigned
+        ? '已交叉签名'
+        : status.currentDeviceLocallyVerified
+          ? '仅本机信任'
+          : status.currentDeviceVerified
+            ? '已验证'
+        : '未验证';
+  const crossSigningLabel =
+    status.crossSigningReady === undefined
+      ? '未知'
+      : status.crossSigningReady
+        ? '已就绪'
+        : status.crossSigningPrivateKeysInSecretStorage
+          ? '待导入'
+          : '未就绪';
 
   return (
     <div className="sheet-backdrop">
@@ -8899,14 +9239,22 @@ function SecuritySheet({
             <small>备份信任</small>
             <strong>{statusLabel(status.backupTrusted)}</strong>
           </span>
+          <span>
+            <small>当前设备</small>
+            <strong>{deviceTrustLabel}</strong>
+          </span>
+          <span>
+            <small>交叉签名</small>
+            <strong>{crossSigningLabel}</strong>
+          </span>
         </div>
 
         <div className="security-copy">
           <KeyRound size={22} />
           <span>
-            <strong>无法解密时先恢复密钥</strong>
-            <small>如果旧设备或 Element 已开启密钥备份，可以从安全存储或恢复密钥导入历史会话密钥</small>
-            <small>恢复历史密钥不等于设备已验证；“未验证”仍需要在另一台已登录设备上完成设备验证。</small>
+            <strong>恢复密钥后会尝试验证当前设备</strong>
+            <small>历史密钥恢复负责解密旧消息；设备验证需要账号的交叉签名私钥。</small>
+            <small>其它旧设备不会被自动信任，仍需要从已验证设备逐个验证或删除不用的登录。</small>
           </span>
         </div>
 
@@ -8929,6 +9277,15 @@ function SecuritySheet({
           >
             <Shield size={17} />
             从安全存储恢复
+          </button>
+          <button
+            className="secondary-button"
+            type="button"
+            onClick={onVerifyCurrentDevice}
+            disabled={!status.cryptoReady || busy}
+          >
+            <Shield size={17} />
+            验证当前设备
           </button>
           <label>
             恢复密钥或备份口令
@@ -11600,7 +11957,7 @@ function RoomInfoSheet({
   onDirectMember,
   onKickMember,
   onBanMember,
-  onToggleMute,
+  onSetNotificationMode,
   onFavorite,
   onLeave,
 }: {
@@ -11627,7 +11984,7 @@ function RoomInfoSheet({
   onDirectMember: (member: RoomMemberSummary) => void;
   onKickMember: (member: RoomMemberSummary) => void;
   onBanMember: (member: RoomMemberSummary) => void;
-  onToggleMute: () => void;
+  onSetNotificationMode: (mode: RoomNotificationMode) => void;
   onFavorite: () => void;
   onLeave: () => void;
 }) {
@@ -11712,14 +12069,33 @@ function RoomInfoSheet({
           </span>
         </div>
 
+        <section className="room-notification-card">
+          <div className="section-title">
+            <span>通知提醒</span>
+            <strong>{roomNotificationLabels[room.notificationMode]}</strong>
+          </div>
+          <div className="room-notification-options">
+            {roomNotificationOptions.map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                className={room.notificationMode === mode ? 'active' : ''}
+                onClick={() => onSetNotificationMode(mode)}
+              >
+                {roomNotificationIcon(mode, 17)}
+                <span>{roomNotificationLabels[mode]}</span>
+                {room.notificationMode === mode && (
+                  <Check className="room-notification-option-check" size={16} />
+                )}
+              </button>
+            ))}
+          </div>
+        </section>
+
         <div className="sheet-actions">
           <button onClick={onFavorite}>
             <Star size={17} />
             {favorite ? '取消收藏' : '收藏房间'}
-          </button>
-          <button onClick={onToggleMute}>
-            <Bell size={17} />
-            {room.muted ? '取消静音' : '静音'}
           </button>
           <button
             onClick={() => void onCopyRoomLink(room)}
@@ -12060,6 +12436,31 @@ function EnhancedMediaPreview({
     startX: number;
     startY: number;
   }>();
+  const previewTouchGestureRef = useRef<
+    | {
+        kind: 'drag';
+        touchId: number;
+        startX: number;
+        startY: number;
+        startPanX: number;
+        startPanY: number;
+      }
+    | {
+        kind: 'pinch';
+        touchIds: [number, number];
+        startDistance: number;
+        startZoom: number;
+        startPan: { x: number; y: number };
+      }
+    | {
+        kind: 'swipe';
+        touchId: number;
+        startX: number;
+        startY: number;
+      }
+    | undefined
+  >(undefined);
+  const prefersTouchPreviewGestures = Capacitor.getPlatform() === 'ios';
   const previewableItems = useMemo(
     () => getNavigableRoomMediaItems(items, media.kind),
     [items, media.kind]
@@ -12098,15 +12499,20 @@ function EnhancedMediaPreview({
     previewDragRef.current = undefined;
     previewPinchRef.current = undefined;
     previewSwipeRef.current = undefined;
+    previewTouchGestureRef.current = undefined;
     previewPointerPositionsRef.current.clear();
   }, []);
   const getVisiblePreviewImage = useCallback(() => {
     const stage = stageRef.current;
     if (!stage) return null;
 
-    return stage.querySelector('.progressive-media-layer.full.ready, .progressive-media-layer.preview') as
-      | HTMLImageElement
-      | null;
+    const fullImage = stage.querySelector('.progressive-media-layer.full.ready');
+    if (fullImage instanceof HTMLImageElement) {
+      return fullImage;
+    }
+
+    const previewImage = stage.querySelector('.progressive-media-layer.preview');
+    return previewImage instanceof HTMLImageElement ? previewImage : null;
   }, []);
   const getMinimumPreviewZoom = useCallback(() => {
     if (media.kind !== 'image') return 1;
@@ -12139,6 +12545,25 @@ function EnhancedMediaPreview({
       y: clientY - (rect.top + rect.height / 2),
     };
   }, []);
+  const findTouchByIdentifier = useCallback((
+    touches: {
+      length: number;
+      item: (index: number) => { identifier: number; clientX: number; clientY: number } | null;
+    },
+    identifier: number
+  ) => {
+    for (let index = 0; index < touches.length; index += 1) {
+      const touch = touches.item(index);
+      if (touch && touch.identifier === identifier) {
+        return touch;
+      }
+    }
+    return undefined;
+  }, []);
+  const shouldDeferToIosBackGesture = useCallback(
+    (clientX: number) => prefersTouchPreviewGestures && clientX <= iosEdgeBackGestureZonePx,
+    [prefersTouchPreviewGestures]
+  );
   const clampPreviewZoom = useCallback(
     (value: number, allowRubberBand = false) => {
       const minZoom = getMinimumPreviewZoom();
@@ -12295,7 +12720,49 @@ function EnhancedMediaPreview({
     previewDragRef.current = undefined;
     previewPinchRef.current = undefined;
     previewSwipeRef.current = undefined;
+    previewTouchGestureRef.current = undefined;
   }, [media.messageId]);
+
+  useEffect(() => {
+    if (!prefersTouchPreviewGestures || media.kind !== 'image') return undefined;
+
+    const stage = stageRef.current;
+    if (!stage) return undefined;
+
+    const preventNativeGesture = (event: Event) => {
+      event.preventDefault();
+    };
+
+    stage.addEventListener('gesturestart', preventNativeGesture, { passive: false });
+    stage.addEventListener('gesturechange', preventNativeGesture, { passive: false });
+    stage.addEventListener('gestureend', preventNativeGesture, { passive: false });
+
+    return () => {
+      stage.removeEventListener('gesturestart', preventNativeGesture);
+      stage.removeEventListener('gesturechange', preventNativeGesture);
+      stage.removeEventListener('gestureend', preventNativeGesture);
+    };
+  }, [media.kind, media.messageId, prefersTouchPreviewGestures]);
+
+  const previousMinimumPreviewZoomRef = useRef(minimumPreviewZoom);
+
+  useLayoutEffect(() => {
+    const previousMinimumPreviewZoom = previousMinimumPreviewZoomRef.current;
+    previousMinimumPreviewZoomRef.current = minimumPreviewZoom;
+
+    if (media.kind !== 'image' || fitMode !== 'actual') return;
+    if (!previousMinimumPreviewZoom || !minimumPreviewZoom) return;
+    if (Math.abs(previousMinimumPreviewZoom - minimumPreviewZoom) < 0.0005) return;
+
+    const zoomRatio = minimumPreviewZoom / previousMinimumPreviewZoom;
+    const nextZoom = clampPreviewZoom(zoom * zoomRatio);
+    if (Math.abs(nextZoom - zoom) >= 0.0005) {
+      setZoom(nextZoom);
+    }
+    setPanOffset((currentPan) =>
+      clampPanOffset(currentPan, { fitMode: 'actual', zoom: nextZoom })
+    );
+  }, [clampPanOffset, clampPreviewZoom, fitMode, media.kind, minimumPreviewZoom, zoom]);
 
   useLayoutEffect(() => {
     setPanOffset((current) => {
@@ -12331,11 +12798,13 @@ function EnhancedMediaPreview({
   }, [navigatePreview, onClose, showNextControl, showPrevControl]);
 
   const handleZoom = useCallback(
-    (delta: number) => {
+    (direction: 'in' | 'out') => {
       if (media.kind !== 'image') return;
 
       const baseZoom = fitMode === 'fit' ? minimumPreviewZoom : zoom;
-      applyPreviewZoom(baseZoom + delta);
+      const zoomFactor =
+        direction === 'in' ? previewToolbarZoomFactor : 1 / previewToolbarZoomFactor;
+      applyPreviewZoom(baseZoom * zoomFactor);
     },
     [applyPreviewZoom, fitMode, media.kind, minimumPreviewZoom, zoom]
   );
@@ -12343,12 +12812,11 @@ function EnhancedMediaPreview({
   const handleWheelZoom = (event: ReactWheelEvent<HTMLDivElement>) => {
     if (media.kind !== 'image') return;
     event.preventDefault();
-    applyPreviewZoom(
-      (fitMode === 'fit' ? minimumPreviewZoom : zoom) + (event.deltaY < 0 ? 0.2 : -0.2),
-      {
-        focalPoint: getStageRelativePoint(event.clientX, event.clientY),
-      }
-    );
+    const baseZoom = fitMode === 'fit' ? minimumPreviewZoom : zoom;
+    const wheelZoomFactor = Math.exp(-event.deltaY * previewWheelZoomSensitivity);
+    applyPreviewZoom(baseZoom * wheelZoomFactor, {
+      focalPoint: getStageRelativePoint(event.clientX, event.clientY),
+    });
   };
 
   const handlePreviewStageDoubleClick = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -12357,7 +12825,7 @@ function EnhancedMediaPreview({
     event.preventDefault();
     const focalPoint = getStageRelativePoint(event.clientX, event.clientY);
     if (fitMode === 'fit') {
-      applyPreviewZoom(Math.min(previewMaxZoom, Math.max(minimumPreviewZoom * 2.2, 1)), {
+      applyPreviewZoom(Math.min(previewMaxZoom, Math.max(minimumPreviewZoom * 1.6, 1)), {
         focalPoint,
       });
       return;
@@ -12405,6 +12873,7 @@ function EnhancedMediaPreview({
   }, [releasePreviewPointerCapture]);
 
   const handlePreviewStagePointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (prefersTouchPreviewGestures && event.pointerType === 'touch') return;
     if (media.kind !== 'image' || event.button !== 0) return;
 
     previewPointerPositionsRef.current.set(event.pointerId, {
@@ -12465,6 +12934,7 @@ function EnhancedMediaPreview({
   };
 
   const handlePreviewStagePointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (prefersTouchPreviewGestures && event.pointerType === 'touch') return;
     if (media.kind !== 'image') return;
 
     if (previewPointerPositionsRef.current.has(event.pointerId)) {
@@ -12528,6 +12998,7 @@ function EnhancedMediaPreview({
   };
 
   const handlePreviewStagePointerEnd = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (prefersTouchPreviewGestures && event.pointerType === 'touch') return;
     if (media.kind !== 'image') return;
 
     const pinch = previewPinchRef.current;
@@ -12623,6 +13094,177 @@ function EnhancedMediaPreview({
     resetPreviewSwipe(event.pointerId, event.currentTarget);
   };
 
+  const handlePreviewStageTouchStart = (event: ReactTouchEvent<HTMLDivElement>) => {
+    if (!prefersTouchPreviewGestures || media.kind !== 'image') return;
+
+    if (event.touches.length === 1) {
+      const firstTouch = event.touches.item(0);
+      if (firstTouch && shouldDeferToIosBackGesture(firstTouch.clientX)) {
+        previewTouchGestureRef.current = undefined;
+        setDraggingPreview(false);
+        return;
+      }
+    }
+
+    if (event.touches.length >= 2) {
+      const firstTouch = event.touches.item(0);
+      const secondTouch = event.touches.item(1);
+      if (!firstTouch || !secondTouch) return;
+
+      const startZoom = fitMode === 'fit' ? minimumPreviewZoom : zoom;
+      const startPan = fitMode === 'fit' ? { x: 0, y: 0 } : panOffset;
+      previewTouchGestureRef.current = {
+        kind: 'pinch',
+        touchIds: [firstTouch.identifier, secondTouch.identifier],
+        startDistance: Math.hypot(
+          secondTouch.clientX - firstTouch.clientX,
+          secondTouch.clientY - firstTouch.clientY
+        ),
+        startZoom,
+        startPan,
+      };
+      setSwipeOffsetX(0);
+      setDraggingPreview(true);
+      event.preventDefault();
+      return;
+    }
+
+    const touch = event.changedTouches.item(0);
+    if (!touch) return;
+
+    if (draggableImage) {
+      previewTouchGestureRef.current = {
+        kind: 'drag',
+        touchId: touch.identifier,
+        startX: touch.clientX,
+        startY: touch.clientY,
+        startPanX: panOffset.x,
+        startPanY: panOffset.y,
+      };
+      setDraggingPreview(true);
+      event.preventDefault();
+      return;
+    }
+
+    if (imageSwipeEnabled) {
+      previewTouchGestureRef.current = {
+        kind: 'swipe',
+        touchId: touch.identifier,
+        startX: touch.clientX,
+        startY: touch.clientY,
+      };
+    }
+  };
+
+  const handlePreviewStageTouchMove = (event: ReactTouchEvent<HTMLDivElement>) => {
+    if (!prefersTouchPreviewGestures || media.kind !== 'image') return;
+
+    const gesture = previewTouchGestureRef.current;
+    if (!gesture) return;
+
+    if (gesture.kind === 'pinch') {
+      const firstTouch = findTouchByIdentifier(event.touches, gesture.touchIds[0]);
+      const secondTouch = findTouchByIdentifier(event.touches, gesture.touchIds[1]);
+      if (!firstTouch || !secondTouch) return;
+
+      const midpointClientX = (firstTouch.clientX + secondTouch.clientX) / 2;
+      const midpointClientY = (firstTouch.clientY + secondTouch.clientY) / 2;
+      const nextDistance = Math.hypot(
+        secondTouch.clientX - firstTouch.clientX,
+        secondTouch.clientY - firstTouch.clientY
+      );
+      const nextZoom = gesture.startZoom * (nextDistance / Math.max(gesture.startDistance, 1));
+
+      applyPreviewZoom(nextZoom, {
+        focalPoint: getStageRelativePoint(midpointClientX, midpointClientY),
+        baseZoom: gesture.startZoom,
+        basePan: gesture.startPan,
+        allowRubberBand: true,
+        snapToFit: false,
+      });
+      event.preventDefault();
+      return;
+    }
+
+    const touch = findTouchByIdentifier(event.touches, gesture.touchId);
+    if (!touch) return;
+
+    if (gesture.kind === 'drag' && draggableImage) {
+      const nextOffset = clampPanOffset({
+        x: gesture.startPanX + (touch.clientX - gesture.startX),
+        y: gesture.startPanY + (touch.clientY - gesture.startY),
+      });
+      setPanOffset(nextOffset);
+      event.preventDefault();
+      return;
+    }
+
+    if (gesture.kind !== 'swipe' || !imageSwipeEnabled) return;
+
+    const deltaX = touch.clientX - gesture.startX;
+    const deltaY = touch.clientY - gesture.startY;
+    if (Math.abs(deltaY) > Math.abs(deltaX) * 1.15 && Math.abs(deltaY) > 18) {
+      previewTouchGestureRef.current = undefined;
+      setSwipeOffsetX(0);
+      return;
+    }
+    if (Math.abs(deltaX) <= Math.abs(deltaY)) return;
+
+    setSwipeOffsetX(Math.max(-160, Math.min(160, deltaX)));
+    event.preventDefault();
+  };
+
+  const handlePreviewStageTouchEnd = (event: ReactTouchEvent<HTMLDivElement>) => {
+    if (!prefersTouchPreviewGestures || media.kind !== 'image') return;
+
+    const gesture = previewTouchGestureRef.current;
+    if (!gesture) return;
+
+    if (gesture.kind === 'pinch') {
+      const pinchEnded = gesture.touchIds.some((touchId) => findTouchByIdentifier(event.changedTouches, touchId));
+      if (!pinchEnded && event.touches.length >= 2) return;
+
+      previewTouchGestureRef.current = undefined;
+      setDraggingPreview(false);
+      finalizeImageGestureViewport();
+      event.preventDefault();
+      return;
+    }
+
+    const touch = findTouchByIdentifier(event.changedTouches, gesture.touchId);
+    if (!touch) return;
+
+    if (gesture.kind === 'drag') {
+      previewTouchGestureRef.current = undefined;
+      setDraggingPreview(false);
+      return;
+    }
+
+    const deltaX = touch.clientX - gesture.startX;
+    const deltaY = touch.clientY - gesture.startY;
+    const shouldNavigate = Math.abs(deltaX) >= 72 && Math.abs(deltaX) > Math.abs(deltaY) * 1.1;
+    if (shouldNavigate) {
+      void navigatePreview(deltaX > 0 ? 'prev' : 'next');
+    }
+
+    previewTouchGestureRef.current = undefined;
+    setSwipeOffsetX(0);
+  };
+
+  const handlePreviewStageTouchCancel = () => {
+    if (!prefersTouchPreviewGestures || media.kind !== 'image') return;
+
+    const gesture = previewTouchGestureRef.current;
+    previewTouchGestureRef.current = undefined;
+    if (!gesture) return;
+
+    setSwipeOffsetX(0);
+    setDraggingPreview(false);
+    if (gesture.kind === 'pinch') {
+      finalizeImageGestureViewport();
+    }
+  };
+
   return (
     <div className="media-preview-backdrop" onClick={(event) => event.target === event.currentTarget && onClose()}>
       <section className="media-preview rich">
@@ -12659,13 +13301,13 @@ function EnhancedMediaPreview({
         {media.kind === 'image' && (
           <div className="media-preview-toolbar">
             <div className="media-preview-toolbar-group">
-              <button type="button" onClick={() => handleZoom(-0.25)} disabled={fitMode === 'fit'}>
+              <button type="button" onClick={() => handleZoom('out')} disabled={fitMode === 'fit'}>
                 -
               </button>
               <button type="button" onClick={handleToggleFitMode}>
                 {fitMode === 'fit' ? '1:1' : '适应'}
               </button>
-              <button type="button" onClick={() => handleZoom(0.25)} disabled={fitMode === 'actual' && zoom >= previewMaxZoom}>
+              <button type="button" onClick={() => handleZoom('in')} disabled={fitMode === 'actual' && zoom >= previewMaxZoom}>
                 +
               </button>
               <button
@@ -12728,6 +13370,10 @@ function EnhancedMediaPreview({
                 onPointerMove={handlePreviewStagePointerMove}
                 onPointerUp={handlePreviewStagePointerEnd}
                 onPointerCancel={handlePreviewStagePointerEnd}
+                onTouchStart={handlePreviewStageTouchStart}
+                onTouchMove={handlePreviewStageTouchMove}
+                onTouchEnd={handlePreviewStageTouchEnd}
+                onTouchCancel={handlePreviewStageTouchCancel}
                 onDoubleClick={handlePreviewStageDoubleClick}
               >
                 <ProgressiveImagePreview

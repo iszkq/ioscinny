@@ -330,8 +330,10 @@ h2 {
 .theme-dark .user-profile-card,
 .theme-dark .profile-card,
 .theme-dark .preference-card,
-.theme-dark .room-profile-form,
-.theme-dark .message-detail-preview,
+  .theme-dark .room-profile-form,
+  .theme-dark .room-notification-card,
+  .theme-dark .room-notification-popover,
+  .theme-dark .message-detail-preview,
 .theme-dark .message-detail-grid,
 .theme-dark .reaction-panel,
 .theme-dark .media-strip,
@@ -454,6 +456,8 @@ h2 {
 .theme-dark .icon-button,
 .theme-dark .tool-button,
 .theme-dark .sheet-actions button,
+.theme-dark .room-notification-options button,
+.theme-dark .room-notification-popover button,
 .theme-dark .settings-action,
 .theme-dark .audio-play,
 .theme-dark .audio-transcribe,
@@ -465,6 +469,22 @@ h2 {
   color: #d6e1ec;
   border-color: #334155;
   background: #202b3a;
+}
+
+.theme-dark .room-notification-options {
+  border-color: #2f3a4c;
+  background: #202b3a;
+}
+
+.theme-dark .room-notification-options button.active,
+.theme-dark .room-notification-popover button.active,
+.theme-dark .room-notification-popover button:hover {
+  color: #c8f3fb;
+  background: #123744;
+}
+
+.theme-dark .room-notification-option-check {
+  color: #c8f3fb;
 }
 
 .theme-dark .segmented button.active,
@@ -1107,6 +1127,7 @@ h2 {
 }
 
 .room-row {
+  position: relative;
   width: 100%;
   min-width: 0;
   min-height: 70px;
@@ -1120,6 +1141,8 @@ h2 {
   text-align: left;
   color: #172033;
   background: transparent;
+  cursor: pointer;
+  user-select: none;
 }
 
 .room-row:hover,
@@ -1159,6 +1182,54 @@ h2 {
 
 .room-row-sub svg {
   flex: 0 0 auto;
+}
+
+.room-notification-popover {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% - 4px);
+  right: 8px;
+  width: min(238px, calc(100% - 16px));
+  padding: 6px;
+  display: grid;
+  gap: 3px;
+  border: 1px solid #d7e2eb;
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 16px 34px rgba(15, 23, 42, 0.18);
+}
+
+.room-notification-popover button {
+  min-width: 0;
+  height: 40px;
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) 16px;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 6px;
+  color: #172033;
+  text-align: left;
+  background: transparent;
+  font-size: 14px;
+  font-weight: 850;
+}
+
+.room-notification-popover button:hover,
+.room-notification-popover button.active {
+  background: #eef2f6;
+}
+
+.room-notification-popover button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-notification-popover button svg:last-child {
+  color: #0f6b82;
 }
 
 .unread {
@@ -4399,6 +4470,10 @@ h2 {
   font-weight: 650;
 }
 
+.security-copy small {
+  white-space: normal;
+}
+
 .security-status-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5090,8 +5165,12 @@ h2 {
   --preview-pan-y: 0px;
   width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
   display: grid;
-  place-items: center;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
+  place-items: stretch;
   overflow: hidden;
   overscroll-behavior: contain;
   touch-action: none;
@@ -5153,13 +5232,24 @@ h2 {
   position: relative;
   width: 100%;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-rows: minmax(0, 1fr);
   place-items: center;
+  overflow: hidden;
+}
+
+.media-preview-stage > .progressive-media-frame,
+.media-preview-stage > .progressive-video-shell {
+  place-self: stretch;
 }
 
 .progressive-media-frame > *,
 .progressive-video-shell > * {
   grid-area: 1 / 1;
+  place-self: center;
 }
 
 .progressive-media-layer {
@@ -5215,6 +5305,9 @@ h2 {
 
 .media-preview-content {
   width: 100%;
+  height: 100%;
+  min-height: 100%;
+  place-self: stretch;
   display: grid;
   place-items: center;
   transition: transform 160ms ease;
@@ -5371,6 +5464,62 @@ h2 {
   color: #344054;
   font-size: 13px;
   font-weight: 850;
+}
+
+.room-notification-card {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #dbe3ea;
+  border-radius: 8px;
+  background: #fbfcfd;
+}
+
+.room-notification-options {
+  display: grid;
+  gap: 0;
+  border: 1px solid #dbe3ea;
+  border-radius: 8px;
+  background: #ffffff;
+  overflow: hidden;
+}
+
+.room-notification-options button {
+  min-width: 0;
+  min-height: 46px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 10px;
+  padding: 0 12px;
+  border: 0;
+  border-bottom: 1px solid #e6edf3;
+  border-radius: 0;
+  color: #344054;
+  background: #ffffff;
+  font-weight: 850;
+  text-align: left;
+}
+
+.room-notification-options button:last-child {
+  border-bottom: 0;
+}
+
+.room-notification-options button.active {
+  color: #0f6b82;
+  background: #edf9fb;
+}
+
+.room-notification-options button span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.room-notification-option-check {
+  margin-left: auto;
+  color: #0f6b82;
 }
 
 .sheet-actions {
