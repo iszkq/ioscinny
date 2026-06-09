@@ -2110,6 +2110,16 @@ h2 {
   background: rgba(15, 107, 130, 0.18);
 }
 
+.message-rich-text .message-inline-emoji {
+  width: 1.35em;
+  height: 1.35em;
+  display: inline-block;
+  margin: 0 0.06em;
+  vertical-align: -0.28em;
+  object-fit: contain;
+  border-radius: 0.32em;
+}
+
 .message-rich-text code {
   padding: 0.15em 0.4em;
   border-radius: 7px;

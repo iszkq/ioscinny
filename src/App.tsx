@@ -858,6 +858,39 @@ const getSafeRichTextHref = (href: string): string | undefined => {
   }
 };
 
+const getSafeRichTextImageSrc = (
+  src: string,
+  client?: MatrixClient,
+  accessToken?: string
+): string | undefined => {
+  const trimmedSrc = src.trim();
+  if (!trimmedSrc) return undefined;
+
+  if (trimmedSrc.startsWith('mxc://')) {
+    if (!client) return undefined;
+
+    const authThumb = withAccessToken(mxcToHttp(client, trimmedSrc, 64, 64, true), accessToken);
+    const plainThumb = mxcToHttp(client, trimmedSrc, 64, 64);
+    const authFull = withAccessToken(mxcToHttp(client, trimmedSrc, undefined, undefined, true), accessToken);
+    const plainFull = mxcToHttp(client, trimmedSrc);
+    return authThumb ?? plainThumb ?? authFull ?? plainFull;
+  }
+
+  if (isMatrixMediaUrl(trimmedSrc)) {
+    const authenticatedSrc = withAccessToken(toAuthenticatedMediaUrl(trimmedSrc), accessToken);
+    const plainTokenSrc = withAccessToken(toUnauthenticatedMediaUrl(trimmedSrc) ?? trimmedSrc, accessToken);
+    const publicSrc = toUnauthenticatedMediaUrl(trimmedSrc) ?? trimmedSrc;
+    return authenticatedSrc ?? plainTokenSrc ?? publicSrc;
+  }
+
+  try {
+    const url = new URL(trimmedSrc, window.location.origin);
+    return url.protocol === 'http:' || url.protocol === 'https:' ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 const splitTrailingLinkPunctuation = (value: string): { link: string; trailing: string } => {
   let link = value;
   let trailing = '';
@@ -970,7 +1003,12 @@ const linkifyRichTextText = (value: string, members: RoomMemberSummary[] = []): 
   return html;
 };
 
-const sanitizeRichTextHtml = (html: string, members: RoomMemberSummary[] = []): string => {
+const sanitizeRichTextHtml = (
+  html: string,
+  members: RoomMemberSummary[] = [],
+  client?: MatrixClient,
+  accessToken?: string
+): string => {
   const parser = new DOMParser();
   const document = parser.parseFromString(`<body>${html}</body>`, 'text/html');
   const membersById = new Map(members.map((member) => [member.id, member]));
@@ -992,6 +1030,24 @@ const sanitizeRichTextHtml = (html: string, members: RoomMemberSummary[] = []): 
     const children = Array.from(element.childNodes)
       .map((child) => sanitizeNode(child, childAllowsAutoLink))
       .join('');
+
+    if (tag === 'img') {
+      const isMatrixEmoticon =
+        element.hasAttribute('data-mx-emoticon') || element.getAttribute('data-mx-emoticon') === 'true';
+      if (!isMatrixEmoticon) return '';
+
+      const rawAlt = element.getAttribute('alt')?.trim() ?? '';
+      const rawTitle = element.getAttribute('title')?.trim() ?? '';
+      const fallbackText = rawAlt || rawTitle;
+      const safeSrc = getSafeRichTextImageSrc(element.getAttribute('src') ?? '', client, accessToken);
+      if (!safeSrc) {
+        return fallbackText ? escapeHtml(fallbackText) : '';
+      }
+
+      return `<img class="message-inline-emoji" src="${escapeHtml(safeSrc)}" alt="${escapeHtml(
+        rawAlt || rawTitle || '表情'
+      )}" title="${escapeHtml(rawTitle || rawAlt || '表情')}" loading="lazy" decoding="async" draggable="false">`;
+    }
 
     if (!richTextAllowedTags.has(tag)) return children;
     if (tag === 'br') return '<br>';
@@ -1022,7 +1078,12 @@ const sanitizeRichTextHtml = (html: string, members: RoomMemberSummary[] = []): 
     .join('');
 };
 
-const markdownishToHtml = (body: string, members: RoomMemberSummary[] = []): string => {
+const markdownishToHtml = (
+  body: string,
+  members: RoomMemberSummary[] = [],
+  client?: MatrixClient,
+  accessToken?: string
+): string => {
   const normalizedBody = getReadableMessageBody(body).replace(/\r\n?/g, '\n');
   const codePlaceholders = createPlaceholderStore('RT_CODE');
   const rawTagPlaceholders = createPlaceholderStore('RT_TAG');
@@ -1045,15 +1106,19 @@ const markdownishToHtml = (body: string, members: RoomMemberSummary[] = []): str
   html = codePlaceholders.restore(html);
   html = html.replace(/\n/g, '<br>');
 
-  return sanitizeRichTextHtml(html, members);
+  return sanitizeRichTextHtml(html, members, client, accessToken);
 };
 
 const getMessageBodyHtml = (
   message: Pick<ChatMessage, 'body' | 'forwardContent'>,
-  members: RoomMemberSummary[] = []
+  members: RoomMemberSummary[] = [],
+  client?: MatrixClient,
+  accessToken?: string
 ): string => {
   const formattedBody = getFormattedBodyFromContent(message.forwardContent);
-  return formattedBody ? sanitizeRichTextHtml(formattedBody, members) : markdownishToHtml(message.body, members);
+  return formattedBody
+    ? sanitizeRichTextHtml(formattedBody, members, client, accessToken)
+    : markdownishToHtml(message.body, members, client, accessToken);
 };
 
 const isForwardableMessage = (message: ChatMessage): boolean =>
@@ -10625,17 +10690,24 @@ const MESSAGE_SWIPE_MAX_OFFSET = 84;
 function MessageRichText({
   body,
   forwardContent,
+  client,
+  accessToken,
   className = 'message-rich-text',
   members = [],
   onOpenMember,
 }: {
   body: string;
   forwardContent?: Record<string, unknown>;
+  client?: MatrixClient;
+  accessToken?: string;
   className?: string;
   members?: RoomMemberSummary[];
   onOpenMember?: (member: RoomMemberSummary) => void;
 }) {
-  const html = useMemo(() => getMessageBodyHtml({ body, forwardContent }, members), [body, forwardContent, members]);
+  const html = useMemo(
+    () => getMessageBodyHtml({ body, forwardContent }, members, client, accessToken),
+    [accessToken, body, client, forwardContent, members]
+  );
   const handleClick = useCallback(
     (event: ReactMouseEvent<HTMLDivElement>) => {
       if (!onOpenMember) return;
@@ -11460,6 +11532,8 @@ function MessageBubble({
               <MessageRichText
                 body={message.body}
                 forwardContent={message.forwardContent}
+                client={client}
+                accessToken={mediaAccessToken}
                 members={members}
                 onOpenMember={onOpenMentionMember}
               />
@@ -11897,6 +11971,8 @@ function MessageInfoSheet({
           <MessageRichText
             body={message.body}
             forwardContent={message.forwardContent}
+            client={client}
+            accessToken={mediaAccessToken}
             members={members}
             onOpenMember={onOpenMemberProfile}
           />
