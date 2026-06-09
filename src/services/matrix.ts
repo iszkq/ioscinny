@@ -1098,6 +1098,61 @@ const getReplyPreview = (
   };
 };
 
+const applyRemoteReplaceRelation = (event: MatrixEvent): void => {
+  const unsigned = event.getUnsigned() as
+    | {
+        ['m.relations']?: {
+          ['m.replace']?: unknown;
+        };
+      }
+    | undefined;
+  const replaceEvent = unsigned?.['m.relations']?.['m.replace'];
+  if (!replaceEvent || typeof replaceEvent !== 'object') return;
+
+  try {
+    event.makeReplaced(new MatrixEvent(replaceEvent));
+  } catch {
+    // Ignore malformed replacement metadata from remote fetches.
+  }
+};
+
+const decryptRemoteEvent = async (client: MatrixClient, event: MatrixEvent): Promise<void> => {
+  const crypto = client.getCrypto();
+  if (!crypto || !event.isEncrypted?.()) return;
+
+  try {
+    await event.attemptDecryption(crypto as never);
+  } catch {
+    // Keep the encrypted placeholder when decryption is unavailable.
+  }
+};
+
+const resolveRoomEventById = async (
+  client: MatrixClient,
+  room: Room,
+  eventId: string
+): Promise<MatrixEvent | undefined> => {
+  const localEvent = getEventById(room, eventId);
+  if (localEvent) return localEvent;
+
+  try {
+    const remoteEvent = await client.fetchRoomEvent(room.roomId, eventId);
+    if (!remoteEvent) return undefined;
+
+    const matrixEvent = new MatrixEvent(remoteEvent);
+    applyRemoteReplaceRelation(matrixEvent);
+    await decryptRemoteEvent(client, matrixEvent);
+    return matrixEvent;
+  } catch {
+    try {
+      await client.getEventTimeline(room.getUnfilteredTimelineSet(), eventId);
+      return getEventById(room, eventId);
+    } catch {
+      return undefined;
+    }
+  }
+};
+
 const getMemberDisplayName = (room: Room, userId?: string): string => {
   if (!userId) return '未知成员';
   const member = room.getMember(userId);
@@ -1712,6 +1767,72 @@ const eventToChatMessage = (
     kind: 'message',
     body: body || (attachment ? attachment.name ?? '附件' : '空消息'),
     attachment,
+  };
+};
+
+const getFallbackMessageBody = (event: MatrixEvent, content: Record<string, unknown>, eventType: string): string => {
+  const body = getPlainBody(content)?.trim();
+  if (body) return body;
+
+  const attachmentName =
+    typeof content.filename === 'string'
+      ? content.filename
+      : typeof content.name === 'string'
+        ? content.name
+        : undefined;
+  if (attachmentName) return attachmentName;
+
+  if (eventType.startsWith('m.room.')) {
+    const stateDescription = describeStateEvent(event).trim();
+    if (stateDescription) return stateDescription;
+  }
+
+  return `暂不支持预览 ${eventType} 消息`;
+};
+
+const toDisplayableChatMessage = (
+  client: MatrixClient,
+  room: Room,
+  event: MatrixEvent
+): ChatMessage | undefined => {
+  const primaryMessage = eventToChatMessage(client, room, event);
+  if (primaryMessage) return primaryMessage;
+
+  const id = event.getId();
+  if (!id) return undefined;
+
+  const content = getEventContent(event);
+  const relationType = getRelationType(content);
+  const eventType = getEventType(event);
+  if (eventType === 'm.reaction' || relationType === 'm.replace' || relationType === 'm.annotation') {
+    return undefined;
+  }
+
+  const sender = event.getSender() ?? undefined;
+  const member = sender ? room.getMember(sender) : undefined;
+  const pinnedEventIds = getRoomPinnedEventIds(room);
+
+  return {
+    id,
+    roomId: room.roomId,
+    eventType,
+    forwardContent: content,
+    kind: eventType.startsWith('m.room.') ? 'system' : 'message',
+    sender,
+    senderName: sender ? getMemberDisplayName(room, sender) : undefined,
+    senderAvatarUrl: getMemberAvatarUrl(client, member, 72),
+    body: getFallbackMessageBody(event, content, eventType),
+    timestamp: event.getTs(),
+    mine: sender === client.getUserId(),
+    edited: Boolean(content['m.new_content']),
+    encrypted: event.isEncrypted?.() ?? eventType === 'm.room.encrypted',
+    canEdit: false,
+    canRedact: sender === client.getUserId() && !event.isRedacted?.(),
+    pinned: pinnedEventIds.includes(id),
+    replyTo: getReplyPreview(client, room, content),
+    reactions: [],
+    readReceipts: [],
+    favoriteSource: getFavoriteSourceMetadata(client, content),
   };
 };
 
@@ -2344,7 +2465,7 @@ export function getPinnedMessages(client: MatrixClient, roomId: string): PinnedM
 
   return getRoomPinnedEventIds(room).map((eventId) => {
     const event = getEventById(room, eventId);
-    const message = event ? eventToChatMessage(client, room, event) : undefined;
+    const message = event ? toDisplayableChatMessage(client, room, event) : undefined;
 
     if (message) {
       return {
@@ -2366,6 +2487,36 @@ export function getPinnedMessages(client: MatrixClient, roomId: string): PinnedM
   });
 }
 
+export async function hydratePinnedMessages(
+  client: MatrixClient,
+  roomId: string,
+  pinnedMessages: PinnedMessageSummary[]
+): Promise<PinnedMessageSummary[]> {
+  const room = client.getRoom(roomId);
+  if (!room) return pinnedMessages;
+
+  return Promise.all(
+    pinnedMessages.map(async (message) => {
+      if (message.available) return message;
+
+      const remoteEvent = await resolveRoomEventById(client, room, message.id);
+      if (!remoteEvent) return message;
+
+      const hydratedMessage = toDisplayableChatMessage(client, room, remoteEvent);
+      if (!hydratedMessage) return message;
+
+      return {
+        id: hydratedMessage.id,
+        roomId,
+        body: hydratedMessage.body,
+        senderName: hydratedMessage.senderName,
+        timestamp: hydratedMessage.timestamp,
+        available: false,
+      } satisfies PinnedMessageSummary;
+    })
+  );
+}
+
 export async function fetchRoomMessageById(
   client: MatrixClient,
   roomId: string,
@@ -2374,17 +2525,87 @@ export async function fetchRoomMessageById(
   const room = client.getRoom(roomId);
   if (!room) return undefined;
 
-  const localEvent = getEventById(room, eventId);
-  if (localEvent) {
-    return eventToChatMessage(client, room, localEvent);
+  const event = await resolveRoomEventById(client, room, eventId);
+  return event ? toDisplayableChatMessage(client, room, event) : undefined;
+}
+
+export async function ensureRoomEventInLiveTimeline(
+  client: MatrixClient,
+  roomId: string,
+  eventId: string,
+  opts?: {
+    pageLimit?: number;
+    pageSize?: number;
+  }
+): Promise<boolean> {
+  const room = client.getRoom(roomId);
+  if (!room) return false;
+
+  const hasEventInLiveTimeline = () =>
+    room.getLiveTimeline().getEvents().some((event) => event.getId() === eventId);
+
+  if (hasEventInLiveTimeline()) return true;
+
+  const pageLimit = opts?.pageLimit ?? 8;
+  const pageSize = opts?.pageSize ?? 40;
+  let previousCount = room.getLiveTimeline().getEvents().length;
+
+  for (let page = 0; page < pageLimit; page += 1) {
+    await client.scrollback(room, pageSize);
+    if (hasEventInLiveTimeline()) return true;
+
+    const nextCount = room.getLiveTimeline().getEvents().length;
+    if (nextCount <= previousCount) break;
+    previousCount = nextCount;
   }
 
+  return false;
+}
+
+export async function loadRoomMessageContext(
+  client: MatrixClient,
+  roomId: string,
+  eventId: string,
+  contextSize = 36
+): Promise<ChatMessage[]> {
+  const room = client.getRoom(roomId);
+  if (!room) return [];
+
   try {
-    const remoteEvent = await client.fetchRoomEvent(roomId, eventId);
-    if (!remoteEvent) return undefined;
-    return eventToChatMessage(client, room, new MatrixEvent(remoteEvent));
+    const timelineSet = room.getUnfilteredTimelineSet();
+    const initialTimeline = await client.getEventTimeline(timelineSet, eventId);
+    const timeline = room.getTimelineForEvent(eventId) ?? initialTimeline;
+
+    if (!timeline) {
+      const remoteEvent = await resolveRoomEventById(client, room, eventId);
+      const message = remoteEvent ? toDisplayableChatMessage(client, room, remoteEvent) : undefined;
+      return message ? [message] : [];
+    }
+
+    const extraContext = Math.max(8, Math.floor(contextSize / 2));
+    await Promise.allSettled([
+      client.paginateEventTimeline(timeline, { backwards: true, limit: extraContext }),
+      client.paginateEventTimeline(timeline, { backwards: false, limit: extraContext }),
+    ]);
+
+    const messages = timeline
+      .getEvents()
+      .map((event) => toDisplayableChatMessage(client, room, event))
+      .filter((message): message is ChatMessage => Boolean(message));
+
+    if (messages.length <= contextSize) return messages;
+
+    const targetIndex = messages.findIndex((message) => message.id === eventId);
+    if (targetIndex < 0) return messages.slice(-contextSize);
+
+    const half = Math.floor(contextSize / 2);
+    const start = Math.max(0, targetIndex - half);
+    const end = Math.min(messages.length, start + contextSize);
+    return messages.slice(Math.max(0, end - contextSize), end);
   } catch {
-    return undefined;
+    const remoteEvent = await resolveRoomEventById(client, room, eventId);
+    const message = remoteEvent ? toDisplayableChatMessage(client, room, remoteEvent) : undefined;
+    return message ? [message] : [];
   }
 }
 

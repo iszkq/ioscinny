@@ -1628,6 +1628,47 @@ h2 {
   height: 100%;
 }
 
+.timeline-context-banner {
+  align-self: center;
+  min-width: min(100%, 420px);
+  min-height: 36px;
+  margin: 4px 0 6px;
+  padding: 0 6px 0 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid rgba(200, 215, 225, 0.92);
+  border-radius: 999px;
+  color: #335166;
+  background: rgba(248, 251, 253, 0.96);
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.08);
+}
+
+.timeline-context-banner span {
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.timeline-context-banner button {
+  min-height: 28px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  color: #0f6b82;
+  background: rgba(15, 107, 130, 0.12);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.timeline-context-banner button:hover {
+  background: rgba(15, 107, 130, 0.18);
+}
+
 .scroll-to-latest-button {
   position: absolute;
   right: clamp(10px, 2vw, 18px);
@@ -2516,6 +2557,22 @@ h2 {
   color: #e2e8f0;
   background: rgba(15, 23, 42, 0.86);
   box-shadow: 0 12px 28px rgba(2, 6, 23, 0.34);
+}
+
+.theme-dark .timeline-context-banner {
+  border-color: rgba(71, 85, 105, 0.82);
+  color: #d7e2ee;
+  background: rgba(15, 23, 42, 0.88);
+  box-shadow: 0 10px 26px rgba(2, 6, 23, 0.26);
+}
+
+.theme-dark .timeline-context-banner button {
+  color: #8be4f5;
+  background: rgba(94, 234, 212, 0.14);
+}
+
+.theme-dark .timeline-context-banner button:hover {
+  background: rgba(94, 234, 212, 0.2);
 }
 
 .theme-dark .scroll-to-latest-button::after {

@@ -106,6 +106,7 @@ import {
   deleteCustomEmojiPack,
   deleteCustomEmojiPackItems,
   editTextMessage,
+  ensureRoomEventInLiveTimeline,
   ExploreNavCard,
   ExploreNavSection,
   ExploreSource,
@@ -132,6 +133,7 @@ import {
   joinRoom,
   kickMember,
   leaveRoom,
+  loadRoomMessageContext,
   loginWithPassword,
   markRoomRead,
   MatrixSnapshot,
@@ -163,6 +165,7 @@ import {
   restoreKeyBackupWithPassphrase,
   moveCustomEmojiPackItems,
   mxcToHttp,
+  hydratePinnedMessages,
   updateCustomEmojiPack,
   updateCustomEmojiPackItem,
   updateOwnAvatar,
@@ -221,6 +224,11 @@ type ComposerMode =
   | { type: 'normal' }
   | { type: 'reply'; message: ChatMessage }
   | { type: 'edit'; message: ChatMessage };
+type FocusedTimelineContext = {
+  roomId: string;
+  eventId: string;
+  messages: ChatMessage[];
+};
 type CreateFormState = {
   mode: 'direct' | 'group' | 'join';
   userId: string;
@@ -1501,6 +1509,96 @@ const fetchMediaBlobDeduped = async (
   });
   pendingMediaBlobRequests.set(cacheKey, nextRequest);
   return nextRequest;
+};
+
+type MediaWarmTarget = {
+  cacheKey: string;
+  src?: string;
+  fallbackSrc?: string;
+  accessToken?: string;
+  encryptedFile?: EncryptedMediaFile;
+  mimeType?: string;
+};
+
+const buildAvatarThumbnailUrl = (
+  client: MatrixClient,
+  mxcUrl: unknown,
+  size: number
+): string | undefined => {
+  if (typeof mxcUrl !== 'string' || !mxcUrl.startsWith('mxc://')) return undefined;
+  return (
+    (client as unknown as {
+      mxcUrlToHttp: (
+        mxc: string,
+        width?: number,
+        height?: number,
+        resizeMethod?: string,
+        allowDirectLinks?: boolean,
+        allowRedirects?: boolean,
+        useAuthentication?: boolean
+      ) => string | null;
+    }).mxcUrlToHttp(mxcUrl, size, size, 'crop', undefined, false, false) ?? undefined
+  );
+};
+
+const dedupeMediaWarmTargets = (targets: MediaWarmTarget[]): MediaWarmTarget[] => {
+  const seen = new Set<string>();
+  return targets.filter((target) => {
+    if (!target.cacheKey || (!target.src && !target.fallbackSrc) || seen.has(target.cacheKey)) {
+      return false;
+    }
+    seen.add(target.cacheKey);
+    return true;
+  });
+};
+
+const warmMediaCacheEntry = async ({
+  cacheKey,
+  src,
+  fallbackSrc,
+  accessToken,
+  encryptedFile,
+  mimeType,
+}: MediaWarmTarget): Promise<boolean> => {
+  const primarySrc = src ?? fallbackSrc;
+  if (!cacheKey || !primarySrc) return false;
+  if (peekCachedMediaUrl(cacheKey)) return true;
+
+  const cachedUrl = await getCachedMediaUrl(cacheKey, mimeType, primarySrc);
+  if (cachedUrl) return true;
+
+  try {
+    const blob = await fetchMediaBlobDeduped(cacheKey, () =>
+      fetchMediaBlob(primarySrc, accessToken, fallbackSrc, encryptedFile, mimeType)
+    );
+    const storedUrl = await storeCachedMediaBlob(cacheKey, blob, mimeType ?? blob.type, primarySrc);
+    return Boolean(storedUrl || peekCachedMediaUrl(cacheKey));
+  } catch {
+    return false;
+  }
+};
+
+const runConcurrentTasks = async <T,>(
+  items: T[],
+  limit: number,
+  task: (item: T, index: number) => Promise<void>,
+  shouldStop?: () => boolean
+): Promise<void> => {
+  if (items.length === 0) return;
+
+  let nextIndex = 0;
+  const workerCount = Math.min(Math.max(limit, 1), items.length);
+
+  await Promise.allSettled(
+    Array.from({ length: workerCount }, async () => {
+      while (!shouldStop?.()) {
+        const currentIndex = nextIndex;
+        nextIndex += 1;
+        if (currentIndex >= items.length) return;
+        await task(items[currentIndex], currentIndex);
+      }
+    })
+  );
 };
 
 const useAuthenticatedMediaState = (
@@ -2870,6 +2968,8 @@ export function App() {
   >(undefined);
   const autoReadKeyRef = useRef<string>();
   const typingTimeoutRef = useRef<number | undefined>(undefined);
+  const warmedMediaKeysRef = useRef<Set<string>>(new Set());
+  const warmedMemberAvatarRoomIdsRef = useRef<Set<string>>(new Set());
   const [bootState, setBootState] = useState<BootState>('booting');
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -2937,6 +3037,7 @@ export function App() {
   const [keyRestoreMessage, setKeyRestoreMessage] = useState<{ type: 'success' | 'error'; text: string }>();
   const [pendingScrollEventId, setPendingScrollEventId] = useState<string>();
   const [highlightedMessageId, setHighlightedMessageId] = useState<string>();
+  const [focusedTimelineContext, setFocusedTimelineContext] = useState<FocusedTimelineContext>();
   const [roomProfileForm, setRoomProfileForm] = useState({ name: '', topic: '' });
   const [publicRooms, setPublicRooms] = useState<PublicRoomSummary[]>([]);
   const [publicSearch, setPublicSearch] = useState({ server: '', query: '' });
@@ -3008,6 +3109,11 @@ export function App() {
   useEffect(() => {
     previewMediaRef.current = previewMedia;
   }, [previewMedia]);
+
+  useEffect(() => {
+    warmedMediaKeysRef.current.clear();
+    warmedMemberAvatarRoomIdsRef.current.clear();
+  }, [client]);
 
   useEffect(() => {
     if (activeViewRef.current !== activeView) {
@@ -3417,10 +3523,19 @@ export function App() {
     return false;
   }, [activeView, favoriteRoomIds, roomFilter, selectedRoom, selectedSpaceId]);
 
+  const activeTimelineContext = useMemo(
+    () =>
+      selectedRoomId && !messageQuery.trim() && focusedTimelineContext?.roomId === selectedRoomId
+        ? focusedTimelineContext
+        : undefined,
+    [focusedTimelineContext, messageQuery, selectedRoomId]
+  );
+
   const selectedRoomMessages = useMemo(() => {
     if (!client || !selectedRoomId) return [];
+    if (activeTimelineContext) return activeTimelineContext.messages;
     return getRoomMessages(client, selectedRoomId, messageQuery);
-  }, [client, messageQuery, selectedRoomId, snapshot.version]);
+  }, [activeTimelineContext, client, messageQuery, selectedRoomId, snapshot.version]);
 
   const selectedRoomInlineReadReceiptStates = useMemo(
     () =>
@@ -3665,6 +3780,16 @@ export function App() {
   }, [selectedRoomId]);
 
   useEffect(() => {
+    if (!focusedTimelineContext || !selectedRoomId || focusedTimelineContext.roomId === selectedRoomId) return;
+    setFocusedTimelineContext(undefined);
+  }, [focusedTimelineContext, selectedRoomId]);
+
+  useEffect(() => {
+    if (!messageQuery.trim()) return;
+    setFocusedTimelineContext(undefined);
+  }, [messageQuery]);
+
+  useEffect(() => {
     if (!client || !selectedRoomId) {
       setRoomMembers([]);
       setTypingMembers([]);
@@ -3682,6 +3807,26 @@ export function App() {
   useEffect(() => {
     if (!client || !selectedRoomId) return undefined;
 
+    const unresolvedPinnedMessages = pinnedMessages.filter(
+      (message) => !message.available && typeof message.timestamp !== 'number'
+    );
+    if (unresolvedPinnedMessages.length === 0) return undefined;
+
+    let cancelled = false;
+
+    void hydratePinnedMessages(client, selectedRoomId, pinnedMessages).then((messages) => {
+      if (cancelled) return;
+      setPinnedMessages(messages);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [client, pinnedMessages, selectedRoomId]);
+
+  useEffect(() => {
+    if (!client || !selectedRoomId) return undefined;
+
     let cancelled = false;
 
     void loadRoomMembers(client, selectedRoomId).then((members) => {
@@ -3693,6 +3838,166 @@ export function App() {
       cancelled = true;
     };
   }, [client, selectedRoomId]);
+
+  useEffect(() => {
+    if (!isIosPlatform || !client || !session?.accessToken) return undefined;
+
+    let cancelled = false;
+    const accessToken = session.accessToken;
+
+    const avatarTargets: MediaWarmTarget[] = [
+      ...(ownProfile?.avatarUrl
+        ? [
+            {
+              cacheKey: ownProfile.avatarUrl,
+              src: ownProfile.avatarUrl,
+              fallbackSrc: ownProfile.avatarUrl,
+              accessToken,
+            },
+          ]
+        : []),
+      ...snapshot.rooms.flatMap((room) =>
+        room.avatarUrl
+          ? [
+              {
+                cacheKey: room.avatarUrl,
+                src: room.avatarUrl,
+                fallbackSrc: room.avatarUrl,
+                accessToken,
+              },
+            ]
+          : []
+      ),
+    ];
+
+    const emojiTargets = customEmojiItems.flatMap<MediaWarmTarget>((item) => {
+      const infoRecord = isRecord(item.info) ? item.info : undefined;
+      const mimeType = typeof infoRecord?.mimetype === 'string' ? infoRecord.mimetype : undefined;
+      const thumbAuthUrl = mxcToHttp(client, item.mxcUrl, 48, 48, true);
+      const thumbUrl = mxcToHttp(client, item.mxcUrl, 48, 48);
+      const fullAuthUrl = mxcToHttp(client, item.mxcUrl, undefined, undefined, true);
+      const fullUrl = mxcToHttp(client, item.mxcUrl);
+
+      return [
+        {
+          cacheKey: item.authUrl ?? item.url ?? item.mxcUrl,
+          src: item.authUrl ?? item.url,
+          fallbackSrc: item.downloadUrl ?? item.url,
+          accessToken,
+          mimeType,
+        },
+        {
+          cacheKey: thumbAuthUrl ?? thumbUrl ?? `${item.mxcUrl}#thumb`,
+          src: thumbAuthUrl ?? thumbUrl,
+          fallbackSrc: thumbUrl ?? thumbAuthUrl,
+          accessToken,
+          mimeType,
+        },
+        {
+          cacheKey: fullAuthUrl ?? fullUrl ?? item.downloadUrl ?? `${item.mxcUrl}#full`,
+          src: fullAuthUrl ?? fullUrl,
+          fallbackSrc: fullUrl ?? fullAuthUrl ?? item.downloadUrl,
+          accessToken,
+          mimeType,
+        },
+      ];
+    });
+
+    const targets = dedupeMediaWarmTargets([...avatarTargets, ...emojiTargets]).filter(
+      (target) => !warmedMediaKeysRef.current.has(target.cacheKey)
+    );
+
+    if (targets.length === 0) return undefined;
+
+    void runConcurrentTasks(
+      targets,
+      4,
+      async (target) => {
+        if (cancelled || warmedMediaKeysRef.current.has(target.cacheKey)) return;
+        const warmed = await warmMediaCacheEntry(target);
+        if (warmed) {
+          warmedMediaKeysRef.current.add(target.cacheKey);
+        }
+      },
+      () => cancelled
+    );
+
+    return () => {
+      cancelled = true;
+    };
+  }, [client, customEmojiItems, isIosPlatform, ownProfile?.avatarUrl, session?.accessToken, snapshot.version]);
+
+  useEffect(() => {
+    if (!isIosPlatform || !client || !session?.accessToken) return undefined;
+
+    let cancelled = false;
+    const accessToken = session.accessToken;
+    const joinedRooms = client
+      .getRooms()
+      .filter(
+        (room) => room.getMyMembership() === 'join' && !warmedMemberAvatarRoomIdsRef.current.has(room.roomId)
+      );
+
+    if (joinedRooms.length === 0) return undefined;
+
+    void runConcurrentTasks(
+      joinedRooms,
+      2,
+      async (room) => {
+        if (cancelled || warmedMemberAvatarRoomIdsRef.current.has(room.roomId)) return;
+
+        try {
+          await room.loadMembersIfNeeded();
+        } catch {
+          // Fall back to the currently known member list so we still warm what is available.
+        }
+
+        if (cancelled) return;
+
+        const targets = dedupeMediaWarmTargets(
+          room.getJoinedMembers().flatMap<MediaWarmTarget>((member) => {
+            const avatarMxc = member.getMxcAvatarUrl();
+            if (!avatarMxc) return [];
+
+            return [48, 72, 96].flatMap((size) => {
+              const avatarUrl = buildAvatarThumbnailUrl(client, avatarMxc, size);
+              if (!avatarUrl) return [];
+              return [
+                {
+                  cacheKey: avatarUrl,
+                  src: avatarUrl,
+                  fallbackSrc: avatarUrl,
+                  accessToken,
+                },
+              ];
+            });
+          })
+        ).filter((target) => !warmedMediaKeysRef.current.has(target.cacheKey));
+
+        await runConcurrentTasks(
+          targets,
+          4,
+          async (target) => {
+            if (cancelled || warmedMediaKeysRef.current.has(target.cacheKey)) return;
+            const warmed = await warmMediaCacheEntry(target);
+            if (warmed) {
+              warmedMediaKeysRef.current.add(target.cacheKey);
+            }
+          },
+          () => cancelled
+        );
+
+        if (!cancelled) {
+          warmedMemberAvatarRoomIdsRef.current.add(room.roomId);
+        }
+      },
+      () => cancelled
+    );
+
+    return () => {
+      cancelled = true;
+    };
+  }, [client, isIosPlatform, session?.accessToken, snapshot.version]);
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -4039,7 +4344,7 @@ export function App() {
 
   const settlePinnedTimelineBottom = useCallback(() => {
     const timeline = timelineRef.current;
-    if (!timeline || pendingScrollEventId || paginationAnchorRef.current) return;
+    if (!timeline || activeTimelineContext || pendingScrollEventId || paginationAnchorRef.current) return;
 
     autoScrollToBottomRef.current = true;
     setShowScrollToLatest(false);
@@ -4074,7 +4379,7 @@ export function App() {
       suppressAutoLoadOlderRef.current = false;
       pinnedTimelineSettleTimeoutRef.current = undefined;
     }, 180);
-  }, [pendingScrollEventId]);
+  }, [activeTimelineContext, pendingScrollEventId]);
 
   useLayoutEffect(() => {
     const handleResize = () => {
@@ -4170,14 +4475,24 @@ export function App() {
     });
   }, []);
 
+  const handleReturnToLatestTimeline = useCallback(() => {
+    setFocusedTimelineContext(undefined);
+    setPendingScrollEventId(undefined);
+    setHighlightedMessageId(undefined);
+    autoScrollToBottomRef.current = true;
+    setShowScrollToLatest(false);
+    window.requestAnimationFrame(() => scrollTimelineToBottom('auto'));
+  }, [scrollTimelineToBottom]);
+
   useEffect(() => {
     const timeline = timelineRef.current;
+    if (activeTimelineContext) return;
     if (!timeline || pendingScrollEventId || paginationAnchorRef.current) return;
     if (!autoScrollToBottomRef.current) return;
     if (initialRoomScrollRoomIdRef.current === selectedRoomId) return;
 
     scrollTimelineToBottom(selectedRoomMessages.length > 0 ? 'smooth' : 'auto');
-  }, [pendingScrollEventId, scrollTimelineToBottom, selectedRoomId, selectedRoomMessages.length]);
+  }, [activeTimelineContext, pendingScrollEventId, scrollTimelineToBottom, selectedRoomId, selectedRoomMessages.length]);
 
   useEffect(() => {
     if (!pendingScrollEventId) return;
@@ -4331,7 +4646,7 @@ export function App() {
     setBootState('signedOut');
   };
 
-  const handleSelectRoom = (roomId: string) => {
+  const handleSelectRoom = (roomId: string, options?: { preserveFocusedContext?: boolean }) => {
     const room = snapshot.rooms.find((item) => item.id === roomId);
     if (activeView === 'rooms' && roomFilter === 'spaces' && !selectedSpaceId && room?.space) {
       setSelectedSpaceId(room.id);
@@ -4341,6 +4656,9 @@ export function App() {
       return;
     }
 
+    if (!options?.preserveFocusedContext) {
+      setFocusedTimelineContext(undefined);
+    }
     setSelectedRoomId(roomId);
     setMobilePane('chat');
     setMessageQuery('');
@@ -4443,6 +4761,7 @@ export function App() {
       }
 
       setComposerMode({ type: 'normal' });
+      setFocusedTimelineContext(undefined);
       setComposerExpanded(false);
       setEmojiOpen(false);
       setRoomDrafts((current) => {
@@ -4669,13 +4988,14 @@ export function App() {
 
     if (
       timeline.scrollTop <= 48 &&
+      !activeTimelineContext &&
       !loadingOlderRef.current &&
       !messageQuery.trim() &&
       !suppressAutoLoadOlderRef.current
     ) {
       void loadOlderMessages();
     }
-  }, [loadOlderMessages, messageQuery]);
+  }, [activeTimelineContext, loadOlderMessages, messageQuery]);
 
   const handleCopyMessage = async (message: ChatMessage) => {
     const copied = await copyTextToClipboard(
@@ -4730,32 +5050,80 @@ export function App() {
     );
   };
 
-  const handleOpenPinnedMessage = useCallback(
+  const handleOpenRoomEvent = useCallback(
     async (roomId: string, eventId: string) => {
       if (!client) return;
 
-      const localMessage =
-        getRoomMessages(client, roomId).find((message) => message.id === eventId) ??
-        (roomId === selectedRoomId ? selectedRoomMessages.find((message) => message.id === eventId) : undefined);
+      autoScrollToBottomRef.current = false;
+      setShowScrollToLatest(false);
+      setError(undefined);
 
-      if (localMessage) {
+      const contextualMessage =
+        roomId === selectedRoomId ? selectedRoomMessages.find((message) => message.id === eventId) : undefined;
+      if (contextualMessage) {
         if (roomId !== selectedRoomId) {
-          handleSelectRoom(roomId);
+          handleSelectRoom(roomId, { preserveFocusedContext: true });
         }
         setPendingScrollEventId(eventId);
         return;
       }
 
-      setError(undefined);
-      const remoteMessage = await fetchRoomMessageById(client, roomId, eventId);
-      if (!remoteMessage) {
-        setError('暂时还没有拿到这条置顶消息，稍后再试。');
+      const liveMessage = getRoomMessages(client, roomId).find((message) => message.id === eventId);
+      if (liveMessage) {
+        setFocusedTimelineContext(undefined);
+        if (roomId !== selectedRoomId) {
+          handleSelectRoom(roomId, { preserveFocusedContext: true });
+        }
+        setPendingScrollEventId(eventId);
         return;
       }
 
+      const foundInLiveTimeline = await ensureRoomEventInLiveTimeline(client, roomId, eventId);
+      refreshSnapshot(client);
+
+      if (foundInLiveTimeline) {
+        setFocusedTimelineContext(undefined);
+        if (roomId !== selectedRoomId) {
+          handleSelectRoom(roomId, { preserveFocusedContext: true });
+        }
+        setPendingScrollEventId(eventId);
+        return;
+      }
+
+      const contextMessages = await loadRoomMessageContext(client, roomId, eventId);
+      if (contextMessages.length > 0) {
+        setFocusedTimelineContext({
+          roomId,
+          eventId,
+          messages: contextMessages,
+        });
+        if (roomId !== selectedRoomId) {
+          handleSelectRoom(roomId, { preserveFocusedContext: true });
+        }
+        setNotice('已定位到原消息附近');
+        setPendingScrollEventId(eventId);
+        return;
+      }
+
+      const remoteMessage = await fetchRoomMessageById(client, roomId, eventId);
+      if (!remoteMessage) {
+        setError('暂时还没有拿到这条消息，稍后再试。');
+        return;
+      }
+
+      if (roomId !== selectedRoomId) {
+        handleSelectRoom(roomId, { preserveFocusedContext: true });
+      }
       setSheet({ type: 'messageInfo', message: remoteMessage });
     },
-    [client, handleSelectRoom, selectedRoomId, selectedRoomMessages]
+    [client, handleSelectRoom, refreshSnapshot, selectedRoomId, selectedRoomMessages]
+  );
+
+  const handleOpenPinnedMessage = useCallback(
+    async (roomId: string, eventId: string) => {
+      await handleOpenRoomEvent(roomId, eventId);
+    },
+    [handleOpenRoomEvent]
   );
 
   const handleOpenMessageInfo = (message: ChatMessage) => {
@@ -6189,10 +6557,7 @@ export function App() {
                 <LocalSearchDigest
                   results={localSearchResults}
                   mediaAccessToken={session?.accessToken}
-                  onOpen={(roomId, eventId) => {
-                    handleSelectRoom(roomId);
-                    setPendingScrollEventId(eventId);
-                  }}
+                  onOpen={(roomId, eventId) => void handleOpenRoomEvent(roomId, eventId)}
                 />
               )}
             </div>
@@ -6437,10 +6802,19 @@ export function App() {
                 ref={timelineRef}
                 onScroll={handleTimelineScroll}
               >
-                <button className="load-older" onClick={() => void loadOlderMessages()} disabled={loadingOlder}>
-                  <History size={15} />
-                  {loadingOlder ? '加载中...' : '加载更早消息'}
-                </button>
+                {activeTimelineContext ? (
+                  <div className="timeline-context-banner">
+                    <span>正在查看原消息附近</span>
+                    <button type="button" onClick={handleReturnToLatestTimeline}>
+                      返回最新
+                    </button>
+                  </div>
+                ) : (
+                  <button className="load-older" onClick={() => void loadOlderMessages()} disabled={loadingOlder}>
+                    <History size={15} />
+                    {loadingOlder ? '加载中...' : '加载更早消息'}
+                  </button>
+                )}
                 {selectedRoomMessages.length === 0 ? (
                   <EmptyState
                     icon={<MessageCircle size={30} />}
@@ -6477,7 +6851,7 @@ export function App() {
                             setComposerMode({ type: 'reply', message });
                             setMessageDraft('');
                           }}
-                          onOpenReply={(eventId) => setPendingScrollEventId(eventId)}
+                          onOpenReply={(eventId) => void handleOpenRoomEvent(message.roomId, eventId)}
                           onInfo={() => handleOpenMessageInfo(message)}
                           onEdit={() => handleEditMessage(message)}
                           onRedact={() => handleRedactMessage(message)}
@@ -6513,11 +6887,11 @@ export function App() {
                   })
                 )}
               </div>
-              {showScrollToLatest && selectedRoomMessages.length > 0 && (
+              {showScrollToLatest && selectedRoomMessages.length > 0 && !activeTimelineContext && (
                 <button
                   className="scroll-to-latest-button"
                   type="button"
-                  onClick={() => scrollTimelineToBottom()}
+                  onClick={handleReturnToLatestTimeline}
                   aria-label="回到底部最新消息"
                 >
                   <ChevronDown size={20} />
@@ -7770,8 +8144,15 @@ function PinnedBar({
   onOpen: (eventId: string) => void;
   onOpenAll: () => void;
 }) {
-  const first = items[0];
+  const firstResolved =
+    items.find((item) => item.available || typeof item.timestamp === 'number' || Boolean(item.senderName)) ?? items[0];
+  const first = firstResolved;
   if (!first) return null;
+
+  const summaryText =
+    first.available || typeof first.timestamp === 'number' || Boolean(first.senderName)
+      ? getReadableMessageBody(first.body)
+      : `${items.length} 条置顶消息暂时无法显示`;
 
   return (
     <section className="pinned-bar">
@@ -7779,7 +8160,7 @@ function PinnedBar({
         <Pin size={16} />
         <span>
           <strong>{first.senderName ?? '置顶消息'}</strong>
-          <small>{getReadableMessageBody(first.body)}</small>
+          <small>{summaryText}</small>
         </span>
       </button>
       <button className="pinned-count" onClick={onOpenAll}>
@@ -12124,9 +12505,11 @@ function RoomInfoSheet({
                   <span>
                     <strong>{message.senderName ?? '置顶消息'}</strong>
                     <small>
-                      {!message.available ? '未同步 · ' : ''}
-                      {message.timestamp ? `${formatTime(message.timestamp)} · ` : ''}
-                      {getReadableMessageBody(message.body)}
+                      {!message.available && typeof message.timestamp !== 'number'
+                        ? '服务端暂时拿不到原文'
+                        : `${!message.available ? '未同步 · ' : ''}${
+                            message.timestamp ? `${formatTime(message.timestamp)} · ` : ''
+                          }${getReadableMessageBody(message.body)}`}
                     </small>
                   </span>
                 </button>
