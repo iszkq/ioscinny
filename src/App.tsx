@@ -38,7 +38,6 @@ import {
   MessageSquarePlus,
   Mic,
   Moon,
-  MoreHorizontal,
   Pause,
   Pin,
   PinOff,
@@ -75,6 +74,7 @@ import {
   KeyboardEvent,
   MutableRefObject,
   MouseEvent as ReactMouseEvent,
+  memo,
   PointerEvent as ReactPointerEvent,
   ReactNode,
   TouchEvent as ReactTouchEvent,
@@ -145,6 +145,7 @@ import {
   redactMessage,
   rejectInvite,
   reorderCustomEmojiPack,
+  retryPendingMessage,
   RoomNotificationMode,
   RoomMediaItem,
   RoomMemberSummary,
@@ -254,6 +255,16 @@ type AudioTranscriptionState = {
   detail?: string;
   error?: string;
 };
+type ResumeState = {
+  activeView: PrimaryView;
+  mobilePane: MobilePane;
+  selectedRoomId?: string;
+  updatedAt: number;
+};
+type PendingNativeCaptureIntent = {
+  kind: 'photo' | 'video';
+  startedAt: number;
+};
 type ExploreSourceEditorDraft = {
   kind: ExploreSourceKind;
   title: string;
@@ -311,9 +322,13 @@ const defaultHomeserver = 'https://mtx01.cc';
 const favoriteRoomsKey = 'ioscinny.favoriteRooms';
 const favoriteMessagesKey = 'ioscinny.favoriteMessages';
 const favoriteMessageSnapshotsKey = 'ioscinny.favoriteMessageSnapshots';
+const customEmojiSnapshotKey = 'ioscinny.customEmojiItems';
 const appPreferencesKey = 'ioscinny.preferences';
+const resumeStateKey = 'ioscinny.resumeState';
+const pendingNativeCaptureIntentKey = 'ioscinny.pendingNativeCaptureIntent';
 const roomDraftsKey = 'ioscinny.roomDrafts';
 const exploreServerSourcesKey = 'ioscinny.exploreServers';
+const PENDING_NATIVE_CAPTURE_INTENT_MAX_AGE_MS = 10 * 60 * 1000;
 const MAX_AUDIO_TRANSCRIPTION_DURATION_SEC = 5 * 60;
 const BROWSER_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC = 20;
 const BROWSER_AUDIO_TRANSCRIPTION_SEGMENT_COOLDOWN_MS = 150;
@@ -322,6 +337,7 @@ const AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_DURATION_SEC = 75;
 const AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_COOLDOWN_MS = 120;
 const AIHUBMIX_CHUNKING_MIN_DURATION_SEC = 90;
 const MAX_RECOGNITION_RESTARTS_PER_SEGMENT = 2;
+const MAX_CUSTOM_EMOJI_SNAPSHOT_ITEMS = 4096;
 const roomNotificationOptions: RoomNotificationMode[] = ['default', 'all', 'mentions', 'mute'];
 const roomNotificationLabels: Record<RoomNotificationMode, string> = {
   default: '默认',
@@ -436,6 +452,17 @@ const reorderOrderableEmojiPacks = (
 };
 
 const bottomPrimaryViews: PrimaryView[] = ['home', 'direct', 'rooms', 'settings'];
+const primaryViewValues: PrimaryView[] = [
+  'home',
+  'direct',
+  'rooms',
+  'spaces',
+  'invites',
+  'favorites',
+  'explore',
+  'settings',
+];
+const mobilePaneValues: MobilePane[] = ['list', 'chat'];
 const roomFilterLabels: Record<RoomFilter, string> = {
   all: '全部',
   spaces: '空间',
@@ -539,6 +566,29 @@ const syncLabel = (state: SyncState | null): string => {
       return '已停止';
     default:
       return '等待同步';
+  }
+};
+
+const matrixSyncReadyStates = new Set<SyncState>([SyncState.Prepared, SyncState.Syncing]);
+const matrixSyncRetryStates = new Set<SyncState>([
+  SyncState.Error,
+  SyncState.Reconnecting,
+  SyncState.Stopped,
+]);
+const matrixConnectionStaleMs = 45_000;
+
+const getMessageSendStatusLabel = (message: Pick<ChatMessage, 'sendStatus'>): string | undefined => {
+  switch (message.sendStatus) {
+    case 'encrypting':
+      return '加密中';
+    case 'queued':
+      return '排队中';
+    case 'sending':
+      return '发送中';
+    case 'failed':
+      return '未发出';
+    default:
+      return undefined;
   }
 };
 
@@ -1044,7 +1094,20 @@ const sanitizeRichTextHtml = (
         return fallbackText ? escapeHtml(fallbackText) : '';
       }
 
-      return `<img class="message-inline-emoji" src="${escapeHtml(safeSrc)}" alt="${escapeHtml(
+      const rawSrc = (element.getAttribute('src') ?? '').trim();
+      const safeCacheKey = rawSrc.startsWith('mxc://') ? safeSrc : rawSrc || safeSrc;
+      const safeFallbackSrc = rawSrc.startsWith('mxc://')
+        ? (client
+            ? mxcToHttp(client, rawSrc, undefined, undefined, true) ?? mxcToHttp(client, rawSrc)
+            : undefined) ??
+          safeSrc
+        : safeSrc;
+
+      return `<img class="message-inline-emoji" src="${escapeHtml(safeSrc)}" data-media-cache-key="${escapeHtml(
+        safeCacheKey
+      )}" data-media-src="${escapeHtml(safeSrc)}" data-media-fallback-src="${escapeHtml(
+        safeFallbackSrc ?? safeSrc
+      )}" alt="${escapeHtml(
         rawAlt || rawTitle || '表情'
       )}" title="${escapeHtml(rawTitle || rawAlt || '表情')}" loading="lazy" decoding="async" draggable="false">`;
     }
@@ -2648,6 +2711,59 @@ const saveFavoriteMessageSnapshots = (value: Record<string, StoredFavoriteMessag
   window.localStorage.setItem(favoriteMessageSnapshotsKey, JSON.stringify(value));
 };
 
+const loadCustomEmojiSnapshot = (): CustomEmojiItem[] => {
+  try {
+    const value = window.localStorage.getItem(customEmojiSnapshotKey);
+    const parsed = value ? JSON.parse(value) : [];
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .map((item) => {
+        if (!item || typeof item !== 'object') return undefined;
+        const record = item as Partial<CustomEmojiItem>;
+        const usage = Array.isArray(record.usage)
+          ? record.usage.filter(
+              (entry): entry is CustomEmojiUsage => entry === 'emoticon' || entry === 'sticker'
+            )
+          : [];
+        if (
+          typeof record.id !== 'string' ||
+          typeof record.packId !== 'string' ||
+          typeof record.shortcode !== 'string' ||
+          typeof record.body !== 'string' ||
+          typeof record.packName !== 'string' ||
+          typeof record.mxcUrl !== 'string'
+        ) {
+          return undefined;
+        }
+
+        return {
+          ...record,
+          usage: usage.length > 0 ? usage : ['emoticon', 'sticker'],
+        } as CustomEmojiItem;
+      })
+      .filter((item): item is CustomEmojiItem => Boolean(item))
+      .slice(0, MAX_CUSTOM_EMOJI_SNAPSHOT_ITEMS);
+  } catch {
+    return [];
+  }
+};
+
+const saveCustomEmojiSnapshot = (items: CustomEmojiItem[]) => {
+  if (items.length === 0) {
+    window.localStorage.removeItem(customEmojiSnapshotKey);
+    return;
+  }
+  window.localStorage.setItem(
+    customEmojiSnapshotKey,
+    JSON.stringify(items.slice(0, MAX_CUSTOM_EMOJI_SNAPSHOT_ITEMS))
+  );
+};
+
+const clearCustomEmojiSnapshot = () => {
+  window.localStorage.removeItem(customEmojiSnapshotKey);
+};
+
 const getFavoriteSnapshotKey = (roomId: string, eventId: string): string => `${roomId}|${eventId}`;
 
 const cloneFavoriteSnapshotMessage = (message: ChatMessage): ChatMessage => {
@@ -2742,6 +2858,70 @@ const loadPreferences = (): AppPreferences => {
 
 const savePreferences = (value: AppPreferences) => {
   window.localStorage.setItem(appPreferencesKey, JSON.stringify(value));
+};
+
+const isPrimaryView = (value: unknown): value is PrimaryView =>
+  typeof value === 'string' && primaryViewValues.includes(value as PrimaryView);
+
+const isMobilePane = (value: unknown): value is MobilePane =>
+  typeof value === 'string' && mobilePaneValues.includes(value as MobilePane);
+
+const loadResumeState = (): ResumeState => {
+  try {
+    const value = window.localStorage.getItem(resumeStateKey);
+    const parsed = value ? (JSON.parse(value) as Partial<ResumeState>) : undefined;
+    const selectedRoomId = typeof parsed?.selectedRoomId === 'string' ? parsed.selectedRoomId : undefined;
+    return {
+      activeView: isPrimaryView(parsed?.activeView) ? parsed.activeView : 'home',
+      mobilePane: isMobilePane(parsed?.mobilePane) ? parsed.mobilePane : selectedRoomId ? 'chat' : 'list',
+      selectedRoomId,
+      updatedAt: typeof parsed?.updatedAt === 'number' ? parsed.updatedAt : 0,
+    };
+  } catch {
+    return {
+      activeView: 'home',
+      mobilePane: 'list',
+      selectedRoomId: undefined,
+      updatedAt: 0,
+    };
+  }
+};
+
+const saveResumeState = (value: ResumeState) => {
+  window.localStorage.setItem(resumeStateKey, JSON.stringify(value));
+};
+
+const clearResumeState = () => {
+  window.localStorage.removeItem(resumeStateKey);
+};
+
+const loadPendingNativeCaptureIntent = (): PendingNativeCaptureIntent | undefined => {
+  try {
+    const value = window.localStorage.getItem(pendingNativeCaptureIntentKey);
+    const parsed = value ? (JSON.parse(value) as Partial<PendingNativeCaptureIntent>) : undefined;
+    if (!parsed || (parsed.kind !== 'photo' && parsed.kind !== 'video')) return undefined;
+    if (
+      typeof parsed.startedAt !== 'number' ||
+      Date.now() - parsed.startedAt > PENDING_NATIVE_CAPTURE_INTENT_MAX_AGE_MS
+    ) {
+      window.localStorage.removeItem(pendingNativeCaptureIntentKey);
+      return undefined;
+    }
+    return {
+      kind: parsed.kind,
+      startedAt: parsed.startedAt,
+    };
+  } catch {
+    return undefined;
+  }
+};
+
+const savePendingNativeCaptureIntent = (value: PendingNativeCaptureIntent) => {
+  window.localStorage.setItem(pendingNativeCaptureIntentKey, JSON.stringify(value));
+};
+
+const clearPendingNativeCaptureIntent = () => {
+  window.localStorage.removeItem(pendingNativeCaptureIntentKey);
 };
 
 const initials = (name: string): string => {
@@ -2899,6 +3079,7 @@ const previewToolbarZoomFactor = 1.12;
 const previewWheelZoomSensitivity = 0.0012;
 const iosEdgeBackGestureZonePx = 28;
 const iosBackGestureTriggerPx = 72;
+const iosBackGestureVisualDistancePx = 120;
 const composerCollapsedMinHeightPx = 42;
 const composerCollapsedMaxHeightPx = 96;
 const composerAttachmentInputIds = {
@@ -2907,6 +3088,7 @@ const composerAttachmentInputIds = {
   video: 'composer-attachment-video',
   cameraImage: 'composer-attachment-camera-image',
   cameraVideo: 'composer-attachment-camera-video',
+  audioCapture: 'composer-attachment-audio-capture',
 } as const;
 
 const isCompactMediaAsset = (width?: number, height?: number): boolean =>
@@ -2984,6 +3166,11 @@ const isMatrixSessionExpiredError = (error: unknown): boolean => {
 };
 
 export function App() {
+  const initialResumeStateRef = useRef<ResumeState>();
+  if (!initialResumeStateRef.current) {
+    initialResumeStateRef.current = loadResumeState();
+  }
+  const initialResumeState = initialResumeStateRef.current;
   const runtimeStopRef = useRef<(() => void) | undefined>();
   const runtimeSessionCleanupRef = useRef<(() => void) | undefined>();
   const sessionExpiryHandledRef = useRef(false);
@@ -2993,6 +3180,7 @@ export function App() {
   const recordingChunksRef = useRef<Blob[]>([]);
   const recordingTimerRef = useRef<number | undefined>(undefined);
   const recordingCancelledRef = useRef(false);
+  const audioCaptureInputRef = useRef<HTMLInputElement | null>(null);
   const composerInputRef = useRef<HTMLTextAreaElement | null>(null);
   const timelineRef = useRef<HTMLDivElement | null>(null);
   const emojiTrayRef = useRef<HTMLDivElement | null>(null);
@@ -3018,10 +3206,11 @@ export function App() {
     } | undefined
   >(undefined);
   const sheetRef = useRef<Sheet>(undefined);
-  const mobilePaneRef = useRef<MobilePane>('list');
+  const mobilePaneRef = useRef<MobilePane>(initialResumeState.mobilePane);
   const previewMediaRef = useRef<RoomMediaItem | undefined>(undefined);
-  const activeViewRef = useRef<PrimaryView>('home');
-  const previousActiveViewRef = useRef<PrimaryView>('home');
+  const activeViewRef = useRef<PrimaryView>(initialResumeState.activeView);
+  const previousActiveViewRef = useRef<PrimaryView>(initialResumeState.activeView);
+  const appFrameRef = useRef<HTMLElement | null>(null);
   const iosEdgeBackGestureRef = useRef<
     | {
         identifier: number;
@@ -3031,10 +3220,17 @@ export function App() {
       }
     | undefined
   >(undefined);
+  const iosEdgeBackResetTimeoutRef = useRef<number | undefined>(undefined);
   const autoReadKeyRef = useRef<string>();
   const typingTimeoutRef = useRef<number | undefined>(undefined);
+  const typingActiveRef = useRef(false);
+  const roomDraftCommitTimeoutRef = useRef<number | undefined>(undefined);
+  const pendingRoomDraftCommitRef = useRef<{ roomId: string; value: string }>();
   const warmedMediaKeysRef = useRef<Set<string>>(new Set());
   const warmedMemberAvatarRoomIdsRef = useRef<Set<string>>(new Set());
+  const lastMatrixActivityAtRef = useRef(Date.now());
+  const syncStateRef = useRef<SyncState | null>(null);
+  const matrixReconnectInFlightRef = useRef(false);
   const [bootState, setBootState] = useState<BootState>('booting');
   const [error, setError] = useState<string>();
   const [notice, setNotice] = useState<string>();
@@ -3042,9 +3238,10 @@ export function App() {
   const [client, setClient] = useState<MatrixClient>();
   const [snapshot, setSnapshot] = useState<MatrixSnapshot>(emptySnapshot);
   const [syncState, setSyncState] = useState<SyncState | null>(null);
-  const [selectedRoomId, setSelectedRoomId] = useState<string>();
-  const [activeView, setActiveView] = useState<PrimaryView>('home');
-  const [mobilePane, setMobilePane] = useState<MobilePane>('list');
+  const [connectionTick, setConnectionTick] = useState(0);
+  const [selectedRoomId, setSelectedRoomId] = useState<string | undefined>(() => initialResumeState.selectedRoomId);
+  const [activeView, setActiveView] = useState<PrimaryView>(() => initialResumeState.activeView);
+  const [mobilePane, setMobilePane] = useState<MobilePane>(() => initialResumeState.mobilePane);
   const [sheet, setSheet] = useState<Sheet>();
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedMessageIds, setSelectedMessageIds] = useState<string[]>([]);
@@ -3093,10 +3290,14 @@ export function App() {
   const [typingMembers, setTypingMembers] = useState<string[]>([]);
   const [roomMediaItems, setRoomMediaItems] = useState<RoomMediaItem[]>([]);
   const [pinnedMessages, setPinnedMessages] = useState<PinnedMessageSummary[]>([]);
-  const [customEmojiItems, setCustomEmojiItems] = useState<CustomEmojiItem[]>([]);
+  const [customEmojiItems, setCustomEmojiItems] = useState<CustomEmojiItem[]>(() => loadCustomEmojiSnapshot());
   const [audioTranscriptions, setAudioTranscriptions] = useState<Record<string, AudioTranscriptionState>>({});
   const [previewMedia, setPreviewMedia] = useState<RoomMediaItem>();
   const [cryptoStatus, setCryptoStatus] = useState<CryptoStatus>({ cryptoReady: false });
+  const [cryptoStatusReady, setCryptoStatusReady] = useState(false);
+  const [pendingNativeCaptureIntent, setPendingNativeCaptureIntent] = useState<PendingNativeCaptureIntent | undefined>(
+    () => loadPendingNativeCaptureIntent()
+  );
   const [recoveryPassphrase, setRecoveryPassphrase] = useState('');
   const [keyRestoreProgress, setKeyRestoreProgress] = useState('');
   const [keyRestoreMessage, setKeyRestoreMessage] = useState<{ type: 'success' | 'error'; text: string }>();
@@ -3126,6 +3327,7 @@ export function App() {
   const audioTranscriptionApplyingRemoteSignatureRef = useRef<string>();
   const audioTranscriptionPendingSaveSignatureRef = useRef<string>();
   const audioTranscriptionHydratedRef = useRef(false);
+  const pendingNativeCaptureNoticeShownRef = useRef(false);
 
   const currentUserServer = serverFromUserId(session?.userId);
   const isIosPlatform = Capacitor.getPlatform() === 'ios';
@@ -3133,6 +3335,34 @@ export function App() {
     () => exploreSources.find((source) => source.id === selectedExploreSourceId) ?? exploreSources[0],
     [exploreSources, selectedExploreSourceId]
   );
+
+  const clearIosEdgeBackResetTimeout = useCallback(() => {
+    if (typeof iosEdgeBackResetTimeoutRef.current === 'number') {
+      window.clearTimeout(iosEdgeBackResetTimeoutRef.current);
+      iosEdgeBackResetTimeoutRef.current = undefined;
+    }
+  }, []);
+
+  const setIosEdgeBackVisual = useCallback(
+    (deltaX: number, active: boolean) => {
+      const frame = appFrameRef.current;
+      if (!frame) return;
+
+      const progress = Math.max(0, Math.min(deltaX / iosBackGestureVisualDistancePx, 1));
+      frame.dataset.edgeBackActive = active ? 'true' : 'false';
+      frame.style.setProperty('--ios-edge-back-shift', `${Math.round(progress * 26)}px`);
+      frame.style.setProperty('--ios-edge-back-radius', `${Math.round(progress * 18)}px`);
+    },
+    []
+  );
+
+  const resetIosEdgeBackVisual = useCallback(() => {
+    const frame = appFrameRef.current;
+    if (!frame) return;
+    frame.dataset.edgeBackActive = 'false';
+    frame.style.setProperty('--ios-edge-back-shift', '0px');
+    frame.style.setProperty('--ios-edge-back-radius', '0px');
+  }, []);
 
   const canPerformEdgeBackNavigation = useCallback(() => {
     if (previewMediaRef.current) return true;
@@ -3181,6 +3411,20 @@ export function App() {
   }, [client]);
 
   useEffect(() => {
+    syncStateRef.current = syncState;
+  }, [syncState]);
+
+  useEffect(() => {
+    if (!client) return undefined;
+
+    const interval = window.setInterval(() => {
+      setConnectionTick((current) => current + 1);
+    }, 15_000);
+
+    return () => window.clearInterval(interval);
+  }, [client]);
+
+  useEffect(() => {
     if (activeViewRef.current !== activeView) {
       previousActiveViewRef.current = activeViewRef.current;
       activeViewRef.current = activeView;
@@ -3188,12 +3432,46 @@ export function App() {
   }, [activeView]);
 
   useEffect(() => {
+    const persistedSelectedRoomId =
+      activeView === 'explore' || activeView === 'settings' ? undefined : selectedRoomId;
+    saveResumeState({
+      activeView,
+      mobilePane: persistedSelectedRoomId ? mobilePane : 'list',
+      selectedRoomId: persistedSelectedRoomId,
+      updatedAt: Date.now(),
+    });
+  }, [activeView, mobilePane, selectedRoomId]);
+
+  useEffect(() => {
     return () => {
       if (typingTimeoutRef.current) {
         window.clearTimeout(typingTimeoutRef.current);
       }
+      if (roomDraftCommitTimeoutRef.current) {
+        window.clearTimeout(roomDraftCommitTimeoutRef.current);
+      }
+      clearIosEdgeBackResetTimeout();
+      resetIosEdgeBackVisual();
       speechRecognitionRef.current?.stop();
     };
+  }, [clearIosEdgeBackResetTimeout, resetIosEdgeBackVisual]);
+
+  const markMatrixActivity = useCallback(() => {
+    lastMatrixActivityAtRef.current = Date.now();
+  }, []);
+
+  const clearPendingNativeCapture = useCallback(() => {
+    clearPendingNativeCaptureIntent();
+    setPendingNativeCaptureIntent(undefined);
+  }, []);
+
+  const preparePendingNativeCapture = useCallback((kind: PendingNativeCaptureIntent['kind']) => {
+    const intent = {
+      kind,
+      startedAt: Date.now(),
+    } satisfies PendingNativeCaptureIntent;
+    savePendingNativeCaptureIntent(intent);
+    setPendingNativeCaptureIntent(intent);
   }, []);
 
   const stopRuntime = useCallback(() => {
@@ -3209,12 +3487,15 @@ export function App() {
     setTypingMembers([]);
     setRoomMediaItems([]);
     setPinnedMessages([]);
-    setCustomEmojiItems([]);
+    setCryptoStatus({ cryptoReady: false });
+    setCryptoStatusReady(false);
+    setCustomEmojiItems((current) => (current.length > 0 ? current : loadCustomEmojiSnapshot()));
     setAudioTranscriptions({});
     setSelectionMode(false);
     setSelectedMessageIds([]);
     setPendingScrollEventId(undefined);
     setHighlightedMessageId(undefined);
+    matrixReconnectInFlightRef.current = false;
   }, []);
 
   const refreshSnapshot = useCallback(
@@ -3270,12 +3551,15 @@ export function App() {
   const refreshCryptoStatus = useCallback(async (mx?: MatrixClient) => {
     if (!mx) {
       setCryptoStatus({ cryptoReady: false });
+      setCryptoStatusReady(false);
       return;
     }
     try {
       setCryptoStatus(await getCryptoStatus(mx));
     } catch {
       setCryptoStatus({ cryptoReady: Boolean(mx.getCrypto()) });
+    } finally {
+      setCryptoStatusReady(true);
     }
   }, []);
 
@@ -3283,12 +3567,13 @@ export function App() {
     async (nextSession: StoredMatrixSession) => {
       sessionExpiryHandledRef.current = false;
       stopRuntime();
+      setCryptoStatusReady(false);
       setBootState('connecting');
       setError(undefined);
 
       try {
         await verifyStoredSession(nextSession);
-        const runtime = await createMatrixRuntime(nextSession, setSnapshot, setSyncState);
+        const runtime = await createMatrixRuntime(nextSession, setSnapshot, setSyncState, markMatrixActivity);
 
         const handleRuntimeLoggedOut = (err: Error) => {
           void handleSessionExpired(err, nextSession);
@@ -3325,6 +3610,7 @@ export function App() {
         setClient(runtime.client);
         setSession(nextSession);
         setBootState('signedIn');
+        markMatrixActivity();
         void refreshCryptoStatus(runtime.client);
       } catch (err) {
         if (isMatrixSessionExpiredError(err)) {
@@ -3336,7 +3622,37 @@ export function App() {
         setBootState('error');
       }
     },
-    [handleSessionExpired, refreshCryptoStatus, stopRuntime]
+    [handleSessionExpired, markMatrixActivity, refreshCryptoStatus, stopRuntime]
+  );
+
+  const isMatrixConnectionHealthy = useCallback((): boolean => {
+    if (!client) return false;
+    if (!matrixSyncReadyStates.has(syncStateRef.current ?? SyncState.Stopped)) return false;
+    return Date.now() - lastMatrixActivityAtRef.current < matrixConnectionStaleMs;
+  }, [client]);
+
+  const attemptMatrixRecovery = useCallback(
+    (reason: 'manual' | 'resume' | 'online' = 'manual') => {
+      if (!client || !session || bootState !== 'signedIn') return;
+      if (matrixReconnectInFlightRef.current) return;
+
+      const retryTriggered = client.retryImmediately();
+      if (retryTriggered) {
+        if (reason === 'manual') {
+          setNotice('正在恢复 Matrix 连接');
+        }
+        return;
+      }
+
+      matrixReconnectInFlightRef.current = true;
+      if (reason === 'manual') {
+        setNotice('正在重新连接 Matrix');
+      }
+      void connectSession(session).finally(() => {
+        matrixReconnectInFlightRef.current = false;
+      });
+    },
+    [bootState, client, connectSession, session]
   );
 
   useEffect(() => {
@@ -3376,6 +3692,53 @@ export function App() {
       void backButton.then((listener) => listener.remove());
     };
   }, [connectSession, performEdgeBackNavigation, stopRuntime]);
+
+  useEffect(() => {
+    if (!client || !session || bootState !== 'signedIn') return undefined;
+
+    const recoverIfNeeded = (reason: 'resume' | 'online') => {
+      if (isMatrixConnectionHealthy()) return;
+      attemptMatrixRecovery(reason);
+    };
+
+    const appStateListener = CapacitorApp.addListener('appStateChange', ({ isActive }) => {
+      if (!isActive) return;
+      recoverIfNeeded('resume');
+    });
+    const resumeListener = CapacitorApp.addListener('resume', () => {
+      recoverIfNeeded('resume');
+    });
+    const handleOnline = () => recoverIfNeeded('online');
+
+    window.addEventListener('online', handleOnline);
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      void appStateListener.then((listener) => listener.remove());
+      void resumeListener.then((listener) => listener.remove());
+    };
+  }, [attemptMatrixRecovery, bootState, client, isMatrixConnectionHealthy, session]);
+
+  useEffect(() => {
+    if (!pendingNativeCaptureIntent) {
+      pendingNativeCaptureNoticeShownRef.current = false;
+      return;
+    }
+    if (bootState !== 'signedIn' || pendingNativeCaptureNoticeShownRef.current) return;
+
+    pendingNativeCaptureNoticeShownRef.current = true;
+    setNotice(
+      pendingNativeCaptureIntent.kind === 'video'
+        ? '已从系统录像返回，正在恢复同步、加密与本地媒体缓存'
+        : '已从系统相机返回，正在恢复同步、加密与本地媒体缓存'
+    );
+
+    const timeoutId = window.setTimeout(() => {
+      clearPendingNativeCapture();
+      pendingNativeCaptureNoticeShownRef.current = false;
+    }, 5000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [bootState, clearPendingNativeCapture, pendingNativeCaptureIntent]);
 
   const handleAudioTranscriptionSettingsChange = useCallback(
     (value: AudioTranscriptionSettings) => {
@@ -3548,6 +3911,63 @@ export function App() {
     [selectedSpaceId, snapshot.rooms]
   );
 
+  const roomAvatarWarmSignature = useMemo(
+    () =>
+      snapshot.rooms
+        .map((room) => `${room.id}:${room.avatarUrl ?? ''}`)
+        .join('|'),
+    [snapshot.rooms]
+  );
+
+  const joinedRoomWarmSignature = useMemo(
+    () =>
+      snapshot.rooms
+        .filter((room) => room.membership === 'join')
+        .map((room) => room.id)
+        .join('|'),
+    [snapshot.rooms]
+  );
+
+  const matrixConnectionHealthy = useMemo(
+    () => isMatrixConnectionHealthy(),
+    [connectionTick, isMatrixConnectionHealthy, snapshot.version, syncState]
+  );
+
+  const matrixConnectionBanner = useMemo(() => {
+    if (!client || bootState !== 'signedIn') return undefined;
+    if (syncState == null) return undefined;
+
+    if (!matrixConnectionHealthy) {
+      return {
+        tone: 'danger' as const,
+        text: `Matrix 连接异常，当前消息可能只停留在本地。点这里立即恢复连接`,
+      };
+    }
+
+    if (matrixSyncRetryStates.has(syncState ?? SyncState.Stopped)) {
+      return {
+        tone: syncState === SyncState.Reconnecting ? ('warning' as const) : ('danger' as const),
+        text: `Matrix ${syncLabel(syncState)}中，新的消息可能会延迟送达。点这里立即恢复连接`,
+      };
+    }
+
+    return undefined;
+  }, [bootState, client, matrixConnectionHealthy, syncState]);
+
+  useEffect(() => {
+    if (!client || !session || bootState !== 'signedIn' || syncState == null) return undefined;
+    if (typeof navigator !== 'undefined' && 'onLine' in navigator && navigator.onLine === false) {
+      return undefined;
+    }
+    if (matrixConnectionHealthy && !matrixSyncRetryStates.has(syncState)) return undefined;
+
+    const timeoutId = window.setTimeout(() => {
+      attemptMatrixRecovery('online');
+    }, matrixConnectionHealthy ? 2500 : 1200);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [attemptMatrixRecovery, bootState, client, matrixConnectionHealthy, session, syncState]);
+
   const selectedRoomMatchesActiveView = useMemo(() => {
     if (!selectedRoom) return false;
 
@@ -3616,6 +4036,23 @@ export function App() {
         (message) => selectedMessageIds.includes(message.id) && isForwardableMessage(message)
       ),
     [selectedMessageIds, selectedRoomMessages]
+  );
+
+  const selectedRoomPendingSendCount = useMemo(
+    () =>
+      selectedRoomMessages.filter(
+        (message) =>
+          message.mine &&
+          (message.sendStatus === 'sending' ||
+            message.sendStatus === 'queued' ||
+            message.sendStatus === 'encrypting')
+      ).length,
+    [selectedRoomMessages]
+  );
+
+  const selectedRoomFailedSendCount = useMemo(
+    () => selectedRoomMessages.filter((message) => message.mine && message.sendStatus === 'failed').length,
+    [selectedRoomMessages]
   );
 
   const messageInfoMessage = useMemo(() => {
@@ -3976,7 +4413,7 @@ export function App() {
 
     void runConcurrentTasks(
       targets,
-      4,
+      2,
       async (target) => {
         if (cancelled || warmedMediaKeysRef.current.has(target.cacheKey)) return;
         const warmed = await warmMediaCacheEntry(target);
@@ -3990,7 +4427,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [client, customEmojiItems, isIosPlatform, ownProfile?.avatarUrl, session?.accessToken, snapshot.version]);
+  }, [client, customEmojiItems, isIosPlatform, ownProfile?.avatarUrl, roomAvatarWarmSignature, session?.accessToken]);
 
   useEffect(() => {
     if (!isIosPlatform || !client || !session?.accessToken) return undefined;
@@ -4007,7 +4444,7 @@ export function App() {
 
     void runConcurrentTasks(
       joinedRooms,
-      2,
+      1,
       async (room) => {
         if (cancelled || warmedMemberAvatarRoomIdsRef.current.has(room.roomId)) return;
 
@@ -4041,7 +4478,7 @@ export function App() {
 
         await runConcurrentTasks(
           targets,
-          4,
+          2,
           async (target) => {
             if (cancelled || warmedMediaKeysRef.current.has(target.cacheKey)) return;
             const warmed = await warmMediaCacheEntry(target);
@@ -4062,7 +4499,7 @@ export function App() {
     return () => {
       cancelled = true;
     };
-  }, [client, isIosPlatform, session?.accessToken, snapshot.version]);
+  }, [client, isIosPlatform, joinedRoomWarmSignature, session?.accessToken]);
 
   useEffect(() => {
     if (!import.meta.env.DEV) return;
@@ -4653,6 +5090,10 @@ export function App() {
     saveStringArray(exploreServerSourcesKey, exploreServers);
   }, [exploreServers]);
 
+  useEffect(() => {
+    saveCustomEmojiSnapshot(customEmojiItems);
+  }, [customEmojiItems]);
+
   const runAction = async (action: () => Promise<void>, success?: string) => {
     setError(undefined);
     try {
@@ -4669,6 +5110,57 @@ export function App() {
       setError(err instanceof Error ? err.message : String(err));
     }
   };
+
+  const commitRoomDraftPreview = useCallback((roomId: string, value: string) => {
+    setRoomDrafts((current) => {
+      const currentValue = current[roomId] ?? '';
+      if (currentValue === value) return current;
+
+      const next = { ...current };
+      if (value) {
+        next[roomId] = value;
+      } else {
+        delete next[roomId];
+      }
+      return next;
+    });
+  }, []);
+
+  const clearPendingRoomDraftCommit = useCallback(() => {
+    if (typeof roomDraftCommitTimeoutRef.current === 'number') {
+      window.clearTimeout(roomDraftCommitTimeoutRef.current);
+      roomDraftCommitTimeoutRef.current = undefined;
+    }
+    pendingRoomDraftCommitRef.current = undefined;
+  }, []);
+
+  const scheduleRoomDraftPreviewCommit = useCallback(
+    (roomId: string, value: string) => {
+      clearPendingRoomDraftCommit();
+      pendingRoomDraftCommitRef.current = { roomId, value };
+      roomDraftCommitTimeoutRef.current = window.setTimeout(() => {
+        const pending = pendingRoomDraftCommitRef.current;
+        roomDraftCommitTimeoutRef.current = undefined;
+        pendingRoomDraftCommitRef.current = undefined;
+        if (!pending) return;
+        commitRoomDraftPreview(pending.roomId, pending.value);
+      }, 180);
+    },
+    [clearPendingRoomDraftCommit, commitRoomDraftPreview]
+  );
+
+  const ensureMatrixReadyForOutgoing = useCallback(
+    (actionLabel = '发送消息'): boolean => {
+      if (matrixConnectionHealthy && matrixSyncReadyStates.has(syncState ?? SyncState.Stopped)) {
+        return true;
+      }
+
+      setError(`Matrix 连接还没有恢复，${actionLabel}现在只会停留在本地。我先帮你恢复连接。`);
+      attemptMatrixRecovery('manual');
+      return false;
+    },
+    [attemptMatrixRecovery, matrixConnectionHealthy, syncState]
+  );
 
   const handleLogin = async (evt: FormEvent<HTMLFormElement>) => {
     evt.preventDefault();
@@ -4707,7 +5199,13 @@ export function App() {
     sessionExpiryHandledRef.current = false;
     stopRuntime();
     await clearStoredSession();
+    clearCustomEmojiSnapshot();
+    clearResumeState();
+    clearPendingNativeCapture();
     setSession(undefined);
+    setCustomEmojiItems([]);
+    setActiveView('home');
+    setMobilePane('list');
     setBootState('signedOut');
   };
 
@@ -4775,6 +5273,8 @@ export function App() {
   const handleSendMessage = async (evt?: FormEvent<HTMLFormElement>) => {
     evt?.preventDefault();
     if (!client || !selectedRoom || sending || !messageDraft.trim()) return;
+    if (!ensureMatrixReadyForOutgoing('发送消息')) return;
+    clearPendingRoomDraftCommit();
 
     const body = messageDraft;
     setMessageDraft('');
@@ -4848,6 +5348,38 @@ export function App() {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSending(false);
+    }
+  };
+
+  const handleRetryPendingMessage = async (message: ChatMessage) => {
+    if (!client) return;
+
+    setError(undefined);
+    try {
+      await retryPendingMessage(client, message.roomId, message.id);
+      markMatrixActivity();
+      attemptMatrixRecovery('manual');
+      setNotice('已重新尝试发送这条消息');
+      refreshSnapshot(client);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleRetryAllFailedSelectedRoomMessages = async () => {
+    if (!client || selectedRoomFailedSendCount === 0) return;
+
+    setError(undefined);
+    try {
+      for (const message of selectedRoomMessages) {
+        if (!message.mine || message.sendStatus !== 'failed') continue;
+        await retryPendingMessage(client, message.roomId, message.id);
+      }
+      attemptMatrixRecovery('manual');
+      setNotice(`已重新尝试发送 ${selectedRoomFailedSendCount} 条未发出的消息`);
+      refreshSnapshot(client);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
     }
   };
 
@@ -4936,24 +5468,23 @@ export function App() {
   const handleDraftChange = (value: string) => {
     setMessageDraft(value);
     if (selectedRoom && composerMode.type === 'normal') {
-      setRoomDrafts((current) => {
-        const next = { ...current };
-        if (value) {
-          next[selectedRoom.id] = value;
-        } else {
-          delete next[selectedRoom.id];
-        }
-        return next;
-      });
+      scheduleRoomDraftPreviewCommit(selectedRoom.id, value);
     }
     if (!client || !selectedRoom || selectedRoom.membership !== 'join') return;
 
-    void updateTypingStatus(client, selectedRoom.id, Boolean(value.trim())).catch(() => undefined);
+    const nextTypingActive = Boolean(value.trim());
+    if (nextTypingActive !== typingActiveRef.current) {
+      typingActiveRef.current = nextTypingActive;
+      void updateTypingStatus(client, selectedRoom.id, nextTypingActive).catch(() => undefined);
+    }
     if (typingTimeoutRef.current) {
       window.clearTimeout(typingTimeoutRef.current);
     }
+    if (!nextTypingActive) return;
     typingTimeoutRef.current = window.setTimeout(() => {
-      if (client && selectedRoom) {
+      typingTimeoutRef.current = undefined;
+      if (client && selectedRoom && typingActiveRef.current) {
+        typingActiveRef.current = false;
         void updateTypingStatus(client, selectedRoom.id, false).catch(() => undefined);
       }
     }, 5000);
@@ -5051,8 +5582,10 @@ export function App() {
     }
     setShowScrollToLatest(distanceToBottom > scrollToLatestThresholdPx);
 
+    const allowAutoLoadOlder = !isIosPlatform && window.innerWidth >= 960;
     if (
-      timeline.scrollTop <= 48 &&
+      allowAutoLoadOlder &&
+      timeline.scrollTop <= 20 &&
       !activeTimelineContext &&
       !loadingOlderRef.current &&
       !messageQuery.trim() &&
@@ -5060,7 +5593,7 @@ export function App() {
     ) {
       void loadOlderMessages();
     }
-  }, [activeTimelineContext, loadOlderMessages, messageQuery]);
+  }, [activeTimelineContext, isIosPlatform, loadOlderMessages, messageQuery]);
 
   const handleCopyMessage = async (message: ChatMessage) => {
     const copied = await copyTextToClipboard(
@@ -5251,8 +5784,14 @@ export function App() {
   };
 
   const handleFileSelected = async (evt: ChangeEvent<HTMLInputElement>) => {
+    const triggeredByNativeCapture =
+      evt.target.id === composerAttachmentInputIds.cameraImage ||
+      evt.target.id === composerAttachmentInputIds.cameraVideo;
     const file = evt.target.files?.[0];
     evt.target.value = '';
+    if (triggeredByNativeCapture) {
+      clearPendingNativeCapture();
+    }
     setAttachmentPickerOpen(false);
     if (!client || !selectedRoom || !file) return;
 
@@ -5260,6 +5799,33 @@ export function App() {
       () => uploadFileMessage(client, selectedRoom.id, file),
       `已发送附件：${file.name}`
     );
+  };
+
+  const handleAudioCaptureSelected = async (evt: ChangeEvent<HTMLInputElement>) => {
+    const file = evt.target.files?.[0];
+    evt.target.value = '';
+    if (!client || !selectedRoom || !file) return;
+
+    const normalizedFile = file.type.startsWith('audio/')
+      ? file
+      : new File([file], file.name || `voice-${Date.now()}.m4a`, {
+          type: file.type || 'audio/mp4',
+        });
+
+    await runAction(
+      () => uploadFileMessage(client, selectedRoom.id, normalizedFile),
+      `已发送语音：${normalizedFile.name}`
+    );
+  };
+
+  const openNativeAudioCapture = () => {
+    const input = audioCaptureInputRef.current;
+    if (!input) {
+      setError('当前真机包还没有准备好系统录音入口。');
+      return;
+    }
+    setNotice('将使用系统录音入口选择或录制语音');
+    input.click();
   };
 
   const handlePreviewAttachment = (message: ChatMessage) => {
@@ -5490,6 +6056,7 @@ export function App() {
       (item.usage.includes('emoticon') ? 'emoji' : item.usage.includes('sticker') ? 'sticker' : 'emoji');
 
     if (effectiveSourceTab === 'sticker') {
+      if (!ensureMatrixReadyForOutgoing('发送贴纸')) return;
       await runAction(
         async () => {
           await sendStickerMessage(client, selectedRoom.id, item);
@@ -5561,7 +6128,11 @@ export function App() {
   const startVoiceRecording = async () => {
     if (!client || !selectedRoom || selectedRoom.membership !== 'join') return;
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
-      setError('当前环境不支持录制语音；iOS 真机需要确认 WebView 麦克风权限。');
+      if (Capacitor.isNativePlatform()) {
+        openNativeAudioCapture();
+        return;
+      }
+      setError('当前环境不支持录制语音；Web 预览需要浏览器支持 MediaRecorder。');
       return;
     }
 
@@ -5626,6 +6197,10 @@ export function App() {
       }, 250);
     } catch (err) {
       resetRecordingState();
+      if (Capacitor.isNativePlatform()) {
+        openNativeAudioCapture();
+        return;
+      }
       setError(err instanceof Error ? getReadableSpeechError((err as { name?: string }).name) : String(err));
     }
   };
@@ -6382,9 +6957,124 @@ export function App() {
   };
 
   const favoriteMessageCount = favoriteMessageItems.length;
+  const renderedSelectedRoomMessages = useMemo(
+    () =>
+      selectedRoomMessages.map((message, index) => {
+        const previousMessage = selectedRoomMessages[index - 1];
+        const showDateSeparator =
+          !previousMessage || getDayKey(previousMessage.timestamp) !== getDayKey(message.timestamp);
+
+        return (
+          <Fragment key={message.id}>
+            {showDateSeparator && <TimelineDateSeparator timestamp={message.timestamp} />}
+            <MessageBubble
+              client={client}
+              message={message}
+              favorite={favoriteMessageIds[message.roomId]?.includes(message.id) ?? false}
+              highlighted={message.id === highlightedMessageId}
+              selectionMode={selectionMode}
+              selected={selectedMessageIds.includes(message.id)}
+              forwardable={isForwardableMessage(message)}
+              mediaAccessToken={session?.accessToken}
+              customEmojiItems={customEmojiItems}
+              members={roomMembers}
+              currentUserProfile={ownProfile}
+              readReceiptAvatarCount={preferences.readReceiptAvatarCount}
+              inlineReadReceiptState={selectedRoomInlineReadReceiptStates.get(message.id)}
+              audioTranscription={audioTranscriptions[message.id]}
+              onToggleSelection={() => toggleMessageSelection(message)}
+              onFavorite={() => toggleFavoriteMessage(message)}
+              onReply={() => {
+                setComposerMode({ type: 'reply', message });
+                setMessageDraft('');
+              }}
+              onOpenReply={(eventId) => void handleOpenRoomEvent(message.roomId, eventId)}
+              onInfo={() => handleOpenMessageInfo(message)}
+              onEdit={() => handleEditMessage(message)}
+              onRedact={() => handleRedactMessage(message)}
+              onCopy={() => handleCopyMessage(message)}
+              onCopyLink={() => handleCopyMessageLink(message)}
+              onTogglePin={() => handleTogglePinMessage(message)}
+              onForward={() => startForwardSelection(message)}
+              onRetrySend={() => void handleRetryPendingMessage(message)}
+              onPreviewAttachment={() => handlePreviewAttachment(message)}
+              onAddImageToEmoji={() => handleAddMessageImageToEmoji(message)}
+              onTranscribeAudio={() => handleTranscribeAudio(message)}
+              onOpenUserProfile={() => handleOpenMessageSenderProfile(message)}
+              onOpenMentionMember={openUserProfile}
+              onMentionSender={() => handleMentionMessageSender(message)}
+              onOpenReadReceipts={() =>
+                handleOpenReadReceipts(message, selectedRoomInlineReadReceiptStates.get(message.id))
+              }
+              editing={editingMessageId === message.id}
+              editingDraft={editingMessageId === message.id ? editingMessageDraft : ''}
+              savingEdit={savingInlineEdit && editingMessageId === message.id}
+              onEditingDraftChange={setEditingMessageDraft}
+              onCancelEdit={handleCancelInlineEdit}
+              onSaveEdit={() => handleSaveInlineEdit(message)}
+              onReact={(key, shortcode) =>
+                client &&
+                runAction(
+                  () => sendReaction(client, message.roomId, message.id, key, shortcode),
+                  '已更新回应'
+                )
+              }
+            />
+          </Fragment>
+        );
+      }),
+    [
+      audioTranscriptions,
+      client,
+      customEmojiItems,
+      editingMessageDraft,
+      editingMessageId,
+      favoriteMessageIds,
+      handleAddMessageImageToEmoji,
+      handleCancelInlineEdit,
+      handleCopyMessage,
+      handleCopyMessageLink,
+      handleEditMessage,
+      handleOpenMessageInfo,
+      handleOpenRoomEvent,
+      handleOpenMessageSenderProfile,
+      handleOpenReadReceipts,
+      handlePreviewAttachment,
+      handleRedactMessage,
+      handleRetryPendingMessage,
+      handleSaveInlineEdit,
+      handleTogglePinMessage,
+      handleTranscribeAudio,
+      highlightedMessageId,
+      handleMentionMessageSender,
+      openUserProfile,
+      ownProfile,
+      preferences.readReceiptAvatarCount,
+      roomMembers,
+      runAction,
+      savingInlineEdit,
+      selectedMessageIds,
+      selectedRoomInlineReadReceiptStates,
+      selectedRoomMessages,
+      selectionMode,
+      session?.accessToken,
+      startForwardSelection,
+      toggleFavoriteMessage,
+      toggleMessageSelection,
+    ]
+  );
+
+  const bootLoadingLabel = pendingNativeCaptureIntent
+    ? pendingNativeCaptureIntent.kind === 'video'
+      ? '正在从系统录像返回并恢复本地会话'
+      : '正在从系统相机返回并恢复本地会话'
+    : '正在恢复本地会话';
+  const connectingLoadingLabel = pendingNativeCaptureIntent
+    ? '正在恢复 Matrix 同步、加密与本地媒体缓存'
+    : '正在连接 Matrix 与加密存储';
 
   if (bootState === 'booting') {
-    return <LoadingScreen label="正在启动 Starfire iOS" />;
+    return <LoadingScreen label={bootLoadingLabel} />;
   }
 
   if (bootState === 'signedOut' || (bootState === 'error' && !session)) {
@@ -6451,7 +7141,7 @@ export function App() {
   }
 
   if (bootState === 'connecting') {
-    return <LoadingScreen label="正在连接 Matrix 与加密存储" />;
+    return <LoadingScreen label={connectingLoadingLabel} />;
   }
 
   const showPaneSearch = activeView !== 'explore' && activeView !== 'settings' && activeView !== 'favorites';
@@ -6483,6 +7173,8 @@ export function App() {
     const touch = event.touches[0];
     if (!touch || touch.clientX > iosEdgeBackGestureZonePx) return;
 
+    clearIosEdgeBackResetTimeout();
+    resetIosEdgeBackVisual();
     iosEdgeBackGestureRef.current = {
       identifier: touch.identifier,
       startX: touch.clientX,
@@ -6498,6 +7190,7 @@ export function App() {
     const touch = Array.from(event.touches).find((item) => item.identifier === gesture.identifier);
     if (!touch) {
       iosEdgeBackGestureRef.current = undefined;
+      resetIosEdgeBackVisual();
       return;
     }
 
@@ -6506,11 +7199,13 @@ export function App() {
     if (deltaX <= 0) return;
     if (Math.abs(deltaY) > Math.abs(deltaX) * 1.15 && Math.abs(deltaY) > 14) {
       iosEdgeBackGestureRef.current = undefined;
+      resetIosEdgeBackVisual();
       return;
     }
     if (deltaX < 14 && !gesture.engaged) return;
 
     gesture.engaged = true;
+    setIosEdgeBackVisual(deltaX, true);
     event.preventDefault();
   };
 
@@ -6526,18 +7221,30 @@ export function App() {
     const deltaY = touch.clientY - gesture.startY;
     if (deltaX >= iosBackGestureTriggerPx && Math.abs(deltaX) > Math.abs(deltaY) * 1.1) {
       event.preventDefault();
+      setIosEdgeBackVisual(deltaX, false);
       performEdgeBackNavigation();
+      clearIosEdgeBackResetTimeout();
+      iosEdgeBackResetTimeoutRef.current = window.setTimeout(() => {
+        iosEdgeBackResetTimeoutRef.current = undefined;
+        resetIosEdgeBackVisual();
+      }, 120);
+      return;
     }
+
+    resetIosEdgeBackVisual();
   };
 
   return (
     <main
+      ref={appFrameRef}
       className={`app-frame mobile-${mobilePane} theme-${preferences.appearance} density-${preferences.density}`}
       onTouchStart={handleAppTouchStart}
       onTouchMove={handleAppTouchMove}
       onTouchEnd={handleAppTouchEnd}
       onTouchCancel={() => {
         iosEdgeBackGestureRef.current = undefined;
+        clearIosEdgeBackResetTimeout();
+        resetIosEdgeBackVisual();
       }}
     >
       <aside className="rail">
@@ -6603,7 +7310,7 @@ export function App() {
                   </span>
                 </button>
               )}
-              <RoomList
+              <MemoRoomList
                 rooms={visibleRooms}
                 selectedRoomId={selectedRoomId}
                 favoriteRoomIds={favoriteRoomIds}
@@ -6711,6 +7418,7 @@ export function App() {
             audioTranscriptionSettings={audioTranscriptionSettings}
             audioTranscriptionSupportLabel={getAudioTranscriptionSupportLabel(audioTranscriptionSettings)}
             cryptoStatus={cryptoStatus}
+            cryptoStatusReady={cryptoStatusReady}
             mediaAccessToken={session?.accessToken}
             onProfileChange={setProfileForm}
             onProfileSubmit={handleProfileSubmit}
@@ -6735,9 +7443,11 @@ export function App() {
               window.localStorage.removeItem(favoriteRoomsKey);
               window.localStorage.removeItem(favoriteMessagesKey);
               window.localStorage.removeItem(favoriteMessageSnapshotsKey);
+              clearCustomEmojiSnapshot();
               setFavoriteRoomIds([]);
               setFavoriteMessageIds({});
               setFavoriteMessageSnapshots({});
+              setCustomEmojiItems([]);
               setNotice('本地偏好已清');
             }}
           />
@@ -6785,7 +7495,7 @@ export function App() {
                   <Star size={19} />
                 </button>
                 <button
-                  className={cryptoStatus.cryptoReady ? 'icon-button' : 'icon-button warning'}
+                  className={cryptoStatusReady && !cryptoStatus.cryptoReady ? 'icon-button warning' : 'icon-button'}
                   onClick={() => setSheet('security')}
                   aria-label="加密与密钥恢复"
                 >
@@ -6833,6 +7543,29 @@ export function App() {
                   onOpen={(eventId) => void handleOpenPinnedMessage(selectedRoom.id, eventId)}
                   onOpenAll={() => setSheet('roomInfo')}
                 />
+              )}
+              {matrixConnectionBanner && (
+                <button
+                  className={`message-box ${matrixConnectionBanner.tone} inline`}
+                  type="button"
+                  onClick={() => attemptMatrixRecovery('manual')}
+                >
+                  {matrixConnectionBanner.text}
+                </button>
+              )}
+              {selectedRoomPendingSendCount > 0 && !matrixConnectionBanner && (
+                <div className="message-box warning inline">
+                  有 {selectedRoomPendingSendCount} 条消息正在等待发送
+                </div>
+              )}
+              {selectedRoomFailedSendCount > 0 && (
+                <button
+                  className="message-box danger inline"
+                  type="button"
+                  onClick={() => void handleRetryAllFailedSelectedRoomMessages()}
+                >
+                  有 {selectedRoomFailedSendCount} 条消息还没真正发出去，点这里重试
+                </button>
               )}
               {error && <button className="message-box danger inline" type="button" onClick={() => setError(undefined)}>{error}</button>}
             </div>
@@ -6887,69 +7620,7 @@ export function App() {
                     copy={messageQuery ? '换一个关键词试试。' : '发出第一条消息，或者等待同步更多历史记录。'}
                   />
                 ) : (
-                  selectedRoomMessages.map((message, index) => {
-                    const previousMessage = selectedRoomMessages[index - 1];
-                    const showDateSeparator =
-                      !previousMessage || getDayKey(previousMessage.timestamp) !== getDayKey(message.timestamp);
-
-                    return (
-                      <Fragment key={message.id}>
-                        {showDateSeparator && <TimelineDateSeparator timestamp={message.timestamp} />}
-                        <MessageBubble
-                          client={client}
-                          message={message}
-                          favorite={favoriteMessageIds[message.roomId]?.includes(message.id) ?? false}
-                          highlighted={message.id === highlightedMessageId}
-                          selectionMode={selectionMode}
-                          selected={selectedMessageIds.includes(message.id)}
-                          forwardable={isForwardableMessage(message)}
-                          mediaAccessToken={session?.accessToken}
-                          customEmojiItems={customEmojiItems}
-                          members={roomMembers}
-                          currentUserProfile={ownProfile}
-                          readReceiptAvatarCount={preferences.readReceiptAvatarCount}
-                          inlineReadReceiptState={selectedRoomInlineReadReceiptStates.get(message.id)}
-                          audioTranscription={audioTranscriptions[message.id]}
-                          onToggleSelection={() => toggleMessageSelection(message)}
-                          onFavorite={() => toggleFavoriteMessage(message)}
-                          onReply={() => {
-                            setComposerMode({ type: 'reply', message });
-                            setMessageDraft('');
-                          }}
-                          onOpenReply={(eventId) => void handleOpenRoomEvent(message.roomId, eventId)}
-                          onInfo={() => handleOpenMessageInfo(message)}
-                          onEdit={() => handleEditMessage(message)}
-                          onRedact={() => handleRedactMessage(message)}
-                          onCopy={() => handleCopyMessage(message)}
-                          onCopyLink={() => handleCopyMessageLink(message)}
-                          onTogglePin={() => handleTogglePinMessage(message)}
-                          onForward={() => startForwardSelection(message)}
-                          onPreviewAttachment={() => handlePreviewAttachment(message)}
-                          onAddImageToEmoji={() => handleAddMessageImageToEmoji(message)}
-                          onTranscribeAudio={() => handleTranscribeAudio(message)}
-                          onOpenUserProfile={() => handleOpenMessageSenderProfile(message)}
-                          onOpenMentionMember={openUserProfile}
-                          onMentionSender={() => handleMentionMessageSender(message)}
-                          onOpenReadReceipts={() =>
-                            handleOpenReadReceipts(message, selectedRoomInlineReadReceiptStates.get(message.id))
-                          }
-                          editing={editingMessageId === message.id}
-                          editingDraft={editingMessageId === message.id ? editingMessageDraft : ''}
-                          savingEdit={savingInlineEdit && editingMessageId === message.id}
-                          onEditingDraftChange={setEditingMessageDraft}
-                          onCancelEdit={handleCancelInlineEdit}
-                          onSaveEdit={() => handleSaveInlineEdit(message)}
-                          onReact={(key, shortcode) =>
-                            client &&
-                            runAction(
-                              () => sendReaction(client, message.roomId, message.id, key, shortcode),
-                              '已更新回应'
-                            )
-                          }
-                        />
-                      </Fragment>
-                    );
-                  })
+                  renderedSelectedRoomMessages
                 )}
               </div>
               {showScrollToLatest && selectedRoomMessages.length > 0 && !activeTimelineContext && (
@@ -7084,6 +7755,17 @@ export function App() {
                 tabIndex={-1}
                 onChange={handleFileSelected}
               />
+              <input
+                id={composerAttachmentInputIds.audioCapture}
+                ref={audioCaptureInputRef}
+                className="attachment-picker-input"
+                type="file"
+                accept="audio/*"
+                capture="user"
+                aria-hidden="true"
+                tabIndex={-1}
+                onChange={handleAudioCaptureSelected}
+              />
               <div className="composer-input-row">
                 <div className={composerSideRailClassName}>
                   {showCollapsedExpandButton && (
@@ -7173,7 +7855,12 @@ export function App() {
           />
         )}
       </section>
-      {attachmentPickerOpen && <AttachmentPickerSheet onClose={() => setAttachmentPickerOpen(false)} />}
+      {attachmentPickerOpen && (
+        <AttachmentPickerSheet
+          onClose={() => setAttachmentPickerOpen(false)}
+          onPrepareNativeCapture={preparePendingNativeCapture}
+        />
+      )}
 
       <nav className="bottom-nav" aria-label="底部导航">
         {bottomPrimaryViews.map((view) => (
@@ -7199,6 +7886,7 @@ export function App() {
       {sheet === 'security' && (
         <SecuritySheet
           status={cryptoStatus}
+          statusReady={cryptoStatusReady}
           passphrase={recoveryPassphrase}
           progress={keyRestoreProgress}
           message={keyRestoreMessage}
@@ -7400,6 +8088,9 @@ function LoadingScreen({ label }: { label: string }) {
   );
 }
 
+const tapMovementTolerancePx = 10;
+const longPressDurationMs = 420;
+
 function Avatar({
   name,
   src,
@@ -7490,12 +8181,15 @@ function Avatar({
             skipClickRef.current = true;
             void Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
             onLongPress();
-          }, 420);
+          }, longPressDurationMs);
         }}
         onPointerMove={(evt) => {
           const state = longPressStateRef.current;
           if (!state || state.pointerId !== evt.pointerId || state.triggered) return;
-          if (Math.abs(evt.clientX - state.startX) > 10 || Math.abs(evt.clientY - state.startY) > 10) {
+          if (
+            Math.abs(evt.clientX - state.startX) > tapMovementTolerancePx ||
+            Math.abs(evt.clientY - state.startY) > tapMovementTolerancePx
+          ) {
             resetLongPress();
           }
         }}
@@ -7510,7 +8204,7 @@ function Avatar({
           }
           resetLongPress();
           evt.stopPropagation();
-          onClick();
+          onClick?.();
         }}
         aria-label={ariaLabel ?? `查看 ${name} 的资料`}
         title={ariaLabel ?? name}
@@ -7577,7 +8271,14 @@ function RoomList({
 }) {
   const [notificationMenuRoomId, setNotificationMenuRoomId] = useState<string>();
   const longPressTimerRef = useRef<number>();
-  const longPressTriggeredRef = useRef(false);
+  const longPressStateRef = useRef<{
+    roomId: string;
+    pointerId: number;
+    startX: number;
+    startY: number;
+    triggered: boolean;
+  }>();
+  const skipClickRoomIdRef = useRef<string>();
 
   useEffect(() => {
     if (!notificationMenuRoomId) return undefined;
@@ -7599,10 +8300,6 @@ function RoomList({
     []
   );
 
-  const closeNotificationMenu = () => {
-    setNotificationMenuRoomId(undefined);
-  };
-
   const clearLongPressTimer = () => {
     if (typeof longPressTimerRef.current === 'number') {
       window.clearTimeout(longPressTimerRef.current);
@@ -7610,27 +8307,19 @@ function RoomList({
     }
   };
 
-  const startRoomLongPress = (room: RoomSummary) => {
-    if (room.membership === 'invite') return;
+  const resetLongPress = () => {
     clearLongPressTimer();
-    longPressTriggeredRef.current = false;
-    longPressTimerRef.current = window.setTimeout(() => {
-      longPressTriggeredRef.current = true;
-      setNotificationMenuRoomId(room.id);
-    }, 520);
-  };
-
-  const finishRoomPress = () => {
-    clearLongPressTimer();
+    longPressStateRef.current = undefined;
   };
 
   const handleRoomClick = (event: ReactMouseEvent<HTMLDivElement>, roomId: string) => {
-    if (longPressTriggeredRef.current) {
+    if (skipClickRoomIdRef.current === roomId) {
+      skipClickRoomIdRef.current = undefined;
       event.preventDefault();
       event.stopPropagation();
-      longPressTriggeredRef.current = false;
       return;
     }
+
     onSelectRoom(roomId);
   };
 
@@ -7670,10 +8359,37 @@ function RoomList({
               setNotificationMenuRoomId(room.id);
             }}
             onKeyDown={(event) => handleRowKeyDown(event, room.id)}
-            onPointerDown={() => startRoomLongPress(room)}
-            onPointerLeave={finishRoomPress}
-            onPointerCancel={finishRoomPress}
-            onPointerUp={finishRoomPress}
+            onPointerDown={(event) => {
+              if (room.membership === 'invite' || event.button !== 0) return;
+              longPressStateRef.current = {
+                roomId: room.id,
+                pointerId: event.pointerId,
+                startX: event.clientX,
+                startY: event.clientY,
+                triggered: false,
+              };
+              clearLongPressTimer();
+              longPressTimerRef.current = window.setTimeout(() => {
+                const state = longPressStateRef.current;
+                if (!state || state.pointerId !== event.pointerId || state.roomId !== room.id) return;
+                state.triggered = true;
+                skipClickRoomIdRef.current = room.id;
+                void Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
+                setNotificationMenuRoomId(room.id);
+              }, longPressDurationMs);
+            }}
+            onPointerMove={(event) => {
+              const state = longPressStateRef.current;
+              if (!state || state.pointerId !== event.pointerId || state.roomId !== room.id) return;
+              if (
+                Math.abs(event.clientX - state.startX) > tapMovementTolerancePx ||
+                Math.abs(event.clientY - state.startY) > tapMovementTolerancePx
+              ) {
+                resetLongPress();
+              }
+            }}
+            onPointerUp={resetLongPress}
+            onPointerCancel={resetLongPress}
           >
             <Avatar name={room.name} src={room.avatarUrl} accessToken={mediaAccessToken} />
             <span className="room-row-main">
@@ -7731,7 +8447,7 @@ function RoomList({
                     className={room.notificationMode === mode ? 'active' : ''}
                     onClick={() => {
                       onSetNotificationMode(room, mode);
-                      closeNotificationMenu();
+                      setNotificationMenuRoomId(undefined);
                     }}
                   >
                     {roomNotificationIcon(mode, 18)}
@@ -7747,6 +8463,8 @@ function RoomList({
     </div>
   );
 }
+
+const MemoRoomList = memo(RoomList);
 
 type FavoritePanelFilter = 'messages' | 'images' | 'videos' | 'audio';
 type FavoriteDateFilter = 'all' | 'today' | 'week' | 'month';
@@ -9302,35 +10020,23 @@ function AttachmentLink({
   );
 }
 
-function AttachmentPickerSheet({ onClose }: { onClose: () => void }) {
-  const handleOptionClick = () => {
-    window.setTimeout(() => {
-      onClose();
-    }, 0);
-  };
-
+function AttachmentPickerSheet({
+  onClose,
+  onPrepareNativeCapture,
+}: {
+  onClose: () => void;
+  onPrepareNativeCapture: (kind: PendingNativeCaptureIntent['kind']) => void;
+}) {
   return (
     <div className="attachment-picker-backdrop" onClick={onClose}>
       <div className="attachment-picker-sheet" onClick={(event) => event.stopPropagation()}>
         <span className="attachment-picker-grabber" aria-hidden="true" />
         <div className="attachment-picker-card">
           <div className="attachment-picker-options">
-            <label className="attachment-picker-option" htmlFor={composerAttachmentInputIds.image} onClick={handleOptionClick}>
-              <span className="attachment-picker-option-icon" aria-hidden="true">
-                <ImageIcon size={18} />
-              </span>
-              <span className="attachment-picker-option-label">从相册选照片</span>
-            </label>
-            <label className="attachment-picker-option" htmlFor={composerAttachmentInputIds.video} onClick={handleOptionClick}>
-              <span className="attachment-picker-option-icon" aria-hidden="true">
-                <Video size={18} />
-              </span>
-              <span className="attachment-picker-option-label">从相册选视频</span>
-            </label>
             <label
               className="attachment-picker-option"
               htmlFor={composerAttachmentInputIds.cameraImage}
-              onClick={handleOptionClick}
+              onClick={() => onPrepareNativeCapture('photo')}
             >
               <span className="attachment-picker-option-icon" aria-hidden="true">
                 <Camera size={18} />
@@ -9340,14 +10046,14 @@ function AttachmentPickerSheet({ onClose }: { onClose: () => void }) {
             <label
               className="attachment-picker-option"
               htmlFor={composerAttachmentInputIds.cameraVideo}
-              onClick={handleOptionClick}
+              onClick={() => onPrepareNativeCapture('video')}
             >
               <span className="attachment-picker-option-icon" aria-hidden="true">
                 <Video size={18} />
               </span>
               <span className="attachment-picker-option-label">录像发送</span>
             </label>
-            <label className="attachment-picker-option" htmlFor={composerAttachmentInputIds.file} onClick={handleOptionClick}>
+            <label className="attachment-picker-option" htmlFor={composerAttachmentInputIds.file}>
               <span className="attachment-picker-option-icon" aria-hidden="true">
                 <FileUp size={18} />
               </span>
@@ -9612,6 +10318,7 @@ function AudioPlayer({
 
 function SecuritySheet({
   status,
+  statusReady,
   passphrase,
   progress,
   message,
@@ -9622,6 +10329,7 @@ function SecuritySheet({
   onClose,
 }: {
   status: CryptoStatus;
+  statusReady: boolean;
   passphrase: string;
   progress: string;
   message?: { type: 'success' | 'error'; text: string };
@@ -9632,12 +10340,16 @@ function SecuritySheet({
   onClose: () => void;
 }) {
   const busy = Boolean(progress);
+  const cryptoEngineLabel = !statusReady ? '恢复中' : status.cryptoReady ? '可用' : '未启用';
   const statusLabel = (value?: boolean) => {
+    if (!statusReady) return '恢复中';
     if (value === undefined) return '未知';
     return value ? '正常' : '需要处理';
   };
   const deviceTrustLabel =
-    status.currentDeviceVerified === undefined
+    !statusReady
+      ? '恢复中'
+      : status.currentDeviceVerified === undefined
       ? '未知'
       : status.currentDeviceCrossSigned
         ? '已交叉签名'
@@ -9645,15 +10357,18 @@ function SecuritySheet({
           ? '仅本机信任'
           : status.currentDeviceVerified
             ? '已验证'
-        : '未验证';
+            : '未验证';
   const crossSigningLabel =
-    status.crossSigningReady === undefined
+    !statusReady
+      ? '恢复中'
+      : status.crossSigningReady === undefined
       ? '未知'
       : status.crossSigningReady
         ? '已就绪'
         : status.crossSigningPrivateKeysInSecretStorage
           ? '待导入'
           : '未就绪';
+  const backupVersionLabel = !statusReady ? '恢复中' : status.backupVersion ?? status.activeBackupVersion ?? '未配置';
 
   return (
     <div className="sheet-backdrop">
@@ -9671,7 +10386,7 @@ function SecuritySheet({
         <div className="security-status-grid">
           <span>
             <small>加密引擎</small>
-            <strong>{status.cryptoReady ? '可用' : '未启用'}</strong>
+            <strong>{cryptoEngineLabel}</strong>
           </span>
           <span>
             <small>安全存储</small>
@@ -9679,7 +10394,7 @@ function SecuritySheet({
           </span>
           <span>
             <small>服务端备份</small>
-            <strong>{status.backupVersion ?? status.activeBackupVersion ?? '未配置'}</strong>
+            <strong>{backupVersionLabel}</strong>
           </span>
           <span>
             <small>备份信任</small>
@@ -9705,12 +10420,13 @@ function SecuritySheet({
         </div>
 
         {progress && <p className="security-progress">{progress}</p>}
+        {!progress && !statusReady && <p className="security-progress">正在恢复本机加密状态与密钥信息...</p>}
         {message && (
           <p className={message.type === 'error' ? 'security-message error' : 'security-message success'}>
             {message.text}
           </p>
         )}
-        {!status.cryptoReady && (
+        {statusReady && !status.cryptoReady && (
           <p className="security-message error">当前客户端还没有启用端到端加密，无法恢复密钥</p>
         )}
 
@@ -9719,7 +10435,7 @@ function SecuritySheet({
             className="primary-button"
             type="button"
             onClick={onRestoreFromSecretStorage}
-            disabled={!status.cryptoReady || busy}
+            disabled={!statusReady || !status.cryptoReady || busy}
           >
             <Shield size={17} />
             从安全存储恢复
@@ -9728,7 +10444,7 @@ function SecuritySheet({
             className="secondary-button"
             type="button"
             onClick={onVerifyCurrentDevice}
-            disabled={!status.cryptoReady || busy}
+            disabled={!statusReady || !status.cryptoReady || busy}
           >
             <Shield size={17} />
             验证当前设备
@@ -9748,7 +10464,7 @@ function SecuritySheet({
             className="secondary-button"
             type="button"
             onClick={onRestoreWithPassphrase}
-            disabled={!status.cryptoReady || busy || !passphrase.trim()}
+            disabled={!statusReady || !status.cryptoReady || busy || !passphrase.trim()}
           >
             <KeyRound size={17} />
             使用恢复密钥恢复
@@ -10671,9 +11387,7 @@ const messageGestureStopSelector = [
   '.message-inline-editor',
   '.message-inline-editor textarea',
   '.message-inline-editor button',
-  '.reply-preview',
   '.message-rich-text a',
-  '.file-chip',
   '.audio-player button',
   '.audio-player input',
 ].join(', ');
@@ -10681,7 +11395,7 @@ const messageGestureStopSelector = [
 const shouldIgnoreMessageGesture = (target: EventTarget | null): boolean =>
   target instanceof HTMLElement && Boolean(target.closest(messageGestureStopSelector));
 
-type MessageSwipeAction = 'reply' | 'forward';
+type MessageSwipeAction = 'reply';
 
 const MESSAGE_SWIPE_TRIGGER_DISTANCE = 72;
 const MESSAGE_SWIPE_READY_DISTANCE = 56;
@@ -10704,10 +11418,57 @@ function MessageRichText({
   members?: RoomMemberSummary[];
   onOpenMember?: (member: RoomMemberSummary) => void;
 }) {
+  const richTextRef = useRef<HTMLDivElement | null>(null);
   const html = useMemo(
     () => getMessageBodyHtml({ body, forwardContent }, members, client, accessToken),
     [accessToken, body, client, forwardContent, members]
   );
+
+  useEffect(() => {
+    const host = richTextRef.current;
+    if (!host) return undefined;
+
+    let cancelled = false;
+    const emojiImages = Array.from(
+      host.querySelectorAll<HTMLImageElement>('img.message-inline-emoji[data-media-cache-key]')
+    );
+    if (emojiImages.length === 0) return undefined;
+
+    void Promise.allSettled(
+      emojiImages.map(async (image) => {
+        const cacheKey = image.dataset.mediaCacheKey?.trim();
+        const source = image.dataset.mediaSrc?.trim();
+        const fallbackSource = image.dataset.mediaFallbackSrc?.trim();
+        if (!cacheKey || !source) return;
+
+        const cachedSrc = peekCachedMediaUrl(cacheKey) ?? (await getCachedMediaUrl(cacheKey, undefined, source));
+        if (cachedSrc) {
+          if (!cancelled && image.isConnected && image.src !== cachedSrc) {
+            image.src = cachedSrc;
+          }
+          return;
+        }
+
+        try {
+          const blob = await fetchMediaBlobDeduped(cacheKey, () =>
+            fetchMediaBlob(source, accessToken, fallbackSource || undefined)
+          );
+          const storedUrl = await storeCachedMediaBlob(cacheKey, blob, blob.type, source);
+          const resolvedSrc = storedUrl ?? peekCachedMediaUrl(cacheKey);
+          if (!cancelled && resolvedSrc && image.isConnected && image.src !== resolvedSrc) {
+            image.src = resolvedSrc;
+          }
+        } catch {
+          // Keep the current remote src when offline cache hydration fails.
+        }
+      })
+    );
+
+    return () => {
+      cancelled = true;
+    };
+  }, [accessToken, html]);
+
   const handleClick = useCallback(
     (event: ReactMouseEvent<HTMLDivElement>) => {
       if (!onOpenMember) return;
@@ -10730,7 +11491,7 @@ function MessageRichText({
     [members, onOpenMember]
   );
 
-  return <div className={className} onClick={handleClick} dangerouslySetInnerHTML={{ __html: html }} />;
+  return <div ref={richTextRef} className={className} onClick={handleClick} dangerouslySetInnerHTML={{ __html: html }} />;
 }
 
 function MessageReactionKey({
@@ -10954,6 +11715,7 @@ function MessageBubble({
   onCopyLink,
   onTogglePin,
   onForward,
+  onRetrySend,
   onPreviewAttachment,
   onAddImageToEmoji,
   onTranscribeAudio,
@@ -10994,6 +11756,7 @@ function MessageBubble({
   onCopyLink: () => void;
   onTogglePin: () => void;
   onForward: () => void;
+  onRetrySend?: () => void;
   onPreviewAttachment: () => void;
   onAddImageToEmoji?: () => void;
   onTranscribeAudio: () => void;
@@ -11020,8 +11783,8 @@ function MessageBubble({
     swipeReady: boolean;
     longPressTriggered: boolean;
   }>();
-  const longPressTimerRef = useRef<number>();
   const skipNextClickRef = useRef(false);
+  const longPressTimerRef = useRef<number>();
   const updateActionsOpen = useCallback((nextState: boolean | ((open: boolean) => boolean)) => {
     const article = articleRef.current;
     const timeline = article?.closest<HTMLElement>('.timeline');
@@ -11039,8 +11802,8 @@ function MessageBubble({
   const closeActionsOpen = useCallback(() => {
     updateActionsOpen(false);
   }, [updateActionsOpen]);
-  const toggleActionsOpen = useCallback(() => {
-    updateActionsOpen((open) => !open);
+  const openActionsOpen = useCallback(() => {
+    updateActionsOpen(true);
   }, [updateActionsOpen]);
   const runAndClose = (action: () => void) => {
     action();
@@ -11059,6 +11822,20 @@ function MessageBubble({
   };
   const attachment = message.attachment;
   const audioAttachment = attachment?.kind === 'audio';
+  const showPreviewAction = Boolean(attachment && attachment.kind !== 'audio' && attachment.url);
+  const showAddImageToEmojiAction = Boolean(
+    attachment?.kind === 'image' && attachment.mxcUrl && onAddImageToEmoji
+  );
+  const showAudioTranscribeAction = attachment?.kind === 'audio';
+  const showMessageEditAction = message.canEdit;
+  const showMessageRedactAction = message.canRedact;
+  const hasMessageExtraActions = Boolean(
+    showPreviewAction ||
+      showAddImageToEmojiAction ||
+      showAudioTranscribeAction ||
+      showMessageEditAction ||
+      showMessageRedactAction
+  );
   const attachmentName = attachment?.name ?? message.body;
   const showBody = Boolean(
     message.body && (!attachment || message.body !== attachmentName)
@@ -11097,23 +11874,27 @@ function MessageBubble({
   );
   const showSenderLine = !message.mine && members.length > 2;
   const messageTimeLabel = formatMessageTime(message.timestamp);
+  const messageSendStatusLabel = getMessageSendStatusLabel(message);
+  const retryableSend = Boolean(message.mine && message.sendStatus === 'failed' && !editing && onRetrySend);
   const messageFooterLabel = [
     messageTimeLabel,
     message.edited ? '已编辑' : undefined,
   ]
     .filter(Boolean)
     .join(' · ');
-  const showMessageFooter = Boolean(messageFooterLabel || (!editing && showReadReceiptIndicator));
+  const showMessageFooter = Boolean(
+    messageFooterLabel || messageSendStatusLabel || (!editing && showReadReceiptIndicator)
+  );
   const messageDetailLabel = [
     formatFullTime(message.timestamp),
     message.edited ? '已编辑' : undefined,
+    messageSendStatusLabel,
     message.pinned ? '已置顶' : undefined,
     message.encrypted ? '已加密' : undefined,
   ]
     .filter(Boolean)
     .join(' · ');
-  const swipeAction: MessageSwipeAction | undefined =
-    swipeOffset === 0 ? undefined : swipeOffset > 0 ? 'forward' : 'reply';
+  const swipeAction: MessageSwipeAction | undefined = swipeOffset < 0 ? 'reply' : undefined;
   const swipeReady = Boolean(swipeAction && Math.abs(swipeOffset) >= MESSAGE_SWIPE_READY_DISTANCE);
   const bubbleWrapStyle = swipeOffset
     ? ({ transform: `translateX(${swipeOffset}px)` } as CSSProperties)
@@ -11225,7 +12006,12 @@ function MessageBubble({
     return () => window.removeEventListener('pointerdown', handlePointerDown);
   }, [actionsOpen, closeActionsOpen]);
 
-  useEffect(() => () => clearLongPressTimer(), []);
+  useEffect(
+    () => () => {
+      clearLongPressTimer();
+    },
+    []
+  );
 
   const handlePointerDown = (event: ReactPointerEvent<HTMLElement>) => {
     if (selectionMode || event.button !== 0 || shouldIgnoreMessageGesture(event.target)) return;
@@ -11238,29 +12024,30 @@ function MessageBubble({
       swipeReady: false,
       longPressTriggered: false,
     };
-
     clearLongPressTimer();
     longPressTimerRef.current = window.setTimeout(() => {
       const gesture = gestureStateRef.current;
-      if (!gesture || gesture.pointerId !== event.pointerId || !forwardable) return;
-
+      if (!gesture || gesture.pointerId !== event.pointerId) return;
       gesture.longPressTriggered = true;
       skipNextClickRef.current = true;
-      setSwipeOffset(0);
-      closeActionsOpen();
       void Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
-      onForward();
-    }, 420);
+      openActionsOpen();
+    }, longPressDurationMs);
   };
 
   const handlePointerMove = (event: ReactPointerEvent<HTMLElement>) => {
     const gesture = gestureStateRef.current;
-    if (!gesture || gesture.pointerId !== event.pointerId || gesture.longPressTriggered) return;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    if (gesture.longPressTriggered) return;
 
     const deltaX = event.clientX - gesture.startX;
     const deltaY = event.clientY - gesture.startY;
     const absDeltaX = Math.abs(deltaX);
     const absDeltaY = Math.abs(deltaY);
+
+    if (absDeltaX > tapMovementTolerancePx || absDeltaY > tapMovementTolerancePx) {
+      clearLongPressTimer();
+    }
 
     if (absDeltaY > 18 && absDeltaY >= absDeltaX) {
       resetGesture();
@@ -11271,24 +12058,30 @@ function MessageBubble({
       return;
     }
 
-    clearLongPressTimer();
-    gesture.swipeEngaged = true;
-
-    if (deltaX > 0 && !forwardable) {
-      gesture.swipeAction = undefined;
-      gesture.swipeReady = false;
-      setSwipeOffset(0);
+    if (deltaX >= 0) {
+      if (gesture.swipeEngaged) {
+        gesture.swipeEngaged = false;
+        gesture.swipeReady = false;
+        gesture.swipeAction = undefined;
+        setSwipeOffset(0);
+      }
       return;
     }
 
-    gesture.swipeAction = deltaX > 0 ? 'forward' : 'reply';
+    gesture.swipeEngaged = true;
+    gesture.swipeAction = 'reply';
     gesture.swipeReady = absDeltaX >= MESSAGE_SWIPE_TRIGGER_DISTANCE;
-    setSwipeOffset(Math.max(-MESSAGE_SWIPE_MAX_OFFSET, Math.min(deltaX, MESSAGE_SWIPE_MAX_OFFSET)));
+    setSwipeOffset(Math.max(-MESSAGE_SWIPE_MAX_OFFSET, deltaX));
   };
 
   const handlePointerUp = (event: ReactPointerEvent<HTMLElement>) => {
     const gesture = gestureStateRef.current;
     if (!gesture || gesture.pointerId !== event.pointerId) {
+      resetGesture();
+      return;
+    }
+
+    if (gesture.longPressTriggered) {
       resetGesture();
       return;
     }
@@ -11300,11 +12093,7 @@ function MessageBubble({
     if (gesture.swipeReady && gesture.swipeAction) {
       closeActionsOpen();
       void Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
-      if (gesture.swipeAction === 'reply') {
-        onReply();
-      } else if (forwardable) {
-        onForward();
-      }
+      onReply();
     }
 
     resetGesture();
@@ -11318,15 +12107,17 @@ function MessageBubble({
   };
 
   const handleMessageClick = (event: ReactMouseEvent<HTMLElement>) => {
-    if (!selectionMode || shouldIgnoreMessageGesture(event.target)) return;
-    event.preventDefault();
-    onToggleSelection();
+    if (shouldIgnoreMessageGesture(event.target)) return;
+    if (selectionMode) {
+      event.preventDefault();
+      onToggleSelection();
+    }
   };
 
   const handleContextMenu = (event: ReactMouseEvent<HTMLElement>) => {
     if (selectionMode || shouldIgnoreMessageGesture(event.target)) return;
     event.preventDefault();
-    toggleActionsOpen();
+    openActionsOpen();
   };
 
   const handleInlineEditorKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -11389,10 +12180,6 @@ function MessageBubble({
           small
         />
       )}
-      <span className="message-swipe-indicator message-swipe-indicator-forward" aria-hidden="true">
-        <Forward size={14} />
-        <span>转发</span>
-      </span>
       <span className="message-swipe-indicator message-swipe-indicator-reply" aria-hidden="true">
         <Reply size={14} />
         <span>回复</span>
@@ -11546,6 +12333,25 @@ function MessageBubble({
                   {messageFooterLabel}
                 </span>
               )}
+              {messageSendStatusLabel &&
+                (retryableSend ? (
+                  <button
+                    type="button"
+                    className="message-send-status retry"
+                    onClick={onRetrySend}
+                    aria-label="重新发送这条消息"
+                  >
+                    {messageSendStatusLabel}
+                  </button>
+                ) : (
+                  <span
+                    className={`message-send-status${
+                      message.sendStatus === 'failed' ? ' error' : ''
+                    }`}
+                  >
+                    {messageSendStatusLabel}
+                  </span>
+                ))}
               {showReadReceiptIndicator && !editing && (
                 <button
                   type="button"
@@ -11593,91 +12399,92 @@ function MessageBubble({
         </div>
         {!editing && (
           <>
-            <button
-              className="message-menu-toggle"
-              type="button"
-              aria-label={actionsOpen ? '收起消息操作' : '更多消息操作'}
-              aria-expanded={actionsOpen}
-              onClick={toggleActionsOpen}
-            >
-              <MoreHorizontal size={17} />
-            </button>
             <div ref={actionsRef} className="message-actions">
-              <button onClick={() => runAndClose(onReply)}>
-                <Reply size={14} />
-                回复
-              </button>
-              <button onClick={() => runAndClose(onForward)}>
-                <Forward size={14} />
-                转发
-              </button>
-              {message.canEdit && (
-                <button onClick={() => runAndClose(onEdit)}>
-                  <Edit3 size={14} />
-                  编辑
+              <div className="message-actions-grid four">
+                <button onClick={() => runAndClose(onReply)}>
+                  <Reply size={14} />
+                  回复
                 </button>
-              )}
-              <button className={favorite ? 'active' : ''} onClick={() => runAndClose(onFavorite)}>
-                <Star size={14} />
-                收藏
-              </button>
-              <button className={message.pinned ? 'active' : ''} onClick={() => runAndClose(onTogglePin)}>
-                {message.pinned ? <PinOff size={14} /> : <Pin size={14} />}
-                {message.pinned ? '取消置顶' : '置顶'}
-              </button>
-              <button onClick={() => runAndClose(onCopy)}>
-                <Copy size={14} />
-                复制
-              </button>
-              <button onClick={() => runAndClose(onCopyLink)}>
-                <Link2 size={14} />
-                链接
-              </button>
-              {message.attachment && message.attachment.kind !== 'audio' && message.attachment.url && (
-                <button onClick={() => runAndClose(onPreviewAttachment)}>
-                  <Eye size={14} />
-                  预览
+                <button onClick={() => runAndClose(onForward)}>
+                  <Forward size={14} />
+                  转发
                 </button>
-              )}
-              {message.attachment?.kind === 'image' && message.attachment.mxcUrl && onAddImageToEmoji && (
-                <button onClick={() => runAndClose(onAddImageToEmoji)}>
-                  <SmilePlus size={14} />
-                  加到表情
+                <button className={favorite ? 'active' : ''} onClick={() => runAndClose(onFavorite)}>
+                  <Star size={14} />
+                  收藏
                 </button>
-              )}
-              {message.attachment?.kind === 'audio' && (
-                <button onClick={() => runAndClose(onTranscribeAudio)}>
-                  <Volume2 size={14} />
-                  转文字
+                <button className={message.pinned ? 'active' : ''} onClick={() => runAndClose(onTogglePin)}>
+                  {message.pinned ? <PinOff size={14} /> : <Pin size={14} />}
+                  {message.pinned ? '取消置顶' : '置顶'}
                 </button>
-              )}
-              <button onClick={() => runAndClose(onInfo)}>
-                <Info size={14} />
-                详情
-              </button>
-              {message.canRedact && (
-                <button className="danger" onClick={() => runAndClose(onRedact)}>
-                  <Trash2 size={14} />
-                  撤回
+              </div>
+              <div className="message-actions-grid three">
+                <button onClick={() => runAndClose(onCopy)}>
+                  <Copy size={14} />
+                  复制
                 </button>
+                <button onClick={() => runAndClose(onCopyLink)}>
+                  <Link2 size={14} />
+                  链接
+                </button>
+                <button onClick={() => runAndClose(onInfo)}>
+                  <Info size={14} />
+                  详情
+                </button>
+              </div>
+              {hasMessageExtraActions && (
+                <div className="message-actions-extras">
+                  {showPreviewAction && (
+                    <button onClick={() => runAndClose(onPreviewAttachment)}>
+                      <Eye size={14} />
+                      预览
+                    </button>
+                  )}
+                  {showAddImageToEmojiAction && (
+                    <button onClick={() => runAndClose(onAddImageToEmoji!)}>
+                      <SmilePlus size={14} />
+                      加到表情
+                    </button>
+                  )}
+                  {showAudioTranscribeAction && (
+                    <button onClick={() => runAndClose(onTranscribeAudio)}>
+                      <Volume2 size={14} />
+                      转文字
+                    </button>
+                  )}
+                  {showMessageEditAction && (
+                    <button onClick={() => runAndClose(onEdit)}>
+                      <Edit3 size={14} />
+                      编辑
+                    </button>
+                  )}
+                  {showMessageRedactAction && (
+                    <button className="danger" onClick={() => runAndClose(onRedact)}>
+                      <Trash2 size={14} />
+                      撤回
+                    </button>
+                  )}
+                </div>
               )}
-              {message.reactions.map((reaction) => (
-                <MessageReactionButton
-                  key={reaction.key}
-                  reaction={reaction}
-                  client={client}
+              <div className="message-actions-reactions">
+                {message.reactions.map((reaction) => (
+                  <MessageReactionButton
+                    key={reaction.key}
+                    reaction={reaction}
+                    client={client}
+                    accessToken={mediaAccessToken}
+                    active={reaction.reactedByMe}
+                    onClick={() => runAndClose(() => onReact(reaction.key, reaction.shortcode))}
+                  />
+                ))}
+                <MessageReactionPicker
+                  className="message-reaction-picker message-reaction-picker-actions"
+                  panelClassName="reaction-picker-panel reaction-picker-panel-actions"
+                  customItems={customEmojiItems}
                   accessToken={mediaAccessToken}
-                  active={reaction.reactedByMe}
-                  onClick={() => runAndClose(() => onReact(reaction.key, reaction.shortcode))}
+                  onReact={(key, shortcode) => runAndClose(() => onReact(key, shortcode))}
                 />
-              ))}
-              <MessageReactionPicker
-                className="message-reaction-picker message-reaction-picker-actions"
-                panelClassName="reaction-picker-panel reaction-picker-panel-actions"
-                customItems={customEmojiItems}
-                accessToken={mediaAccessToken}
-                onReact={(key, shortcode) => runAndClose(() => onReact(key, shortcode))}
-              />
+              </div>
             </div>
           </>
         )}
@@ -14870,6 +15677,7 @@ function SettingsPanel({
   audioTranscriptionSettings,
   audioTranscriptionSupportLabel,
   cryptoStatus,
+  cryptoStatusReady,
   mediaAccessToken,
   onLogout,
   onProfileChange,
@@ -14895,6 +15703,7 @@ function SettingsPanel({
   audioTranscriptionSettings: AudioTranscriptionSettings;
   audioTranscriptionSupportLabel: string;
   cryptoStatus: CryptoStatus;
+  cryptoStatusReady: boolean;
   mediaAccessToken?: string;
   onLogout: () => void;
   onProfileChange: (value: { displayName: string }) => void;
@@ -14923,12 +15732,21 @@ function SettingsPanel({
         : notificationPermission === 'default'
           ? '未询问'
           : notificationPermission;
+  const cryptoSummaryLabel = !cryptoStatusReady
+    ? '正在恢复加密状态'
+    : cryptoStatus.cryptoReady
+      ? '端到端加密可用'
+      : '加密未启用';
   const backupLabel =
-    cryptoStatus.backupVersion ??
-    cryptoStatus.activeBackupVersion ??
-    (cryptoStatus.cryptoReady ? '未检测到备份' : '加密未启用');
+    !cryptoStatusReady
+      ? '恢复中'
+      : cryptoStatus.backupVersion ??
+        cryptoStatus.activeBackupVersion ??
+        (cryptoStatus.cryptoReady ? '未检测到备份' : '加密未启用');
   const backupTrustLabel =
-    cryptoStatus.backupTrusted === undefined
+    !cryptoStatusReady
+      ? '恢复中'
+      : cryptoStatus.backupTrusted === undefined
       ? '未知'
       : cryptoStatus.backupTrusted
         ? '已信任'
@@ -15041,7 +15859,7 @@ function SettingsPanel({
           <span>
             <strong>加密与密钥恢复</strong>
             <small>
-              {cryptoStatus.cryptoReady ? '端到端加密可用' : '加密未启用'} · {backupLabel} · {backupTrustLabel}
+              {cryptoSummaryLabel} · {backupLabel} · {backupTrustLabel}
             </small>
           </span>
         </button>

@@ -20,7 +20,7 @@ import {
 } from 'matrix-js-sdk/lib/@types/PushRules.js';
 import { deriveRecoveryKeyFromPassphrase } from 'matrix-js-sdk/lib/crypto-api/key-passphrase.js';
 import { decodeRecoveryKey } from 'matrix-js-sdk/lib/crypto-api/recovery-key.js';
-import { MatrixEventEvent } from 'matrix-js-sdk/lib/models/event.js';
+import { EventStatus, MatrixEventEvent } from 'matrix-js-sdk/lib/models/event.js';
 
 import { matrixFetch, matrixRequestError } from './nativeFetch';
 import type { StoredMatrixSession } from './sessionStore';
@@ -132,6 +132,8 @@ export type ChatMessage = {
   mine: boolean;
   edited: boolean;
   encrypted: boolean;
+  sendStatus?: 'encrypting' | 'sending' | 'queued' | 'failed';
+  sendError?: string;
   canEdit: boolean;
   canRedact: boolean;
   pinned: boolean;
@@ -1647,6 +1649,34 @@ const describeStateEvent = (event: MatrixEvent): string => {
   return '房间状态已更新';
 };
 
+const getChatMessageSendStatus = (
+  event: MatrixEvent
+): ChatMessage['sendStatus'] => {
+  switch (event.status) {
+    case EventStatus.ENCRYPTING:
+      return 'encrypting';
+    case EventStatus.QUEUED:
+      return 'queued';
+    case EventStatus.SENDING:
+    case EventStatus.SENT:
+      return 'sending';
+    case EventStatus.NOT_SENT:
+    case EventStatus.CANCELLED:
+      return 'failed';
+    default:
+      return undefined;
+  }
+};
+
+const getPendingRoomEvent = (
+  room: Room,
+  eventId: string
+): MatrixEvent | undefined =>
+  room
+    .getLiveTimeline()
+    .getEvents()
+    .find((event) => event.getId() === eventId || event.getAssociatedId() === eventId);
+
 const eventToChatMessage = (
   client: MatrixClient,
   room: Room,
@@ -1679,6 +1709,8 @@ const eventToChatMessage = (
     mine: sender === client.getUserId(),
     edited: Boolean(latestEditContent ?? content['m.new_content']),
     encrypted: event.isEncrypted?.() ?? eventType === 'm.room.encrypted',
+    sendStatus: sender === client.getUserId() ? getChatMessageSendStatus(event) : undefined,
+    sendError: sender === client.getUserId() ? event.error?.message : undefined,
     canEdit:
       sender === client.getUserId() &&
       eventType === 'm.room.message' &&
@@ -1826,6 +1858,8 @@ const toDisplayableChatMessage = (
     mine: sender === client.getUserId(),
     edited: Boolean(content['m.new_content']),
     encrypted: event.isEncrypted?.() ?? eventType === 'm.room.encrypted',
+    sendStatus: sender === client.getUserId() ? getChatMessageSendStatus(event) : undefined,
+    sendError: sender === client.getUserId() ? event.error?.message : undefined,
     canEdit: false,
     canRedact: sender === client.getUserId() && !event.isRedacted?.(),
     pinned: pinnedEventIds.includes(id),
@@ -2229,7 +2263,8 @@ export async function verifyStoredSession(session: StoredMatrixSession): Promise
 export async function createMatrixRuntime(
   session: StoredMatrixSession,
   onSnapshotChanged: (snapshot: MatrixSnapshot) => void,
-  onSyncStateChanged: (state: SyncState | null) => void
+  onSyncStateChanged: (state: SyncState | null) => void,
+  onActivity?: () => void
 ): Promise<MatrixRuntime> {
   const sessionStoreKey = getSessionStoreKey(session);
   const rustCryptoDatabasePrefix = `ioscinny-rust-crypto-${sessionStoreKey}`;
@@ -2259,37 +2294,76 @@ export async function createMatrixRuntime(
     cryptoDatabasePrefix: rustCryptoDatabasePrefix,
   });
 
-  const refresh = () => onSnapshotChanged(buildSnapshot(client));
+  const refresh = () => {
+    onSnapshotChanged(buildSnapshot(client));
+  };
+  const markRemoteActivity = () => {
+    onActivity?.();
+  };
   const handleSync = (state: SyncState | null) => {
+    if (state === SyncState.Prepared || state === SyncState.Syncing || state === SyncState.Reconnecting) {
+      markRemoteActivity();
+    }
     onSyncStateChanged(state);
+    refresh();
+  };
+  const handleAccountData = () => {
+    markRemoteActivity();
+    refresh();
+  };
+  const handleTimeline = (
+    event: MatrixEvent,
+    _room: Room | undefined,
+    toStartOfTimeline?: boolean,
+    removed?: boolean
+  ) => {
+    if (!toStartOfTimeline && !removed && !event.status) {
+      markRemoteActivity();
+    }
+    refresh();
+  };
+  const handleTimelineReset = () => {
+    markRemoteActivity();
+    refresh();
+  };
+  const handleLocalEchoUpdated = () => {
+    refresh();
+  };
+  const handleReceipt = () => {
+    markRemoteActivity();
+    refresh();
+  };
+  const handleMembership = () => {
+    markRemoteActivity();
     refresh();
   };
 
   client.on(ClientEvent.Sync, handleSync);
-  client.on(ClientEvent.AccountData, refresh);
-  client.on(RoomEvent.Timeline, refresh);
-  client.on(RoomEvent.TimelineReset, refresh);
-  client.on(RoomEvent.LocalEchoUpdated, refresh);
-  client.on(RoomEvent.AccountData, refresh);
-  client.on(RoomEvent.Receipt, refresh);
-  client.on(RoomEvent.MyMembership, refresh);
+  client.on(ClientEvent.AccountData, handleAccountData);
+  client.on(RoomEvent.Timeline, handleTimeline);
+  client.on(RoomEvent.TimelineReset, handleTimelineReset);
+  client.on(RoomEvent.LocalEchoUpdated, handleLocalEchoUpdated);
+  client.on(RoomEvent.AccountData, handleAccountData);
+  client.on(RoomEvent.Receipt, handleReceipt);
+  client.on(RoomEvent.MyMembership, handleMembership);
 
   await client.startClient({
     lazyLoadMembers: true,
   });
+  markRemoteActivity();
   refresh();
 
   return {
     client,
     stop: () => {
       client.removeListener(ClientEvent.Sync, handleSync);
-      client.removeListener(ClientEvent.AccountData, refresh);
-      client.removeListener(RoomEvent.Timeline, refresh);
-      client.removeListener(RoomEvent.TimelineReset, refresh);
-      client.removeListener(RoomEvent.LocalEchoUpdated, refresh);
-      client.removeListener(RoomEvent.AccountData, refresh);
-      client.removeListener(RoomEvent.Receipt, refresh);
-      client.removeListener(RoomEvent.MyMembership, refresh);
+      client.removeListener(ClientEvent.AccountData, handleAccountData);
+      client.removeListener(RoomEvent.Timeline, handleTimeline);
+      client.removeListener(RoomEvent.TimelineReset, handleTimelineReset);
+      client.removeListener(RoomEvent.LocalEchoUpdated, handleLocalEchoUpdated);
+      client.removeListener(RoomEvent.AccountData, handleAccountData);
+      client.removeListener(RoomEvent.Receipt, handleReceipt);
+      client.removeListener(RoomEvent.MyMembership, handleMembership);
       client.stopClient();
     },
   };
@@ -3638,6 +3712,37 @@ export async function sendTextMessage(
         }
       : {}),
   } as never);
+}
+
+export async function retryPendingMessage(
+  client: MatrixClient,
+  roomId: string,
+  eventId: string
+): Promise<void> {
+  const room = client.getRoom(roomId);
+  if (!room) {
+    throw new Error('当前房间还没有同步到本地，暂时不能重试。');
+  }
+
+  const event = getPendingRoomEvent(room, eventId);
+  if (!event) {
+    throw new Error('没有找到这条待发送的本地消息。');
+  }
+
+  switch (event.status) {
+    case EventStatus.NOT_SENT:
+    case EventStatus.CANCELLED:
+      await client.resendEvent(event, room);
+      return;
+    case EventStatus.ENCRYPTING:
+    case EventStatus.QUEUED:
+    case EventStatus.SENDING:
+    case EventStatus.SENT:
+      client.retryImmediately();
+      return;
+    default:
+      throw new Error('这条消息当前不需要重发。');
+  }
 }
 
 const cloneForwardContent = (content: Record<string, unknown>): Record<string, unknown> =>

@@ -2,6 +2,7 @@ import { Capacitor, CapacitorHttp } from '@capacitor/core';
 
 const networkErrorPattern = /load failed|failed to fetch|network request failed|fetch failed/i;
 const emptyBodyStatuses = new Set([101, 204, 205, 304]);
+const matrixSyncRequestPattern = /\/_matrix\/client\/[^/]+\/sync(?:[/?#]|$)/i;
 
 const createAbortError = (): DOMException =>
   new DOMException('The operation was aborted.', 'AbortError');
@@ -97,10 +98,19 @@ const runNativeHttpRequest = async (
   return createNativeResponse(request, nativeResponse, responseType);
 };
 
+const shouldUseBrowserFetchForNativeMatrix = (request: Request): boolean =>
+  request.method === 'GET' && matrixSyncRequestPattern.test(request.url);
+
 export const matrixFetch: typeof fetch = async (input, init) => {
   const request = new Request(input, init);
 
   if (!Capacitor.isNativePlatform()) {
+    return fetch(request);
+  }
+
+  // Matrix sync relies on long-polling plus abort/retry. Keep it on the browser
+  // fetch path so iOS WebView can cancel stale sync requests cleanly.
+  if (shouldUseBrowserFetchForNativeMatrix(request)) {
     return fetch(request);
   }
 
@@ -127,7 +137,7 @@ export const matrixRequestError = (error: unknown, baseUrl: string): Error => {
 
   if (isLikelyNetworkError(error)) {
     return new Error(
-      `无法连接 ${baseUrl}。请确认手机网络能访问该 homeserver，HTTPS 证书有效，且服务器没有拦截 Matrix API 请求。原始错误：${message}`
+      `无法连接 ${baseUrl}。请确认手机网络可以访问该 homeserver，HTTPS 证书有效，而且服务端没有拦截 Matrix API 请求。原始错误：${message}`
     );
   }
 
