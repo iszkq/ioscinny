@@ -3,6 +3,7 @@ import { Capacitor } from '@capacitor/core';
 import { Device } from '@capacitor/device';
 import { Haptics, ImpactStyle } from '@capacitor/haptics';
 import { Keyboard as CapacitorKeyboard } from '@capacitor/keyboard';
+import { LocalNotifications } from '@capacitor/local-notifications';
 import {
   Archive,
   AtSign,
@@ -64,8 +65,9 @@ import {
   VolumeX,
   X,
 } from 'lucide-react';
-import { ClientEvent, MatrixClient, MatrixEvent, RoomEvent, SyncState } from 'matrix-js-sdk';
+import { ClientEvent, MatrixClient, MatrixEvent, Room, RoomEvent, SyncState } from 'matrix-js-sdk';
 import { HttpApiEvent } from 'matrix-js-sdk/lib/http-api/interface.js';
+import { RoomMemberEvent, type RoomMember } from 'matrix-js-sdk/lib/models/room-member.js';
 import {
   CSSProperties,
   ChangeEvent,
@@ -79,7 +81,9 @@ import {
   ReactNode,
   TouchEvent as ReactTouchEvent,
   WheelEvent as ReactWheelEvent,
+  startTransition,
   useCallback,
+  useDeferredValue,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -184,7 +188,12 @@ import {
   saveStoredSession,
   StoredMatrixSession,
 } from './services/sessionStore';
-import { getCachedMediaUrl, peekCachedMediaUrl, storeCachedMediaBlob } from './services/mediaCache';
+import {
+  getCachedMediaUrl,
+  peekCachedMediaUrl,
+  peekPersistedCachedMediaUrl,
+  storeCachedMediaBlob,
+} from './services/mediaCache';
 import { mediaFetch } from './services/nativeFetch';
 import {
   AUDIO_TRANSCRIPTION_ACCOUNT_DATA_EVENT_TYPE,
@@ -205,6 +214,16 @@ import {
   saveAudioTranscriptionSettings,
   transcribeAudioWithAihubmix,
 } from './services/audioTranscription';
+import {
+  checkLocalNotificationPermission,
+  clearChatNotifications,
+  extractChatNotificationExtra,
+  isChatNotificationOpenAction,
+  NotificationPermissionState,
+  registerChatNotificationActions,
+  requestLocalNotificationPermission,
+  scheduleChatNotification,
+} from './services/nativeNotifications';
 
 type BootState = 'booting' | 'signedOut' | 'connecting' | 'signedIn' | 'error';
 type PrimaryView = 'home' | 'direct' | 'rooms' | 'spaces' | 'invites' | 'favorites' | 'explore' | 'settings';
@@ -248,6 +267,8 @@ type AppPreferences = {
   density: DensityMode;
   readReceiptAvatarCount: number;
   sendReadReceipts: boolean;
+  notifyInForeground: boolean;
+  showNotificationPreview: boolean;
 };
 type AudioTranscriptionState = {
   status: 'loading' | 'success' | 'error';
@@ -262,7 +283,7 @@ type ResumeState = {
   updatedAt: number;
 };
 type PendingNativeCaptureIntent = {
-  kind: 'photo' | 'video';
+  kind: 'photo' | 'video' | 'audio';
   startedAt: number;
 };
 type ExploreSourceEditorDraft = {
@@ -338,6 +359,8 @@ const AIHUBMIX_AUDIO_TRANSCRIPTION_SEGMENT_COOLDOWN_MS = 120;
 const AIHUBMIX_CHUNKING_MIN_DURATION_SEC = 90;
 const MAX_RECOGNITION_RESTARTS_PER_SEGMENT = 2;
 const MAX_CUSTOM_EMOJI_SNAPSHOT_ITEMS = 4096;
+const notificationTimelineWarmupDriftMs = 5_000;
+const maxTrackedNotificationEventIds = 512;
 const roomNotificationOptions: RoomNotificationMode[] = ['default', 'all', 'mentions', 'mute'];
 const roomNotificationLabels: Record<RoomNotificationMode, string> = {
   default: '默认',
@@ -755,6 +778,82 @@ const getReadableMessageBody = (body: string): string => {
   return body;
 };
 
+const getNotificationPermissionLabel = (permission: NotificationPermissionState): string => {
+  if (permission === 'granted') return '已允许';
+  if (permission === 'denied') return '已拒绝';
+  if (permission === 'prompt') return '未询问';
+  return '当前环境不支持';
+};
+
+const isTimelineEventNotificationCandidate = (event: MatrixEvent): boolean => {
+  const eventType = event.getType();
+  if (eventType === 'm.room.message' || eventType === 'm.room.encrypted' || eventType === 'm.sticker') {
+    const content = event.getContent();
+    const relatesTo = isRecord(content['m.relates_to']) ? content['m.relates_to'] : undefined;
+    return relatesTo?.rel_type !== 'm.replace';
+  }
+  return false;
+};
+
+const getTimelineEventNotificationPreview = (event: MatrixEvent): string => {
+  const eventType = event.getType();
+  if (eventType === 'm.room.encrypted') return '发来一条加密消息';
+  if (eventType === 'm.sticker') return '发来一个贴纸';
+  if (eventType !== 'm.room.message') return '发来一条新消息';
+
+  const content = event.getContent();
+  const msgType = typeof content.msgtype === 'string' ? content.msgtype : 'm.text';
+  const body = typeof content.body === 'string' ? getReadableMessageBody(content.body).trim() : '';
+
+  switch (msgType) {
+    case 'm.image':
+      return body ? `发来图片：${body}` : '发来一张图片';
+    case 'm.video':
+      return body ? `发来视频：${body}` : '发来一段视频';
+    case 'm.audio':
+      return body ? `发来语音：${body}` : '发来一段语音';
+    case 'm.file':
+      return body ? `发来文件：${body}` : '发来一个文件';
+    case 'm.notice':
+      return body || '发来一条提醒';
+    case 'm.emote':
+      return body ? `* ${body}` : '发送了一个动作';
+    default:
+      return body || '发来一条新消息';
+  }
+};
+
+const buildTimelineEventNotificationContent = ({
+  event,
+  room,
+  senderName,
+  showPreview,
+}: {
+  event: MatrixEvent;
+  room: RoomSummary;
+  senderName?: string;
+  showPreview: boolean;
+}): { title: string; body: string; summaryArgument?: string } => {
+  const preview = getTimelineEventNotificationPreview(event);
+  const senderLabel = senderName?.trim() || '有人';
+  const roomLabel = room.name?.trim() || senderLabel || '新消息';
+  const title = room.direct ? senderLabel || roomLabel : roomLabel;
+
+  if (!showPreview) {
+    return {
+      title,
+      body: room.direct ? '你收到一条新消息' : `${senderLabel} 发来一条新消息`,
+      summaryArgument: senderLabel,
+    };
+  }
+
+  return {
+    title,
+    body: room.direct ? preview : `${senderLabel}：${preview}`,
+    summaryArgument: senderLabel,
+  };
+};
+
 const richTextAllowedRawTagPattern = /<\/?(?:u|b|strong|i|em|s|strike|del|code|br)\s*\/?>/gi;
 const richTextAllowedTags = new Set([
   'a',
@@ -1102,8 +1201,12 @@ const sanitizeRichTextHtml = (
             : undefined) ??
           safeSrc
         : safeSrc;
+      const initialEmojiSrc =
+        peekCachedMediaUrl(safeCacheKey) ??
+        peekPersistedCachedMediaUrl(safeCacheKey) ??
+        transparentMediaPlaceholderDataUri;
 
-      return `<img class="message-inline-emoji" src="${escapeHtml(safeSrc)}" data-media-cache-key="${escapeHtml(
+      return `<img class="message-inline-emoji" src="${escapeHtml(initialEmojiSrc)}" data-media-cache-key="${escapeHtml(
         safeCacheKey
       )}" data-media-src="${escapeHtml(safeSrc)}" data-media-fallback-src="${escapeHtml(
         safeFallbackSrc ?? safeSrc
@@ -1620,6 +1723,8 @@ const fetchMediaBlob = async (
 };
 
 const pendingMediaBlobRequests = new Map<string, Promise<Blob>>();
+const transparentMediaPlaceholderDataUri =
+  'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==';
 
 const fetchMediaBlobDeduped = async (
   cacheKey: string | undefined,
@@ -1739,12 +1844,27 @@ const useAuthenticatedMediaState = (
   const encryptedFileSignature = encryptedFile
     ? `${encryptedFile.url}|${encryptedFile.iv}|${encryptedFile.hashes?.sha256 ?? ''}`
     : '';
+  const cacheKey = encryptedFile?.url ?? src ?? fallbackSrc;
+  const authenticatedSrc = accessToken ? toAuthenticatedMediaUrl(src) : undefined;
   const immediateDisplaySrc = getImmediateMediaDisplaySrc(src, accessToken, fallbackSrc);
   const deferNativePlaybackSrc =
     Capacitor.isNativePlatform() && (mimeType?.startsWith('audio/') || mimeType?.startsWith('video/'));
+  const needsProtectedFetch = Boolean(
+    src &&
+      (encryptedFile ||
+        (accessToken && (isMatrixMediaUrl(src) || isMatrixMediaUrl(fallbackSrc) || Boolean(authenticatedSrc))))
+  );
+  const memoryCachedSrc = peekCachedMediaUrl(cacheKey);
+  const persistedCachedSrc = memoryCachedSrc ? undefined : peekPersistedCachedMediaUrl(cacheKey);
   const [state, setState] = useState<{ resolvedSrc?: string; loading: boolean; failed: boolean }>(() => ({
-    resolvedSrc: encryptedFile || deferNativePlaybackSrc ? undefined : immediateDisplaySrc ?? fallbackSrc,
-    loading: Boolean(src && (encryptedFile || deferNativePlaybackSrc)),
+    resolvedSrc: src
+      ? needsProtectedFetch
+        ? memoryCachedSrc ?? persistedCachedSrc
+        : immediateDisplaySrc ?? fallbackSrc
+      : deferNativePlaybackSrc
+        ? undefined
+        : immediateDisplaySrc,
+    loading: Boolean(src && !memoryCachedSrc && !persistedCachedSrc && (needsProtectedFetch || deferNativePlaybackSrc)),
     failed: false,
   }));
 
@@ -1752,8 +1872,6 @@ const useAuthenticatedMediaState = (
     let objectUrl: string | undefined;
     let cancelled = false;
     const cacheKey = encryptedFile?.url ?? src ?? fallbackSrc;
-    const plainSrc = toUnauthenticatedMediaUrl(src) ?? src;
-    const plainFallbackSrc = toUnauthenticatedMediaUrl(fallbackSrc) ?? fallbackSrc;
     const nextImmediateDisplaySrc = getImmediateMediaDisplaySrc(src, accessToken, fallbackSrc);
 
     if (!src) {
@@ -1770,12 +1888,11 @@ const useAuthenticatedMediaState = (
       encryptedFile ||
       (accessToken && (isMatrixMediaUrl(src) || isMatrixMediaUrl(fallbackSrc) || Boolean(authenticatedSrc)))
     );
-    const requestSrc = authenticatedSrc ?? plainSrc;
-    const tokenSrc = withAccessToken(plainSrc, accessToken);
     const memoryCachedSrc = peekCachedMediaUrl(cacheKey);
+    const persistedCachedSrc = memoryCachedSrc ? undefined : peekPersistedCachedMediaUrl(cacheKey);
 
     if (!needsProtectedFetch) {
-      setState({ resolvedSrc: requestSrc, loading: false, failed: false });
+      setState({ resolvedSrc: nextImmediateDisplaySrc ?? fallbackSrc, loading: false, failed: false });
       return undefined;
     }
 
@@ -1784,11 +1901,15 @@ const useAuthenticatedMediaState = (
       return undefined;
     }
 
-    setState({
-      resolvedSrc: deferNativePlaybackSrc ? undefined : nextImmediateDisplaySrc,
-      loading: true,
-      failed: false,
-    });
+    if (persistedCachedSrc) {
+      setState({ resolvedSrc: persistedCachedSrc, loading: false, failed: false });
+    } else {
+      setState({
+        resolvedSrc: undefined,
+        loading: true,
+        failed: false,
+      });
+    }
 
     void (async () => {
       try {
@@ -2845,6 +2966,8 @@ const loadPreferences = (): AppPreferences => {
       density: parsed.density === 'compact' ? 'compact' : 'comfortable',
       readReceiptAvatarCount: clampReadReceiptAvatarCount(parsed.readReceiptAvatarCount),
       sendReadReceipts: parsed.sendReadReceipts !== false,
+      notifyInForeground: parsed.notifyInForeground !== false,
+      showNotificationPreview: parsed.showNotificationPreview !== false,
     };
   } catch {
     return {
@@ -2852,6 +2975,8 @@ const loadPreferences = (): AppPreferences => {
       density: 'comfortable',
       readReceiptAvatarCount: 7,
       sendReadReceipts: true,
+      notifyInForeground: true,
+      showNotificationPreview: true,
     };
   }
 };
@@ -2895,11 +3020,36 @@ const clearResumeState = () => {
   window.localStorage.removeItem(resumeStateKey);
 };
 
+const isPendingNativeCaptureKind = (value: unknown): value is PendingNativeCaptureIntent['kind'] =>
+  value === 'photo' || value === 'video' || value === 'audio';
+
+const getPendingNativeCaptureResumeNotice = (kind: PendingNativeCaptureIntent['kind']): string => {
+  switch (kind) {
+    case 'video':
+      return '已从系统录像返回，正在恢复同步、加密与本地媒体缓存';
+    case 'audio':
+      return '已从系统录音返回，正在恢复同步、加密与本地媒体缓存';
+    default:
+      return '已从系统相机返回，正在恢复同步、加密与本地媒体缓存';
+  }
+};
+
+const getPendingNativeCaptureBootLabel = (kind: PendingNativeCaptureIntent['kind']): string => {
+  switch (kind) {
+    case 'video':
+      return '正在从系统录像返回并恢复本地会话';
+    case 'audio':
+      return '正在从系统录音返回并恢复本地会话';
+    default:
+      return '正在从系统相机返回并恢复本地会话';
+  }
+};
+
 const loadPendingNativeCaptureIntent = (): PendingNativeCaptureIntent | undefined => {
   try {
     const value = window.localStorage.getItem(pendingNativeCaptureIntentKey);
     const parsed = value ? (JSON.parse(value) as Partial<PendingNativeCaptureIntent>) : undefined;
-    if (!parsed || (parsed.kind !== 'photo' && parsed.kind !== 'video')) return undefined;
+    if (!parsed || !isPendingNativeCaptureKind(parsed.kind)) return undefined;
     if (
       typeof parsed.startedAt !== 'number' ||
       Date.now() - parsed.startedAt > PENDING_NATIVE_CAPTURE_INTENT_MAX_AGE_MS
@@ -2922,6 +3072,21 @@ const savePendingNativeCaptureIntent = (value: PendingNativeCaptureIntent) => {
 
 const clearPendingNativeCaptureIntent = () => {
   window.localStorage.removeItem(pendingNativeCaptureIntentKey);
+};
+
+const formatTypingStatusLabel = (members: string[]): string | undefined => {
+  const normalized = Array.from(
+    new Set(
+      members
+        .map((member) => member.trim())
+        .filter(Boolean)
+    )
+  );
+  if (normalized.length === 0) return undefined;
+  if (normalized.length === 1) return `${normalized[0]} 正在输入`;
+  if (normalized.length === 2) return `${normalized[0]} 和 ${normalized[1]} 正在输入`;
+  if (normalized.length === 3) return `${normalized[0]}、${normalized[1]}、${normalized[2]} 正在输入`;
+  return `${normalized[0]}、${normalized[1]} 等 ${normalized.length} 人正在输入`;
 };
 
 const initials = (name: string): string => {
@@ -3211,6 +3376,14 @@ export function App() {
   const activeViewRef = useRef<PrimaryView>(initialResumeState.activeView);
   const previousActiveViewRef = useRef<PrimaryView>(initialResumeState.activeView);
   const appFrameRef = useRef<HTMLElement | null>(null);
+  const selectedRoomIdRef = useRef<string | undefined>(initialResumeState.selectedRoomId);
+  const preferencesRef = useRef<AppPreferences>(loadPreferences());
+  const snapshotRoomsRef = useRef<Map<string, RoomSummary>>(new Map());
+  const notificationPermissionStateRef = useRef<NotificationPermissionState>('unsupported');
+  const notificationSessionStartedAtRef = useRef(Date.now());
+  const notifiedEventIdsRef = useRef<string[]>([]);
+  const previousUnreadByRoomRef = useRef<Map<string, number>>(new Map());
+  const appIsActiveRef = useRef(true);
   const iosEdgeBackGestureRef = useRef<
     | {
         identifier: number;
@@ -3252,7 +3425,6 @@ export function App() {
   const [messageSearchOpen, setMessageSearchOpen] = useState(false);
   const [messageDraft, setMessageDraft] = useState('');
   const [composerExpanded, setComposerExpanded] = useState(false);
-  const [composerTextareaHeight, setComposerTextareaHeight] = useState(composerCollapsedMinHeightPx);
   const [composerCanExpand, setComposerCanExpand] = useState(false);
   const [composerMode, setComposerMode] = useState<ComposerMode>({ type: 'normal' });
   const [attachmentPickerOpen, setAttachmentPickerOpen] = useState(false);
@@ -3295,9 +3467,15 @@ export function App() {
   const [previewMedia, setPreviewMedia] = useState<RoomMediaItem>();
   const [cryptoStatus, setCryptoStatus] = useState<CryptoStatus>({ cryptoReady: false });
   const [cryptoStatusReady, setCryptoStatusReady] = useState(false);
+  const [notificationPermissionState, setNotificationPermissionState] =
+    useState<NotificationPermissionState>('unsupported');
+  const [appIsActive, setAppIsActive] = useState(() =>
+    typeof document === 'undefined' ? true : !document.hidden
+  );
   const [pendingNativeCaptureIntent, setPendingNativeCaptureIntent] = useState<PendingNativeCaptureIntent | undefined>(
     () => loadPendingNativeCaptureIntent()
   );
+  const deferredMessageDraft = useDeferredValue(messageDraft);
   const [recoveryPassphrase, setRecoveryPassphrase] = useState('');
   const [keyRestoreProgress, setKeyRestoreProgress] = useState('');
   const [keyRestoreMessage, setKeyRestoreMessage] = useState<{ type: 'success' | 'error'; text: string }>();
@@ -3331,6 +3509,46 @@ export function App() {
 
   const currentUserServer = serverFromUserId(session?.userId);
   const isIosPlatform = Capacitor.getPlatform() === 'ios';
+  const refreshNotificationPermission = useCallback(async (): Promise<NotificationPermissionState> => {
+    const nextState = await checkLocalNotificationPermission();
+    setNotificationPermissionState(nextState);
+    return nextState;
+  }, []);
+  const handleRequestNotificationPermission = useCallback(async () => {
+    const currentState = await refreshNotificationPermission();
+    if (currentState === 'granted') {
+      setNotice('系统通知已经开启。');
+      return;
+    }
+    if (currentState === 'denied') {
+      setNotice(
+        isIosPlatform
+          ? '系统通知已被关闭，请到 iPhone 设置 > 通知 > Starfire iOS 手动开启。'
+          : '系统通知已被关闭，请到系统设置里重新开启后再回来检测。'
+      );
+      return;
+    }
+    if (currentState === 'unsupported') {
+      setNotice('当前环境不支持系统通知。');
+      return;
+    }
+
+    const nextState = await requestLocalNotificationPermission();
+    setNotificationPermissionState(nextState);
+    if (nextState === 'granted') {
+      setNotice('系统通知已开启。');
+      return;
+    }
+    if (nextState === 'denied') {
+      setNotice(
+        isIosPlatform
+          ? '通知权限已被拒绝，请到 iPhone 设置 > 通知 > Starfire iOS 手动开启。'
+          : '通知权限已被拒绝，请到系统设置里重新开启。'
+      );
+      return;
+    }
+    setNotice('通知权限还没有开启。');
+  }, [isIosPlatform, refreshNotificationPermission]);
   const selectedExploreSource = useMemo(
     () => exploreSources.find((source) => source.id === selectedExploreSourceId) ?? exploreSources[0],
     [exploreSources, selectedExploreSourceId]
@@ -3402,6 +3620,14 @@ export function App() {
   }, [mobilePane]);
 
   useEffect(() => {
+    selectedRoomIdRef.current = selectedRoomId;
+  }, [selectedRoomId]);
+
+  useEffect(() => {
+    preferencesRef.current = preferences;
+  }, [preferences]);
+
+  useEffect(() => {
     previewMediaRef.current = previewMedia;
   }, [previewMedia]);
 
@@ -3413,6 +3639,61 @@ export function App() {
   useEffect(() => {
     syncStateRef.current = syncState;
   }, [syncState]);
+
+  useEffect(() => {
+    snapshotRoomsRef.current = new Map(snapshot.rooms.map((room) => [room.id, room]));
+  }, [snapshot.rooms]);
+
+  useEffect(() => {
+    notificationPermissionStateRef.current = notificationPermissionState;
+  }, [notificationPermissionState]);
+
+  useEffect(() => {
+    appIsActiveRef.current = appIsActive;
+  }, [appIsActive]);
+
+  useEffect(() => {
+    const updateFromVisibility = () => {
+      setAppIsActive(typeof document === 'undefined' ? true : !document.hidden);
+    };
+
+    updateFromVisibility();
+    const appStateListener = CapacitorApp.addListener('appStateChange', ({ isActive }) => {
+      setAppIsActive(isActive);
+      if (isActive) {
+        void refreshNotificationPermission();
+      }
+    });
+    const pauseListener = CapacitorApp.addListener('pause', () => setAppIsActive(false));
+    const resumeListener = CapacitorApp.addListener('resume', () => {
+      setAppIsActive(true);
+      void refreshNotificationPermission();
+    });
+
+    document.addEventListener('visibilitychange', updateFromVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', updateFromVisibility);
+      void appStateListener.then((listener) => listener.remove());
+      void pauseListener.then((listener) => listener.remove());
+      void resumeListener.then((listener) => listener.remove());
+    };
+  }, [refreshNotificationPermission]);
+
+  useEffect(() => {
+    void refreshNotificationPermission();
+  }, [refreshNotificationPermission]);
+
+  useEffect(() => {
+    if (!client || !session || bootState !== 'signedIn') return undefined;
+
+    notificationSessionStartedAtRef.current = Date.now();
+    notifiedEventIdsRef.current = [];
+    void registerChatNotificationActions();
+
+    return () => {
+      notifiedEventIdsRef.current = [];
+    };
+  }, [bootState, client, session]);
 
   useEffect(() => {
     if (!client) return undefined;
@@ -3726,11 +4007,7 @@ export function App() {
     if (bootState !== 'signedIn' || pendingNativeCaptureNoticeShownRef.current) return;
 
     pendingNativeCaptureNoticeShownRef.current = true;
-    setNotice(
-      pendingNativeCaptureIntent.kind === 'video'
-        ? '已从系统录像返回，正在恢复同步、加密与本地媒体缓存'
-        : '已从系统相机返回，正在恢复同步、加密与本地媒体缓存'
-    );
+    setNotice(getPendingNativeCaptureResumeNotice(pendingNativeCaptureIntent.kind));
 
     const timeoutId = window.setTimeout(() => {
       clearPendingNativeCapture();
@@ -4038,18 +4315,6 @@ export function App() {
     [selectedMessageIds, selectedRoomMessages]
   );
 
-  const selectedRoomPendingSendCount = useMemo(
-    () =>
-      selectedRoomMessages.filter(
-        (message) =>
-          message.mine &&
-          (message.sendStatus === 'sending' ||
-            message.sendStatus === 'queued' ||
-            message.sendStatus === 'encrypting')
-      ).length,
-    [selectedRoomMessages]
-  );
-
   const selectedRoomFailedSendCount = useMemo(
     () => selectedRoomMessages.filter((message) => message.mine && message.sendStatus === 'failed').length,
     [selectedRoomMessages]
@@ -4132,7 +4397,7 @@ export function App() {
 
   const mentionSuggestions = useMemo(() => {
     if (composerMode.type !== 'normal') return [];
-    const query = getTrailingMentionQuery(messageDraft);
+    const query = getTrailingMentionQuery(deferredMessageDraft);
     if (query === undefined) return [];
 
     return roomMembers
@@ -4143,7 +4408,8 @@ export function App() {
           : true
       )
       .slice(0, 6);
-  }, [composerMode.type, messageDraft, roomMembers, session?.userId]);
+  }, [composerMode.type, deferredMessageDraft, roomMembers, session?.userId]);
+  const typingStatusLabel = useMemo(() => formatTypingStatusLabel(typingMembers), [typingMembers]);
 
   const cinnyFavoritesRoomId = useMemo(
     () => getCinnyFavoritesRoomId(client, snapshot.rooms),
@@ -4612,7 +4878,7 @@ export function App() {
     if (!selectedRoom) {
       setRoomProfileForm({ name: '', topic: '' });
       setComposerMode({ type: 'normal' });
-      setMessageDraft('');
+      setComposerDraft('');
       setComposerExpanded(false);
       setEmojiOpen(false);
       setShowScrollToLatest(false);
@@ -4625,7 +4891,7 @@ export function App() {
       topic: selectedRoom.topic ?? '',
     });
     setComposerMode({ type: 'normal' });
-    setMessageDraft(roomDrafts[selectedRoom.id] ?? '');
+    setComposerDraft(roomDrafts[selectedRoom.id] ?? '');
     setComposerExpanded(false);
     setEmojiOpen(false);
     setShowScrollToLatest(false);
@@ -4636,29 +4902,48 @@ export function App() {
     const textarea = composerInputRef.current;
     if (!textarea) return;
 
-    const previousHeight = textarea.style.height;
     textarea.style.height = 'auto';
     const measuredHeight = textarea.scrollHeight;
-    textarea.style.height = previousHeight;
-
     const nextHeight = Math.max(composerCollapsedMinHeightPx, measuredHeight);
-    setComposerTextareaHeight((current) => (current === nextHeight ? current : nextHeight));
-    setComposerCanExpand(measuredHeight > composerCollapsedMaxHeightPx + 4);
+    textarea.style.height = `${nextHeight}px`;
+    setComposerCanExpand((current) => {
+      const nextCanExpand = measuredHeight > composerCollapsedMaxHeightPx + 4;
+      return current === nextCanExpand ? current : nextCanExpand;
+    });
   }, []);
 
   useLayoutEffect(() => {
     measureComposerTextarea();
-  }, [composerExpanded, measureComposerTextarea, messageDraft, selectedRoomId]);
+  }, [composerExpanded, measureComposerTextarea, selectedRoomId]);
+
+  const setComposerDraft = useCallback(
+    (value: string) => {
+      setMessageDraft(value);
+      window.requestAnimationFrame(() => {
+        measureComposerTextarea();
+      });
+    },
+    [measureComposerTextarea]
+  );
 
 
   useEffect(() => {
     if (!client || !selectedRoomId) return undefined;
 
     const refreshTyping = () => setTypingMembers(getRoomTypingMembers(client, selectedRoomId));
+    const handleTypingRefresh = (_event: MatrixEvent, member: RoomMember) => {
+      if (member.roomId !== selectedRoomId) return;
+      refreshTyping();
+    };
+
     refreshTyping();
-    const interval = window.setInterval(refreshTyping, 2500);
-    return () => window.clearInterval(interval);
-  }, [client, selectedRoomId, snapshot.version]);
+    client.on(RoomMemberEvent.Typing, handleTypingRefresh);
+    const interval = window.setInterval(refreshTyping, isIosPlatform ? 1200 : 1800);
+    return () => {
+      client.removeListener(RoomMemberEvent.Typing, handleTypingRefresh);
+      window.clearInterval(interval);
+    };
+  }, [client, isIosPlatform, selectedRoomId, snapshot.version]);
 
   useEffect(() => {
     if (!client || !selectedRoomId) return undefined;
@@ -5061,7 +5346,10 @@ export function App() {
   }, [favoriteMessageSnapshots]);
 
   useEffect(() => {
-    saveRoomDrafts(roomDrafts);
+    const timeoutId = window.setTimeout(() => {
+      saveRoomDrafts(roomDrafts);
+    }, 600);
+    return () => window.clearTimeout(timeoutId);
   }, [roomDrafts]);
 
   useEffect(() => {
@@ -5112,17 +5400,19 @@ export function App() {
   };
 
   const commitRoomDraftPreview = useCallback((roomId: string, value: string) => {
-    setRoomDrafts((current) => {
-      const currentValue = current[roomId] ?? '';
-      if (currentValue === value) return current;
+    startTransition(() => {
+      setRoomDrafts((current) => {
+        const currentValue = current[roomId] ?? '';
+        if (currentValue === value) return current;
 
-      const next = { ...current };
-      if (value) {
-        next[roomId] = value;
-      } else {
-        delete next[roomId];
-      }
-      return next;
+        const next = { ...current };
+        if (value) {
+          next[roomId] = value;
+        } else {
+          delete next[roomId];
+        }
+        return next;
+      });
     });
   }, []);
 
@@ -5197,6 +5487,7 @@ export function App() {
 
   const handleLogout = async () => {
     sessionExpiryHandledRef.current = false;
+    await clearChatNotifications().catch(() => undefined);
     stopRuntime();
     await clearStoredSession();
     clearCustomEmojiSnapshot();
@@ -5230,7 +5521,153 @@ export function App() {
     setEditingMessageId(undefined);
     setEditingMessageDraft('');
     setSavingInlineEdit(false);
+    void clearChatNotifications([roomId]);
   };
+
+  const openRoomFromNotification = useCallback(
+    (roomId: string) => {
+      const room = snapshot.rooms.find((item) => item.id === roomId);
+      if (!room) return;
+
+      setFocusedTimelineContext(undefined);
+      setSelectedSpaceId(undefined);
+      setRoomQuery('');
+      setSelectedRoomId(roomId);
+      setActiveView(room.direct ? 'direct' : 'rooms');
+      setMobilePane('chat');
+      setMessageQuery('');
+      setMessageSearchOpen(false);
+      setComposerMode({ type: 'normal' });
+      setEditingMessageId(undefined);
+      setEditingMessageDraft('');
+      setSavingInlineEdit(false);
+      void clearChatNotifications([roomId]);
+    },
+    [snapshot.rooms]
+  );
+
+  useEffect(() => {
+    if (!selectedRoomId) return;
+    void clearChatNotifications([selectedRoomId]);
+  }, [selectedRoomId]);
+
+  useEffect(() => {
+    if (!client || !session) return undefined;
+
+    const isRoomCurrentlyVisible = (roomId: string): boolean => {
+      if (!appIsActiveRef.current || selectedRoomIdRef.current !== roomId) return false;
+      if (typeof window !== 'undefined' && window.matchMedia('(min-width: 960px)').matches) return true;
+      return mobilePaneRef.current === 'chat';
+    };
+
+    const rememberNotificationEvent = (eventId: string) => {
+      const trackedEventIds = notifiedEventIdsRef.current;
+      trackedEventIds.push(eventId);
+      if (trackedEventIds.length > maxTrackedNotificationEventIds) {
+        trackedEventIds.splice(0, trackedEventIds.length - maxTrackedNotificationEventIds);
+      }
+    };
+
+    const handleNotificationAction = (action: Parameters<typeof extractChatNotificationExtra>[0]) => {
+      const extra = extractChatNotificationExtra(action);
+      if (!extra?.roomId) return;
+
+      void clearChatNotifications([extra.roomId]);
+      if (isChatNotificationOpenAction(action)) {
+        openRoomFromNotification(extra.roomId);
+      }
+    };
+
+    const handleNotificationReceived = () => {
+      if (!appIsActiveRef.current) return;
+      void Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
+    };
+
+    const handleTimelineNotification = (
+      event: MatrixEvent,
+      room?: Room,
+      toStartOfTimeline?: boolean,
+      removed?: boolean
+    ) => {
+      if (notificationPermissionStateRef.current !== 'granted') return;
+      if (!room || toStartOfTimeline || removed || event.status) return;
+      if (event.getSender() === session.userId) return;
+      if (!isTimelineEventNotificationCandidate(event)) return;
+
+      const eventId = event.getId();
+      if (!eventId || notifiedEventIdsRef.current.includes(eventId)) return;
+      if (event.getTs() < notificationSessionStartedAtRef.current - notificationTimelineWarmupDriftMs) return;
+
+      const roomSummary = snapshotRoomsRef.current.get(room.roomId);
+      if (!roomSummary || roomSummary.membership !== 'join' || roomSummary.notificationMode === 'mute') return;
+
+      const pushActions = client.getPushActionsForEvent(event, true);
+      if (!pushActions?.notify) return;
+      if (isRoomCurrentlyVisible(room.roomId)) return;
+
+      const prefs = preferencesRef.current;
+      if (appIsActiveRef.current && !prefs.notifyInForeground) return;
+
+      const senderId = event.getSender() ?? undefined;
+      const senderName = senderId ? room.getMember(senderId)?.name ?? senderId : undefined;
+      const notificationContent = buildTimelineEventNotificationContent({
+        event,
+        room: roomSummary,
+        senderName,
+        showPreview: prefs.showNotificationPreview,
+      });
+
+      rememberNotificationEvent(eventId);
+      void scheduleChatNotification({
+        roomId: room.roomId,
+        eventId,
+        senderId,
+        title: notificationContent.title,
+        body: notificationContent.body,
+        summaryArgument: notificationContent.summaryArgument,
+      }).catch(() => undefined);
+    };
+
+    const actionListener = LocalNotifications.addListener(
+      'localNotificationActionPerformed',
+      handleNotificationAction
+    );
+    const receivedListener = LocalNotifications.addListener(
+      'localNotificationReceived',
+      handleNotificationReceived
+    );
+    client.on(RoomEvent.Timeline, handleTimelineNotification);
+
+    return () => {
+      client.removeListener(RoomEvent.Timeline, handleTimelineNotification);
+      void actionListener.then((listener) => listener.remove());
+      void receivedListener.then((listener) => listener.remove());
+    };
+  }, [client, openRoomFromNotification, session]);
+
+  useEffect(() => {
+    const previousUnreadByRoom = previousUnreadByRoomRef.current;
+    const nextUnreadByRoom = new Map<string, number>();
+    const roomsToClear: string[] = [];
+
+    snapshot.rooms.forEach((room) => {
+      nextUnreadByRoom.set(room.id, room.unread);
+      if (room.unread === 0 && (previousUnreadByRoom.get(room.id) ?? 0) > 0) {
+        roomsToClear.push(room.id);
+      }
+    });
+
+    previousUnreadByRoom.forEach((count, roomId) => {
+      if (count > 0 && !nextUnreadByRoom.has(roomId)) {
+        roomsToClear.push(roomId);
+      }
+    });
+
+    previousUnreadByRoomRef.current = nextUnreadByRoom;
+    if (roomsToClear.length > 0) {
+      void clearChatNotifications(Array.from(new Set(roomsToClear)));
+    }
+  }, [snapshot.rooms]);
 
   const executeSlashCommand = async (body: string): Promise<boolean> => {
     if (!client || !selectedRoom || composerMode.type !== 'normal' || !body.startsWith('/')) {
@@ -5277,7 +5714,7 @@ export function App() {
     clearPendingRoomDraftCommit();
 
     const body = messageDraft;
-    setMessageDraft('');
+    setComposerDraft('');
     setSending(true);
     try {
       if (typingTimeoutRef.current) {
@@ -5337,7 +5774,7 @@ export function App() {
       await Haptics.impact({ style: ImpactStyle.Light }).catch(() => undefined);
       refreshSnapshot();
     } catch (err) {
-      setMessageDraft(body);
+      setComposerDraft(body);
       setRoomDrafts((current) => ({ ...current, [selectedRoom.id]: body }));
 
       if (isMatrixSessionExpiredError(err)) {
@@ -5488,6 +5925,11 @@ export function App() {
         void updateTypingStatus(client, selectedRoom.id, false).catch(() => undefined);
       }
     }, 5000);
+  };
+
+  const handleComposerInputChange = (evt: ChangeEvent<HTMLTextAreaElement>) => {
+    measureComposerTextarea();
+    handleDraftChange(evt.target.value);
   };
 
   const handleLoadOlder = async () => {
@@ -5804,6 +6246,7 @@ export function App() {
   const handleAudioCaptureSelected = async (evt: ChangeEvent<HTMLInputElement>) => {
     const file = evt.target.files?.[0];
     evt.target.value = '';
+    clearPendingNativeCapture();
     if (!client || !selectedRoom || !file) return;
 
     const normalizedFile = file.type.startsWith('audio/')
@@ -5824,7 +6267,8 @@ export function App() {
       setError('当前真机包还没有准备好系统录音入口。');
       return;
     }
-    setNotice('将使用系统录音入口选择或录制语音');
+    preparePendingNativeCapture('audio');
+    setNotice('将使用系统录音入口直接录制语音并发送');
     input.click();
   };
 
@@ -6127,11 +6571,11 @@ export function App() {
 
   const startVoiceRecording = async () => {
     if (!client || !selectedRoom || selectedRoom.membership !== 'join') return;
+    if (Capacitor.isNativePlatform()) {
+      openNativeAudioCapture();
+      return;
+    }
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
-      if (Capacitor.isNativePlatform()) {
-        openNativeAudioCapture();
-        return;
-      }
       setError('当前环境不支持录制语音；Web 预览需要浏览器支持 MediaRecorder。');
       return;
     }
@@ -6197,10 +6641,6 @@ export function App() {
       }, 250);
     } catch (err) {
       resetRecordingState();
-      if (Capacitor.isNativePlatform()) {
-        openNativeAudioCapture();
-        return;
-      }
       setError(err instanceof Error ? getReadableSpeechError((err as { name?: string }).name) : String(err));
     }
   };
@@ -6218,6 +6658,10 @@ export function App() {
 
   const handleToggleVoiceRecording = () => {
     if (voiceRecording) return;
+    if (Capacitor.isNativePlatform()) {
+      openNativeAudioCapture();
+      return;
+    }
     void startVoiceRecording();
   };
 
@@ -6986,7 +7430,7 @@ export function App() {
               onFavorite={() => toggleFavoriteMessage(message)}
               onReply={() => {
                 setComposerMode({ type: 'reply', message });
-                setMessageDraft('');
+                setComposerDraft('');
               }}
               onOpenReply={(eventId) => void handleOpenRoomEvent(message.roomId, eventId)}
               onInfo={() => handleOpenMessageInfo(message)}
@@ -7065,9 +7509,7 @@ export function App() {
   );
 
   const bootLoadingLabel = pendingNativeCaptureIntent
-    ? pendingNativeCaptureIntent.kind === 'video'
-      ? '正在从系统录像返回并恢复本地会话'
-      : '正在从系统相机返回并恢复本地会话'
+    ? getPendingNativeCaptureBootLabel(pendingNativeCaptureIntent.kind)
     : '正在恢复本地会话';
   const connectingLoadingLabel = pendingNativeCaptureIntent
     ? '正在恢复 Matrix 同步、加密与本地媒体缓存'
@@ -7419,11 +7861,13 @@ export function App() {
             audioTranscriptionSupportLabel={getAudioTranscriptionSupportLabel(audioTranscriptionSettings)}
             cryptoStatus={cryptoStatus}
             cryptoStatusReady={cryptoStatusReady}
+            notificationPermissionState={notificationPermissionState}
             mediaAccessToken={session?.accessToken}
             onProfileChange={setProfileForm}
             onProfileSubmit={handleProfileSubmit}
             onAvatarSelected={handleProfileAvatarSelected}
             onPreferencesChange={setPreferences}
+            onRequestNotificationPermission={handleRequestNotificationPermission}
             onAudioTranscriptionSettingsChange={handleAudioTranscriptionSettingsChange}
             onOpenSecurity={() => setSheet('security')}
             onOpenEmojiManager={() => setSheet('emojiManager')}
@@ -7553,11 +7997,6 @@ export function App() {
                   {matrixConnectionBanner.text}
                 </button>
               )}
-              {selectedRoomPendingSendCount > 0 && !matrixConnectionBanner && (
-                <div className="message-box warning inline">
-                  有 {selectedRoomPendingSendCount} 条消息正在等待发送
-                </div>
-              )}
               {selectedRoomFailedSendCount > 0 && (
                 <button
                   className="message-box danger inline"
@@ -7636,11 +8075,6 @@ export function App() {
             </div>
 
             <form className={composerExpanded ? 'composer expanded' : 'composer'} onSubmit={handleSendMessage}>
-              {typingMembers.length > 0 && (
-                <div className="typing-line">
-                  {typingMembers.slice(0, 3).join('')} 正在输入
-                </div>
-              )}
               {composerMode.type === 'normal' && messageDraft.startsWith('/') && (
                 <div className="command-hint">
                   支持 /me /join /invite /topic /shrug
@@ -7656,7 +8090,7 @@ export function App() {
                     type="button"
                     onClick={() => {
                       setComposerMode({ type: 'normal' });
-                      setMessageDraft('');
+                      setComposerDraft('');
                     }}
                   >
                     <X size={16} />
@@ -7806,7 +8240,6 @@ export function App() {
                     ref={composerInputRef}
                     value={messageDraft}
                     rows={1}
-                    style={{ height: `${composerTextareaHeight}px` }}
                     enterKeyHint="send"
                     placeholder={selectedRoom.membership === 'join' ? '输入消息' : '需要先加入房间'}
                     disabled={selectedRoom.membership !== 'join'}
@@ -7817,7 +8250,7 @@ export function App() {
                       }
                     }}
                     onKeyDown={handleComposerKeyDown}
-                    onChange={(evt) => handleDraftChange(evt.target.value)}
+                    onChange={handleComposerInputChange}
                   />
                   {showInlineComposerMic && (
                     <div className="composer-inline-actions">
@@ -7834,6 +8267,16 @@ export function App() {
                   )}
                 </div>
               </div>
+              {typingStatusLabel && (
+                <div className="typing-inline-hint" aria-live="polite" title={typingStatusLabel}>
+                  <span className="typing-inline-dots" aria-hidden="true">
+                    <span />
+                    <span />
+                    <span />
+                  </span>
+                  <span>{typingStatusLabel}</span>
+                </div>
+              )}
               {emojiOpen && selectedRoom.membership === 'join' && (
                 <div className="emoji-tray-shell" ref={emojiTrayRef}>
                   <EnhancedEmojiTray
@@ -8022,7 +8465,7 @@ export function App() {
           onOpenMemberProfile={openUserProfile}
           onReply={() => {
             setComposerMode({ type: 'reply', message: messageInfoMessage });
-            setMessageDraft('');
+            setComposerDraft('');
             setSheet(undefined);
           }}
           onEdit={() => handleEditMessage(messageInfoMessage)}
@@ -11459,7 +11902,10 @@ function MessageRichText({
             image.src = resolvedSrc;
           }
         } catch {
-          // Keep the current remote src when offline cache hydration fails.
+          const remoteFallbackSrc = fallbackSource || source;
+          if (!cancelled && remoteFallbackSrc && image.isConnected && image.src !== remoteFallbackSrc) {
+            image.src = remoteFallbackSrc;
+          }
         }
       })
     );
@@ -15706,12 +16152,14 @@ function SettingsPanel({
   audioTranscriptionSupportLabel,
   cryptoStatus,
   cryptoStatusReady,
+  notificationPermissionState,
   mediaAccessToken,
   onLogout,
   onProfileChange,
   onProfileSubmit,
   onAvatarSelected,
   onPreferencesChange,
+  onRequestNotificationPermission,
   onAudioTranscriptionSettingsChange,
   onOpenSecurity,
   onOpenEmojiManager,
@@ -15732,12 +16180,14 @@ function SettingsPanel({
   audioTranscriptionSupportLabel: string;
   cryptoStatus: CryptoStatus;
   cryptoStatusReady: boolean;
+  notificationPermissionState: NotificationPermissionState;
   mediaAccessToken?: string;
   onLogout: () => void;
   onProfileChange: (value: { displayName: string }) => void;
   onProfileSubmit: (evt: FormEvent<HTMLFormElement>) => void;
   onAvatarSelected: (file: File) => void;
   onPreferencesChange: (value: AppPreferences) => void;
+  onRequestNotificationPermission: () => void | Promise<void>;
   onAudioTranscriptionSettingsChange: (value: AudioTranscriptionSettings) => void;
   onOpenSecurity: () => void;
   onOpenEmojiManager: () => void;
@@ -15746,20 +16196,25 @@ function SettingsPanel({
   onOpenExplore: () => void;
   onClearLocal: () => void;
 }) {
-  const notificationPermission =
-    typeof Notification === 'undefined' ? '未知' : Notification.permission;
   const joinedRooms = snapshot.rooms.filter((room) => room.membership === 'join');
   const spaceRooms = joinedRooms.filter((room) => room.space).length;
   const mutedRooms = joinedRooms.filter((room) => room.muted).length;
   const inviteRooms = snapshot.rooms.filter((room) => room.membership === 'invite').length;
-  const notificationLabel =
-    notificationPermission === 'granted'
-      ? '已允许'
-      : notificationPermission === 'denied'
-        ? '已拒绝'
-        : notificationPermission === 'default'
-          ? '未询问'
-          : notificationPermission;
+  const notificationLabel = getNotificationPermissionLabel(notificationPermissionState);
+  const notificationButtonLabel =
+    notificationPermissionState === 'granted'
+      ? '重新检测通知权限'
+      : notificationPermissionState === 'denied'
+        ? '查看如何开启通知'
+        : '开启系统通知';
+  const notificationDetailLabel =
+    notificationPermissionState === 'granted'
+      ? '新消息会按房间设置进行系统提醒，点通知可直接回到会话。'
+      : notificationPermissionState === 'denied'
+        ? '如果之前点了不允许，请到 iPhone 设置 > 通知 > Starfire iOS 手动开启。'
+        : notificationPermissionState === 'prompt'
+          ? '建议开启系统通知，这样锁屏和后台收到新消息时更像原生聊天应用。'
+          : '当前预览环境不支持完整的系统通知能力。';
   const cryptoSummaryLabel = !cryptoStatusReady
     ? '正在恢复加密状态'
     : cryptoStatus.cryptoReady
@@ -15918,6 +16373,53 @@ function SettingsPanel({
             <small>{notificationLabel}</small>
           </span>
         </div>
+        <button className="settings-item button-like" type="button" onClick={() => void onRequestNotificationPermission()}>
+          <Bell size={19} />
+          <span>
+            <strong>{notificationButtonLabel}</strong>
+            <small>{notificationDetailLabel}</small>
+          </span>
+        </button>
+        <button
+          type="button"
+          className={preferences.notifyInForeground ? 'settings-item button-like active' : 'settings-item button-like'}
+          onClick={() =>
+            onPreferencesChange({
+              ...preferences,
+              notifyInForeground: !preferences.notifyInForeground,
+            })
+          }
+        >
+          <CheckSquare2 size={19} />
+          <span>
+            <strong>{preferences.notifyInForeground ? '前台也提醒新消息' : '前台不弹系统通知'}</strong>
+            <small>
+              {preferences.notifyInForeground
+                ? '正在使用 App 但停留在别的房间时，收到新消息也会给出系统提醒。'
+                : '只有 App 不在前台时才走系统通知，避免打扰当前操作。'}
+            </small>
+          </span>
+        </button>
+        <button
+          type="button"
+          className={preferences.showNotificationPreview ? 'settings-item button-like active' : 'settings-item button-like'}
+          onClick={() =>
+            onPreferencesChange({
+              ...preferences,
+              showNotificationPreview: !preferences.showNotificationPreview,
+            })
+          }
+        >
+          <Eye size={19} />
+          <span>
+            <strong>{preferences.showNotificationPreview ? '通知显示消息预览' : '通知隐藏消息预览'}</strong>
+            <small>
+              {preferences.showNotificationPreview
+                ? '通知里会直接显示发送者和消息摘要，更适合高频聊天。'
+                : '通知只显示“新消息”类提示，更适合锁屏隐私。'}
+            </small>
+          </span>
+        </button>
         <button className="settings-item button-like" type="button" onClick={onOpenEmojiManager}>
           <SmilePlus size={19} />
           <span>

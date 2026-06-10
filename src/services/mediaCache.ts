@@ -3,8 +3,19 @@ import { Directory, Filesystem } from '@capacitor/filesystem';
 
 const MEDIA_CACHE_DIR = 'ioscinny/media';
 const WEB_MEDIA_CACHE_NAME = 'ioscinny-media-cache-v1';
+const NATIVE_MEDIA_CACHE_INDEX_KEY = 'ioscinny.native-media-cache-index.v1';
 const mediaUrlCache = new Map<string, string>();
 const isWebPlatform = (): boolean => Capacitor.getPlatform() === 'web';
+type PersistedMediaDirectory = 'DATA' | 'CACHE';
+type PersistedMediaIndexEntry = {
+  directory: PersistedMediaDirectory;
+  path: string;
+  uri: string;
+  updatedAt: number;
+};
+
+let nativeMediaCacheIndexLoaded = false;
+let nativeMediaCacheIndex: Record<string, PersistedMediaIndexEntry> = {};
 
 const toHex = (value: ArrayBuffer): string =>
   Array.from(new Uint8Array(value))
@@ -35,6 +46,100 @@ const getExtensionFromUrl = (src?: string): string | undefined => {
   } catch {
     return undefined;
   }
+};
+
+const isNativePersistentIndexAvailable = (): boolean =>
+  !isWebPlatform() && typeof window !== 'undefined' && typeof window.localStorage !== 'undefined';
+
+const loadNativeMediaCacheIndex = (): Record<string, PersistedMediaIndexEntry> => {
+  if (nativeMediaCacheIndexLoaded) return nativeMediaCacheIndex;
+
+  nativeMediaCacheIndexLoaded = true;
+  if (!isNativePersistentIndexAvailable()) return nativeMediaCacheIndex;
+
+  try {
+    const rawValue = window.localStorage.getItem(NATIVE_MEDIA_CACHE_INDEX_KEY);
+    const parsed = rawValue ? JSON.parse(rawValue) : {};
+    if (parsed && typeof parsed === 'object') {
+      nativeMediaCacheIndex = parsed as Record<string, PersistedMediaIndexEntry>;
+    }
+  } catch {
+    nativeMediaCacheIndex = {};
+  }
+
+  return nativeMediaCacheIndex;
+};
+
+const saveNativeMediaCacheIndex = () => {
+  if (!isNativePersistentIndexAvailable()) return;
+
+  try {
+    window.localStorage.setItem(NATIVE_MEDIA_CACHE_INDEX_KEY, JSON.stringify(nativeMediaCacheIndex));
+  } catch {
+    // Ignore persistent cache index write failures.
+  }
+};
+
+const toPersistedMediaDirectory = (directory: Directory): PersistedMediaDirectory | undefined => {
+  if (directory === Directory.Data) return 'DATA';
+  if (directory === Directory.Cache) return 'CACHE';
+  return undefined;
+};
+
+const fromPersistedMediaDirectory = (directory: PersistedMediaDirectory | undefined): Directory | undefined => {
+  if (directory === 'DATA') return Directory.Data;
+  if (directory === 'CACHE') return Directory.Cache;
+  return undefined;
+};
+
+const getPersistedMediaIndexEntry = (cacheKey?: string): PersistedMediaIndexEntry | undefined => {
+  if (!cacheKey || !isNativePersistentIndexAvailable()) return undefined;
+
+  const entry = loadNativeMediaCacheIndex()[cacheKey];
+  if (!entry || typeof entry !== 'object') return undefined;
+  if (
+    typeof entry.path !== 'string' ||
+    typeof entry.uri !== 'string' ||
+    !fromPersistedMediaDirectory(entry.directory)
+  ) {
+    delete nativeMediaCacheIndex[cacheKey];
+    saveNativeMediaCacheIndex();
+    return undefined;
+  }
+
+  return entry;
+};
+
+const setPersistedMediaIndexEntry = (
+  cacheKey: string,
+  entry: {
+    directory: Directory;
+    path: string;
+    uri: string;
+  }
+) => {
+  if (!isNativePersistentIndexAvailable()) return;
+
+  const persistedDirectory = toPersistedMediaDirectory(entry.directory);
+  if (!persistedDirectory) return;
+
+  loadNativeMediaCacheIndex();
+  nativeMediaCacheIndex[cacheKey] = {
+    directory: persistedDirectory,
+    path: entry.path,
+    uri: entry.uri,
+    updatedAt: Date.now(),
+  };
+  saveNativeMediaCacheIndex();
+};
+
+const removePersistedMediaIndexEntry = (cacheKey: string) => {
+  if (!isNativePersistentIndexAvailable()) return;
+
+  loadNativeMediaCacheIndex();
+  if (!nativeMediaCacheIndex[cacheKey]) return;
+  delete nativeMediaCacheIndex[cacheKey];
+  saveNativeMediaCacheIndex();
 };
 
 const blobToBase64 = async (blob: Blob): Promise<string> =>
@@ -112,6 +217,11 @@ const getCachedFilesystemMediaUrl = async (
     const { uri } = await Filesystem.getUri({ path: cachedEntry.path, directory: cachedEntry.directory });
     const resolvedUrl = toDisplayUrl(uri);
     mediaUrlCache.set(cacheKey, resolvedUrl);
+    setPersistedMediaIndexEntry(cacheKey, {
+      directory: cachedEntry.directory,
+      path: cachedEntry.path,
+      uri,
+    });
     return resolvedUrl;
   } catch {
     return undefined;
@@ -137,8 +247,42 @@ const storeCachedFilesystemMediaBlob = async (
     const { uri } = await Filesystem.getUri({ path, directory });
     const resolvedUrl = toDisplayUrl(uri);
     mediaUrlCache.set(cacheKey, resolvedUrl);
+    setPersistedMediaIndexEntry(cacheKey, {
+      directory,
+      path,
+      uri,
+    });
     return resolvedUrl;
   } catch {
+    return undefined;
+  }
+};
+
+const getCachedPersistedFilesystemMediaUrl = async (cacheKey: string): Promise<string | undefined> => {
+  const persistedEntry = getPersistedMediaIndexEntry(cacheKey);
+  if (!persistedEntry) return undefined;
+
+  const directory = fromPersistedMediaDirectory(persistedEntry.directory);
+  if (!directory) {
+    removePersistedMediaIndexEntry(cacheKey);
+    return undefined;
+  }
+
+  try {
+    await Filesystem.stat({ path: persistedEntry.path, directory });
+    const { uri } = await Filesystem.getUri({ path: persistedEntry.path, directory });
+    const resolvedUrl = toDisplayUrl(uri);
+    mediaUrlCache.set(cacheKey, resolvedUrl);
+    if (uri !== persistedEntry.uri) {
+      setPersistedMediaIndexEntry(cacheKey, {
+        directory,
+        path: persistedEntry.path,
+        uri,
+      });
+    }
+    return resolvedUrl;
+  } catch {
+    removePersistedMediaIndexEntry(cacheKey);
     return undefined;
   }
 };
@@ -213,6 +357,18 @@ export const peekCachedMediaUrl = (cacheKey?: string): string | undefined =>
       })()
     : undefined;
 
+export const peekPersistedCachedMediaUrl = (cacheKey?: string): string | undefined => {
+  const persistedEntry = getPersistedMediaIndexEntry(cacheKey);
+  if (!persistedEntry) return undefined;
+
+  const resolvedUrl = toDisplayUrl(persistedEntry.uri);
+  if (!isUsableMediaUrl(resolvedUrl)) {
+    removePersistedMediaIndexEntry(cacheKey ?? '');
+    return undefined;
+  }
+  return resolvedUrl;
+};
+
 export const getCachedMediaUrl = async (
   cacheKey: string,
   mimeType?: string,
@@ -224,6 +380,9 @@ export const getCachedMediaUrl = async (
   if (isWebPlatform()) {
     return getCachedWebMediaUrl(cacheKey, mimeType, src);
   }
+
+  const persistedFilesystemCachedUrl = await getCachedPersistedFilesystemMediaUrl(cacheKey);
+  if (persistedFilesystemCachedUrl) return persistedFilesystemCachedUrl;
 
   const filesystemCachedUrl = await getCachedFilesystemMediaUrl(cacheKey, mimeType, src);
   if (filesystemCachedUrl) return filesystemCachedUrl;

@@ -37,7 +37,7 @@ jobs:
         run: npx cap add ios
 
       - name: Sync web assets to iOS
-        run: npx cap sync ios
+        run: npm run cap:sync:ios
 
       - name: Build iOS app without Apple signing
         run: |

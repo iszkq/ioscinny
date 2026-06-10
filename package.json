@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview --host 0.0.0.0",
     "cap:add:ios": "cap add ios",
-    "cap:sync:ios": "cap sync ios",
+    "cap:sync:ios": "cap sync ios && node scripts/configure-ios-project.mjs",
     "ios:ipa:unsigned": "npm run build && npm run cap:add:ios && npm run cap:sync:ios"
   },
   "dependencies": {
@@ -20,6 +20,7 @@
     "@capacitor/haptics": "^7.0.0",
     "@capacitor/ios": "^7.0.0",
     "@capacitor/keyboard": "^7.0.0",
+    "@capacitor/local-notifications": "^7.0.6",
     "@capacitor/preferences": "^7.0.0",
     "buffer": "^6.0.3",
     "lucide-react": "^0.468.0",
